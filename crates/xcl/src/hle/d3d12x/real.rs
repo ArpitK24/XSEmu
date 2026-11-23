@@ -182,14 +182,30 @@ pub fn console_buffers() -> usize {
 }
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
-/// GPU virtual address of the first open unified memory buffer (0: not available).
+/// GPU virtual address of the unified memory buffer of window 0 (0: not available).
 pub fn uma_gpu_va() -> u64 {
-    UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).find(|va| *va != 0).unwrap_or(0)).unwrap_or(0)
+    uma_window_vas().first().copied().unwrap_or(0)
 }
 
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
 pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
+}
+
+pub(super) fn shader_window_base(windows: &[u64]) -> Result<u64, &'static str> {
+    if windows.contains(&0) {
+        return Err("a shader memory window is not open on the GPU");
+    }
+    windows.first().copied().ok_or("shader memory is not open on the GPU")
+}
+
+#[test]
+fn translated_shaders_require_all_active_memory_windows() {
+    assert!(shader_window_base(&[]).is_err());
+    assert!(shader_window_base(&[0, 0, 0, 0x4000]).is_err());
+    assert!(shader_window_base(&[0x1000, 0, 0x3000, 0x4000]).is_err());
+    assert_eq!(shader_window_base(&[0x1000]), Ok(0x1000));
+    assert_eq!(shader_window_base(&[0x1000, 0x2000, 0x3000, 0x4000]), Ok(0x1000));
 }
 
 /// The window buffer holding `len` bytes at UMA address `p`, and their offset in it.

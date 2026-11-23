@@ -649,13 +649,8 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("no PC list")?.clone();
     // created with the first translated pipeline (without one every dispatch is skipped)
     let rs = super::real::abi_rs_cached().and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
-    let uma_va = super::real::uma_gpu_va();
-    let u = crate::gpu::uma::get().ok_or("no UMA")?;
-    if uma_va == 0 {
-        return Err("the UMA buffer is not open on the GPU".into());
-    }
-    let _ = u;
     let windows = super::real::uma_window_vas();
+    let uma_va = super::real::shader_window_base(&windows)?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
     let mut layout: Option<Arc<Layout>> = None;
