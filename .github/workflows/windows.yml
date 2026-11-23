@@ -1,0 +1,27 @@
+name: Windows
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-2025
+    timeout-minutes: 25
+    env:
+      XCL_ADAPTER: warp
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
+      - name: Build the runtime and test title
+        run: cargo +1.99.0-x86_64-pc-windows-msvc build --locked --workspace
+      - name: Test the compatibility layer on WARP
+        run: cargo +1.99.0-x86_64-pc-windows-msvc test --locked --workspace -- --test-threads=4 --show-output
