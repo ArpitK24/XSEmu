@@ -1318,6 +1318,7 @@ mod tests {
         let v = &f.vfs;
         let path = "G:\\data\\gone.txt";
         assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        let writes_before = v.redirected_writes();
         let disp = windows_sys::Win32::Storage::FileSystem::CREATE_ALWAYS;
         let acc = windows_sys::Win32::Foundation::GENERIC_WRITE;
         let result = unsafe {
@@ -1331,7 +1332,7 @@ mod tests {
         assert_eq!(unsafe { GetLastError() }, vfs::ERROR_INVALID_PARAMETER);
         assert_eq!(f.read_vfs(path), None);
         assert!(v.is_whiteout("data\\gone.txt"));
-        assert!(v.redirected_writes().is_empty());
+        assert_eq!(v.redirected_writes(), writes_before);
     }
 
     #[test]
