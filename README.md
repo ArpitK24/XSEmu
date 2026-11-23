@@ -19,13 +19,17 @@ for DXC, Gaming Services, and GPU requirements.
 
 ```powershell
 cargo build --locked --workspace
-$env:XCL_ADAPTER = 'warp'
 cargo test --locked --workspace -- --test-threads=4 --show-output
 ```
 
-The workspace builds its own test title. CI runs without retail game files or
-the console SDK. Tests that require a physical GPU or optional local samples
-may skip on CI. For hardware testing, clear `XCL_ADAPTER` or select your adapter.
+The full suite builds and runs its own test title. Run it on a physical D3D12
+adapter that can back the console's sparse memory windows. Hosted CI uses WARP
+for unit and selected integration tests: its software adapter cannot allocate
+the sparse windows that the full synthetic title exercises. Neither run needs
+retail game files or the console SDK. Retail data tests are opt-in.
+
+Run only one instance for a given title data directory. Use separate
+`XCL_DATA_ROOT` directories to test the same title in parallel.
 
 To inspect a supported, authorized, already unpacked title before launching it:
 

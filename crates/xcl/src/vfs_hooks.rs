@@ -13,7 +13,7 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use windows_sys::Win32::Foundation::{SetLastError, HANDLE, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{GetLastError, SetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{WIN32_FIND_DATAA, WIN32_FIND_DATAW};
 
 use crate::hooks::hook;
@@ -64,6 +64,31 @@ static O_CREATE_FILE_W: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_A: AtomicUsize = AtomicUsize::new(0);
 static O_CREATE_FILE_2: AtomicUsize = AtomicUsize::new(0);
 
+unsafe fn open_file(
+    v: &vfs::Vfs,
+    decision: Decision,
+    disp: u32,
+    open: impl FnOnce(Option<&str>, u32) -> HANDLE,
+) -> HANDLE {
+    match decision {
+        Decision::Pass => open(None, disp),
+        Decision::Use(path) => open(Some(&path), disp),
+        Decision::WriteOverlay { path, rel, disposition } => {
+            let h = open(Some(&path), disposition);
+            if h != INVALID_HANDLE_VALUE {
+                let e = GetLastError();
+                v.commit_write(&rel);
+                SetLastError(e);
+            }
+            h
+        }
+        Decision::Fail(e) => {
+            SetLastError(e);
+            INVALID_HANDLE_VALUE
+        }
+    }
+}
+
 /// The first opens with their flags (how a title reads: overlapped / unbuffered I/O writes
 /// memory without the CPU – write-watch does not see it).
 fn log_open(api: &str, path: &str, flags: u32) {
@@ -87,15 +112,10 @@ unsafe extern "system" fn hk_create_file_w(n: *const u16, acc: u32, sh: u32, sa:
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_wide_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileW", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    open_file(v, v.open_decision(&path, acc, disp, fl), disp, |path, d| match path {
+        Some(p) => orig(wide(p).as_ptr(), acc, sh, sa, d, fl, t),
+        None => orig(n, acc, sh, sa, d, fl, t),
+    })
 }
 
 unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: *const c_void, disp: u32, fl: u32, t: HANDLE) -> HANDLE {
@@ -103,15 +123,10 @@ unsafe extern "system" fn hk_create_file_a(n: *const u8, acc: u32, sh: u32, sa: 
     let (Some(_g), Some(v)) = (Guard::enter(), vfs::get()) else { return orig(n, acc, sh, sa, disp, fl, t) };
     let Some(path) = from_ansi_ptr(n) else { return orig(n, acc, sh, sa, disp, fl, t) };
     log_open("CreateFileA", &path, fl);
-    match v.open_decision(&path, acc, disp, fl) {
-        Decision::Pass => orig(n, acc, sh, sa, disp, fl, t),
-        Decision::Use(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, disp, fl, t),
-        Decision::UseWithDisposition(p, d) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(&p).as_ptr(), acc, sh, sa, d, fl, t),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    open_file(v, v.open_decision(&path, acc, disp, fl), disp, |path, d| match path {
+        Some(p) => orig!(O_CREATE_FILE_W as FnCreateFileW)(wide(p).as_ptr(), acc, sh, sa, d, fl, t),
+        None => orig(n, acc, sh, sa, d, fl, t),
+    })
 }
 
 unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, disp: u32, params: *const c_void) -> HANDLE {
@@ -121,15 +136,10 @@ unsafe extern "system" fn hk_create_file_2(n: *const u16, acc: u32, sh: u32, dis
     // CREATEFILE2_EXTENDED_PARAMETERS { dwSize, dwFileAttributes, dwFileFlags, ... }
     let flags = if params.is_null() { 0 } else { *((params as *const u8).add(8) as *const u32) };
     log_open("CreateFile2", &path, flags);
-    match v.open_decision(&path, acc, disp, flags) {
-        Decision::Pass => orig(n, acc, sh, disp, params),
-        Decision::Use(p) => orig(wide(&p).as_ptr(), acc, sh, disp, params),
-        Decision::UseWithDisposition(p, d) => orig(wide(&p).as_ptr(), acc, sh, d, params),
-        Decision::Fail(e) => {
-            SetLastError(e);
-            INVALID_HANDLE_VALUE
-        }
-    }
+    open_file(v, v.open_decision(&path, acc, disp, flags), disp, |path, d| match path {
+        Some(p) => orig(wide(p).as_ptr(), acc, sh, d, params),
+        None => orig(n, acc, sh, d, params),
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -226,7 +236,15 @@ unsafe extern "system" fn hk_set_attr_w(n: *const u16, attrs: u32) -> i32 {
                 return 0;
             }
             match v.prepare_write(&rel, true) {
-                Ok(p) => orig(wide(&p).as_ptr(), attrs),
+                Ok(p) => {
+                    let ok = orig(wide(&p).as_ptr(), attrs);
+                    if ok != 0 {
+                        let e = GetLastError();
+                        v.commit_write(&rel);
+                        SetLastError(e);
+                    }
+                    ok
+                }
                 Err(e) => {
                     SetLastError(e);
                     0
@@ -1292,6 +1310,28 @@ mod tests {
         assert_eq!(ok, 1);
         assert!(!v.is_whiteout("data\\gone.txt"));
         assert_eq!(f.read_vfs("G:\\data\\gone.txt"), Some(b"original".to_vec()));
+    }
+
+    #[test]
+    fn failed_open_preserves_the_deleted_original() {
+        let f = HookFixture::new("open_whiteout");
+        let v = &f.vfs;
+        let path = "G:\\data\\gone.txt";
+        assert_eq!(v.delete_file("data\\gone.txt"), Ok(()));
+        let disp = windows_sys::Win32::Storage::FileSystem::CREATE_ALWAYS;
+        let acc = windows_sys::Win32::Foundation::GENERIC_WRITE;
+        let result = unsafe {
+            open_file(v, v.open_decision(path, acc, disp, 0), disp, |overlay, _| {
+                assert!(overlay.is_some());
+                SetLastError(vfs::ERROR_INVALID_PARAMETER);
+                INVALID_HANDLE_VALUE
+            })
+        };
+        assert_eq!(result, INVALID_HANDLE_VALUE);
+        assert_eq!(unsafe { GetLastError() }, vfs::ERROR_INVALID_PARAMETER);
+        assert_eq!(f.read_vfs(path), None);
+        assert!(v.is_whiteout("data\\gone.txt"));
+        assert!(v.redirected_writes().is_empty());
     }
 
     #[test]

@@ -176,7 +176,7 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         return q;
     }
     // the title's own reservations of 64 KiB pages: in a sparse window, so the GPU sees them
-    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES {
+    if addr.is_null() && t & 0x2000 != 0 && t & MEM_64K_PAGES == MEM_64K_PAGES && crate::hle::d3d12x::sparse::accepts_allocations() {
         if let Some(q) = uma.and_then(|u| u.sparse_reserve(size)) {
             if t & 0x1000 != 0 && commit_sparse(q, size, p).is_null() {
                 uma.map(|u| u.sparse_release(q));
@@ -208,7 +208,9 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
         // on the console all graphics memory is GPU-visible, reserved address space too (titles
         // reserve a range, then commit or map pages and place resources in it): prefer the
         // sparse VRAM windows first so reservations consume zero system RAM until committed
-        let reserved = if t & 0x8000_0000 != 0 {
+        let reserved = if !crate::hle::d3d12x::sparse::accepts_allocations() {
+            None
+        } else if t & 0x8000_0000 != 0 {
             let rounded = size.max(1).div_ceil(4 << 20) * (4 << 20);
             uma.and_then(|u| u.sparse_alloc(rounded, 4 << 20)).map(|(q, _)| q)
         } else {

@@ -182,9 +182,9 @@ pub fn console_buffers() -> usize {
 }
 static UMA_ERROR: Mutex<String> = Mutex::new(String::new());
 
-/// GPU virtual address of the unified memory buffer of window 0 (0: not available).
+/// GPU virtual address of the first open unified memory buffer (0: not available).
 pub fn uma_gpu_va() -> u64 {
-    uma_window_vas().first().copied().unwrap_or(0)
+    UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).find(|va| *va != 0).unwrap_or(0)).unwrap_or(0)
 }
 
 /// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
@@ -197,17 +197,19 @@ pub(super) fn uma_window_buffer(p: usize, len: usize) -> Option<(usize, u64)> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
     let (base, size) = u.window(k);
-    if p - base + len > size {
+    if len > size - (p - base) {
         return None;
     }
-    Some((UMA_BUFFER.lock().ok()?.get(k)?.0, (p - base) as u64))
+    let raw = UMA_BUFFER.lock().ok()?.get(k)?.0;
+    (raw != 0).then_some((raw, (p - base) as u64))
 }
 
 /// GPU virtual address of a UMA address (None: not in UMA or not open on the GPU).
 pub fn uma_va_of(p: usize) -> Option<u64> {
     let u = crate::gpu::uma::get()?;
     let k = u.window_of(p)?;
-    Some(*uma_window_vas().get(k)? + (p - u.window(k).0) as u64)
+    let base = UMA_BUFFER.lock().ok()?.get(k)?.1;
+    (base != 0).then(|| base + (p - u.window(k).0) as u64)
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {

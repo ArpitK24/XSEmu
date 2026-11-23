@@ -25,10 +25,7 @@ pub enum Target {
 pub enum Decision {
     Pass,
     Use(String),
-    /// Use this path with a rewritten Win32 creation disposition (e.g. `TRUNCATE_EXISTING`
-    /// on an un-overlaid game file becomes `CREATE_ALWAYS` in the overlay so no placeholder
-    /// file is published before the native open succeeds).
-    UseWithDisposition(String, u32),
+    WriteOverlay { path: String, rel: String, disposition: u32 },
     /// Fail with this Win32 error code.
     Fail(u32),
 }
@@ -479,8 +476,6 @@ impl Vfs {
                 std::fs::copy(&orig, &ov).map_err(|_| ERROR_ACCESS_DENIED)?;
             }
         }
-        self.remove_whiteout(rel);
-        self.record_write(rel);
         Ok(ov)
     }
 
@@ -540,8 +535,11 @@ impl Vfs {
                 }
                 let keep = matches!(disposition, OPEN_EXISTING | OPEN_ALWAYS);
                 match self.prepare_write(&rel, keep) {
-                    Ok(p) if disposition == TRUNCATE_EXISTING && !ov_entry => Decision::UseWithDisposition(p, CREATE_ALWAYS),
-                    Ok(p) => Decision::Use(p),
+                    Ok(path) => Decision::WriteOverlay {
+                        path,
+                        rel,
+                        disposition: if disposition == TRUNCATE_EXISTING && !ov_entry { CREATE_ALWAYS } else { disposition },
+                    },
                     Err(e) => Decision::Fail(e),
                 }
             }
@@ -734,17 +732,20 @@ mod tests {
         );
         // write → overlay copy with original content
         let d = v.open_decision("G:\\data\\hello.txt", 0x4000_0000, OPEN_EXISTING, 0);
-        let Decision::Use(ov) = d else { panic!("{d:?}") };
+        let Decision::WriteOverlay { path: ov, rel, .. } = d else { panic!("{d:?}") };
         assert!(ov.contains("overlay"));
         assert_eq!(std::fs::read(&ov).unwrap(), b"original");
         std::fs::write(&ov, b"modified").unwrap();
+        v.commit_write(&rel);
         // later reads see the overlay
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x8000_0000, OPEN_EXISTING, 0), Decision::Use(ov.clone()));
         // original untouched
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
         // CREATE_ALWAYS on a new file → overlay, nothing created in the game folder
-        let Decision::Use(newp) = v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
+        let Decision::WriteOverlay { path: newp, rel, .. } = v.open_decision("G:\\data\\new.bin", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
         assert!(newp.contains("overlay"));
+        std::fs::write(&newp, b"new").unwrap();
+        v.commit_write(&rel);
         assert!(!f.game().join("data").join("new.bin").exists());
         // CREATE_NEW on an existing file fails
         assert_eq!(v.open_decision("G:\\data\\hello.txt", 0x4000_0000, CREATE_NEW, 0), Decision::Fail(ERROR_FILE_EXISTS));
@@ -764,8 +765,12 @@ mod tests {
         let v2 = Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]);
         assert!(v2.is_whiteout("data\\gone.txt"));
         // re-creating the file un-hides it (in the overlay)
-        let Decision::Use(p) = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
+        let Decision::WriteOverlay { path: p, rel, .. } = v.open_decision("G:\\data\\gone.txt", 0x4000_0000, CREATE_ALWAYS, 0) else { panic!() };
         assert!(p.contains("overlay"));
+        assert!(v.is_whiteout(&rel), "preparing an open must not clear a whiteout");
+        assert!(Vfs::new(&f.game(), &f.dir.join("xcldata"), vec![]).is_whiteout(&rel));
+        std::fs::write(&p, b"recreated").unwrap();
+        v.commit_write(&rel);
         assert!(!v.is_whiteout("data\\gone.txt"));
     }
 
@@ -790,10 +795,10 @@ mod tests {
 
         // Un-overlaid game file: TRUNCATE_EXISTING rewrites disposition to CREATE_ALWAYS in the
         // overlay WITHOUT publishing a placeholder file before the native CreateFile call runs.
-        let Decision::UseWithDisposition(ov, disp) =
+        let Decision::WriteOverlay { path: ov, rel, disposition: disp } =
             v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0)
         else {
-            panic!("expected Decision::UseWithDisposition for TRUNCATE_EXISTING on un-overlaid game file");
+            panic!("expected an overlay write for TRUNCATE_EXISTING on an un-overlaid game file");
         };
         assert!(ov.contains("overlay"));
         assert_eq!(disp, CREATE_ALWAYS);
@@ -814,6 +819,7 @@ mod tests {
             )
         };
         assert_ne!(h, windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE);
+        v.commit_write(&rel);
         unsafe { windows_sys::Win32::Foundation::CloseHandle(h) };
         assert_eq!(std::fs::read(&ov).unwrap(), b"");
         assert_eq!(std::fs::read(&orig).unwrap(), b"original");
@@ -822,7 +828,7 @@ mod tests {
         std::fs::write(&ov, b"overlay-content").unwrap();
         assert_eq!(
             v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, TRUNCATE_EXISTING, 0),
-            Decision::Use(ov.clone())
+            Decision::WriteOverlay { path: ov.clone(), rel: rel.clone(), disposition: TRUNCATE_EXISTING }
         );
         assert_eq!(std::fs::read(&ov).unwrap(), b"overlay-content");
         let h2 = unsafe {
@@ -971,10 +977,11 @@ mod tests {
         assert!(v2.is_whiteout("data\\sub\\deep.txt"));
 
         // Recreating one file un-hides only that file.
-        let Decision::Use(p) = v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
+        let Decision::WriteOverlay { path: p, rel, .. } = v.open_decision("G:\\data\\hello.txt", GENERIC_WRITE, CREATE_ALWAYS, 0) else {
             panic!("expected overlay path");
         };
         std::fs::write(&p, b"fresh").unwrap();
+        v.commit_write(&rel);
         assert!(!v.is_whiteout("data\\hello.txt"));
         assert!(v.is_whiteout("data\\gone.txt"));
         assert!(v.is_whiteout("data\\sub\\deep.txt"));

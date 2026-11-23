@@ -1,10 +1,16 @@
-//! XGameSave – containers of named blobs (public GDK `XGameSave.h`), stored as files:
-//! `<data>/gamesave/<configuration id>/<container>/b/<blob>` + `display` (display name).
+//! XGameSave – containers of named blobs (public GDK `XGameSave.h`), stored under
+//! `<data>/gamesave/<configuration id>/<container>/`.
+//! A container's committed snapshot holds `b/<blob>` and `display` (display name).
+//! `b/~xclsave.current` selects one of two snapshots under the container's `b/` directory.
+//! Containers without a pointer read the original files directly from the container root.
 //! Offline: no cloud sync. Async variants use XAsync.
 
-use std::ffi::{c_void, CString};
+use std::ffi::{c_void, CString, OsStr};
+use std::fs;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
 use super::xasync::*;
 use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
@@ -13,6 +19,9 @@ use crate::util::{from_cstr_ptr, E_FAIL, E_INVALIDARG, HRESULT, S_OK};
 /// `enc()` always percent-encodes `~` as `%7E`, so no encoded blob name can ever start with this.
 const TMP_PREFIX: &str = "~xcltmp.";
 static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+const CURRENT: &str = "~xclsave.current";
+const SNAPSHOTS: [&str; 2] = ["~xclsave.0", "~xclsave.1"];
+static SAVE_FILES: RwLock<()> = RwLock::new(());
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
@@ -109,15 +118,30 @@ fn dec(file: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+fn current_snapshot(dir: &Path) -> io::Result<PathBuf> {
+    let storage = dir.join("b");
+    let name = match fs::read(storage.join(CURRENT)) {
+        Ok(marker) => SNAPSHOTS
+            .into_iter()
+            .find(|name| name.as_bytes() == marker)
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "invalid save snapshot"))?,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(dir.to_path_buf()),
+        Err(e) => return Err(e),
+    };
+    Ok(storage.join(name))
+}
+
+fn internal_file(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with(TMP_PREFIX) || name.starts_with("~xclsave.")
+}
+
 fn blobs_of(dir: &Path) -> Vec<(String, PathBuf, u64)> {
     let mut v: Vec<(String, PathBuf, u64)> = std::fs::read_dir(dir.join("b"))
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| {
-            e.file_type().is_ok_and(|t| t.is_file())
-                && !e.file_name().to_string_lossy().starts_with(TMP_PREFIX)
-        })
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !internal_file(&e.file_name()))
         .map(|e| (dec(&e.file_name().to_string_lossy()), e.path(), e.metadata().map(|m| m.len()).unwrap_or(0)))
         .collect();
     v.sort();
@@ -227,7 +251,17 @@ pub unsafe extern "system" fn XGameSaveGetRemainingQuota(p: *mut Provider, quota
     if quota.is_null() {
         return E_INVALIDARG;
     }
-    let used: u64 = std::fs::read_dir(&pr.root).into_iter().flatten().flatten().flat_map(|e| blobs_of(&e.path())).map(|b| b.2).sum();
+    let used: u64 = {
+        let _files = SAVE_FILES.read().unwrap_or_else(|e| e.into_inner());
+        fs::read_dir(&pr.root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| current_snapshot(&e.path()).ok())
+            .flat_map(|snapshot| blobs_of(&snapshot))
+            .map(|b| b.2)
+            .sum()
+    };
     *quota = (QUOTA - used as i64).max(0);
     static LAST: std::sync::Mutex<Option<i64>> = std::sync::Mutex::new(None);
     if let Ok(mut last) = LAST.lock() {
@@ -264,11 +298,8 @@ unsafe fn delete_path(p: *mut Provider, name: *const u8) -> Result<PathBuf, HRES
     std::path::absolute(pr.root.join(enc(&name))).map_err(|_| E_FAIL)
 }
 
-// A queued delete must not remove a container partway through a blob update.
-static SAVE_MUTATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 fn delete_container(dir: &Path) {
-    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
+    let _files = SAVE_FILES.write().unwrap_or_else(|e| e.into_inner());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -332,17 +363,22 @@ unsafe fn each_container(pr: &Provider, prefix: &str, exact: bool, ctx: *mut c_v
         } else if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
-        let blobs = blobs_of(&d);
-        if blobs.is_empty() && !d.join("display").exists() {
-            continue; // created but never written
-        }
-        let display = std::fs::read_to_string(d.join("display")).unwrap_or_else(|_| name.clone());
-        let modified = std::fs::metadata(&d)
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|t| t.as_secs() as i64)
-            .unwrap_or(0);
+        let (blobs, display, modified) = {
+            let _files = SAVE_FILES.read().unwrap_or_else(|e| e.into_inner());
+            let Ok(snapshot) = current_snapshot(&d) else { continue };
+            let blobs = blobs_of(&snapshot);
+            if blobs.is_empty() && !snapshot.join("display").exists() {
+                continue; // created but never written
+            }
+            let display = fs::read_to_string(snapshot.join("display")).unwrap_or_else(|_| name.clone());
+            let modified = fs::metadata(snapshot)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|t| t.as_secs() as i64)
+                .unwrap_or(0);
+            (blobs, display, modified)
+        };
         let (cn, cd) = (CString::new(name).unwrap_or_default(), CString::new(display).unwrap_or_default());
         let info = ContainerInfo {
             name: cn.as_ptr() as *const u8,
@@ -381,7 +417,12 @@ pub unsafe extern "system" fn XGameSaveEnumerateContainerInfoByName(p: *mut Prov
 }
 
 unsafe fn each_blob(c: &Container, prefix: &str, ctx: *mut c_void, cb: BlobCb) {
-    for (name, _, size) in blobs_of(&c.dir) {
+    let blobs = {
+        let _files = SAVE_FILES.read().unwrap_or_else(|e| e.into_inner());
+        let Ok(snapshot) = current_snapshot(&c.dir) else { return };
+        blobs_of(&snapshot)
+    };
+    for (name, _, size) in blobs {
         if !starts_with_ignore_ascii_case(&name, prefix) {
             continue;
         }
@@ -407,7 +448,8 @@ pub unsafe extern "system" fn XGameSaveEnumerateBlobInfoByName(c: *mut Container
 /// Blobs `names` (all when empty) laid out as the API returns them: `Blob` array, then the
 /// names and data; pointers stored as offsets from the start (fixed up by the caller).
 fn read_layout(dir: &Path, names: &[String]) -> Result<(Vec<u8>, u32), HRESULT> {
-    let all = blobs_of(dir);
+    let _files = SAVE_FILES.read().unwrap_or_else(|e| e.into_inner());
+    let all = blobs_of(&current_snapshot(dir).map_err(|_| E_FAIL)?);
     let picked: Vec<(String, PathBuf)> = if names.is_empty() {
         all.into_iter().map(|b| (b.0, b.1)).collect()
     } else {
@@ -561,32 +603,87 @@ pub unsafe extern "system" fn XGameSaveSubmitBlobDelete(u: *mut Update, name: *c
     S_OK
 }
 
-fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
-    let _mutation = SAVE_MUTATION.lock().unwrap_or_else(|e| e.into_inner());
-    let blobs = dir.join("b");
-    if std::fs::create_dir_all(&blobs).is_err() {
-        return crate::util::E_FAIL;
-    }
-    if let Some(d) = display {
-        if write_atomic(&dir.join("display"), d.as_bytes()).is_err() {
-            return crate::util::E_FAIL;
-        }
-    }
-    for (name, data) in ops {
-        let path = blobs.join(enc(name));
-        match data {
-            Some(d) => {
-                // write to a unique sibling temp file, sync, then replace atomically
-                if write_atomic(&path, d).is_err() {
-                    return crate::util::E_FAIL;
+fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
+    result.or_else(|e| if e.kind() == ErrorKind::NotFound { Ok(()) } else { Err(e) })
+}
+
+fn copy_save_file(mut src: fs::File, dest: &Path) -> io::Result<()> {
+    let mut dest = fs::File::create(dest)?;
+    io::copy(&mut src, &mut dest)?;
+    dest.sync_all()
+}
+
+fn commit_update(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> io::Result<()> {
+    let _files = SAVE_FILES.write().unwrap_or_else(|e| e.into_inner());
+    let current = current_snapshot(dir)?;
+    let marker = if current.ends_with(SNAPSHOTS[0]) { SNAPSHOTS[1] } else { SNAPSHOTS[0] };
+    let storage = dir.join("b");
+    let stage = storage.join(marker);
+    let staged_blobs = stage.join("b");
+    ignore_missing(fs::remove_dir_all(&stage))?;
+    let mut legacy_files = Vec::new();
+    let result = (|| {
+        fs::create_dir_all(&staged_blobs)?;
+        let source_blobs = current.join("b");
+        match fs::read_dir(source_blobs) {
+            Ok(entries) => {
+                for e in entries {
+                    let e = e?;
+                    let name = e.file_name();
+                    if internal_file(&name) {
+                        continue;
+                    }
+                    let ty = e.file_type()?;
+                    let dest = staged_blobs.join(name);
+                    if ty.is_file() {
+                        copy_save_file(fs::File::open(e.path())?, &dest)?;
+                        if current == dir {
+                            legacy_files.push(e.path());
+                        }
+                    } else if ty.is_dir() {
+                        fs::create_dir(dest)?;
+                    }
                 }
             }
-            None => {
-                let _ = std::fs::remove_file(&path);
+            Err(e) if e.kind() == ErrorKind::NotFound && current == dir => {}
+            Err(e) => return Err(e),
+        }
+        let staged_display = stage.join("display");
+        let current_display = current.join("display");
+        if let Some(display) = display {
+            write_atomic(&staged_display, display.as_bytes())?;
+        } else {
+            match fs::File::open(&current_display) {
+                Ok(src) => copy_save_file(src, &staged_display)?,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
             }
         }
+        for (name, data) in ops {
+            let path = staged_blobs.join(enc(name));
+            match data {
+                Some(data) => write_atomic(&path, data)?,
+                None => ignore_missing(fs::remove_file(path))?,
+            }
+        }
+        write_atomic(&storage.join(CURRENT), marker.as_bytes())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_dir_all(stage);
+    } else if current == dir {
+        for file in legacy_files {
+            let _ = fs::remove_file(file);
+        }
+        let _ = fs::remove_file(dir.join("display"));
+    } else {
+        let _ = fs::remove_dir_all(current);
     }
-    S_OK
+    result
+}
+
+fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
+    commit_update(dir, display, ops).map_or(E_FAIL, |()| S_OK)
 }
 
 pub unsafe extern "system" fn XGameSaveSubmitUpdate(u: *mut Update) -> HRESULT {
@@ -750,6 +847,58 @@ mod tests {
         let i = &*i;
         v.push((from_cstr_ptr(i.name).unwrap(), from_cstr_ptr(i.display_name).unwrap(), i.blob_count, i.total_size));
         true
+    }
+
+    #[test]
+    fn failed_updates_preserve_display_and_all_blobs() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = DeleteFixture::new();
+        let dir = fixture.container_dir();
+        fs::write(dir.join("display"), b"Original").unwrap();
+        fs::write(dir.join("b").join("other"), b"keep").unwrap();
+        fs::create_dir(dir.join("b").join("blocked")).unwrap();
+        let (mut c, mut u) = (std::ptr::null_mut(), std::ptr::null_mut());
+        unsafe {
+            assert_eq!(XGameSaveCreateContainer(fixture.provider, b"slot/1\0".as_ptr(), &mut c), S_OK);
+            for asynchronous in [false, true] {
+                if asynchronous {
+                    assert_eq!(XGameSaveCreateUpdate(c, std::ptr::null(), &mut u), S_OK);
+                    assert_eq!(XGameSaveSubmitUpdate(u), S_OK);
+                    XGameSaveCloseUpdate(u);
+                }
+                assert_eq!(XGameSaveCreateUpdate(c, b"Changed\0".as_ptr(), &mut u), S_OK);
+                assert_eq!(XGameSaveSubmitBlobWrite(u, b"data\0".as_ptr(), b"changed".as_ptr(), 7), S_OK);
+                assert_eq!(XGameSaveSubmitBlobDelete(u, b"other\0".as_ptr()), S_OK);
+                assert_eq!(XGameSaveSubmitBlobWrite(u, b"blocked\0".as_ptr(), b"invalid".as_ptr(), 7), S_OK);
+                if asynchronous {
+                    assert_eq!(XGameSaveSubmitUpdateAsync(u, &mut *fixture.block), S_OK);
+                    XGameSaveCloseUpdate(u);
+                    assert!(XTaskQueueDispatch(fixture.block.queue, PORT_WORK, 0));
+                    assert_eq!(XGameSaveSubmitUpdateResult(&mut *fixture.block), E_FAIL);
+                } else {
+                    assert_eq!(XGameSaveSubmitUpdate(u), E_FAIL);
+                    XGameSaveCloseUpdate(u);
+                }
+
+                let mut list: Vec<(String, String, u32, u64)> = Vec::new();
+                assert_eq!(
+                    XGameSaveEnumerateContainerInfo(fixture.provider, std::ptr::addr_of_mut!(list).cast(), Some(count_containers)),
+                    S_OK
+                );
+                assert_eq!(list, [("slot/1".into(), "Original".into(), 2, 18)]);
+                let mut n = 0;
+                let mut buf = [0u64; 16];
+                let blobs = buf.as_mut_ptr().cast::<Blob>();
+                assert_eq!(XGameSaveReadBlobData(c, std::ptr::null(), &mut n, std::mem::size_of_val(&buf), blobs), S_OK);
+                assert_eq!(n, 2);
+                for (i, (name, data)) in [("data", &b"synthetic save"[..]), ("other", &b"keep"[..])].into_iter().enumerate() {
+                    let blob = &*blobs.add(i);
+                    assert_eq!(from_cstr_ptr(blob.info.name).as_deref(), Some(name));
+                    assert_eq!(std::slice::from_raw_parts(blob.data, blob.info.size as usize), data);
+                }
+            }
+            XGameSaveCloseContainer(c);
+        }
     }
 
     #[test]

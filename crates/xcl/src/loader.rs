@@ -1,6 +1,7 @@
 //! The XCL PE loader: maps console executables/DLLs into the current process and wires
 //! them to HLE modules, game DLLs and real Windows DLLs (design §5.1).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// map it twice. Re-entrant loads (import resolution mapping dependencies) happen on the
 /// same thread, so a re-entrant flag is used instead of holding the mutex across them.
 static LOAD_LOCK: Mutex<()> = Mutex::new(());
+static FAILED_ATTACH: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 thread_local! {
     static IN_LOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -57,14 +59,15 @@ type ExeEntry = unsafe extern "system" fn(*mut c_void) -> u32;
 
 /// Map an image, apply relocations, resolve imports, set up TLS / exception data and
 /// page protections. Does NOT run any code of the image.
-pub fn map_image(path: &Path) -> Result<Arc<MappedModule>, String> {
-    map_image_ex(path, false)
-}
-
 fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String> {
     let file = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pe = Pe::parse(&file, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = crate::util::dll_key(&path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+    let mut all = pe.imports().map_err(|e| format!("{name}: import table: {e}"))?;
+    match pe.delay_imports() {
+        Ok(v) => all.extend(v),
+        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+    }
     let size = pe.size_of_image as usize;
 
     // 1. reserve + commit
@@ -158,14 +161,6 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
     );
 
     // 4. imports (normal + delay-load, resolved eagerly)
-    let mut all = match pe.imports() {
-        Ok(v) => v,
-        Err(e) => return fail(format!("{name}: import table: {e}")),
-    };
-    match pe.delay_imports() {
-        Ok(v) => all.extend(v),
-        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
-    }
     for dll in &all {
         for e in &dll.entries {
             let addr = resolver::resolve_import(&dll.dll, &e.what, &name, dll.delay);
@@ -184,7 +179,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let template_len = t.template_len() as usize;
         let index_ptr = adj(t.address_of_index) as *mut u32;
         unsafe {
-            tls_install(&module, template, template_len, t.total_len(), index_ptr)?;
+            if let Err(e) = tls_install(&module, template, template_len, t.total_len(), index_ptr) {
+                reject_mapped(&module, &e);
+                return Err(e);
+            }
             if t.address_of_callbacks != 0 {
                 let mut cb = adj(t.address_of_callbacks) as *const u64;
                 let mut list = module.tls_callbacks.lock().unwrap();
@@ -263,6 +261,10 @@ pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
 }
 
 struct LoadGuard;
+pub(crate) fn on_loading_thread() -> bool {
+    IN_LOAD.try_with(|c| c.get() != 0).unwrap_or(false)
+}
+
 impl LoadGuard {
     fn enter() -> (LoadGuard, Option<std::sync::MutexGuard<'static, ()>>) {
         let outer = IN_LOAD.with(|c| {
@@ -287,12 +289,23 @@ pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
     if let Some(m) = modules::find_mapped_by_name(&key) {
         return Ok(m);
     }
-    let m = map_image(path)?;
+    if let Some(error) = FAILED_ATTACH.lock().unwrap().as_ref().and_then(|failed| failed.get(&key)).cloned() {
+        return Err(error);
+    }
+    let m = map_image_ex(path, false)?;
     if !m.is_dll {
         crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
     }
-    init_dll(&m)?;
+    if let Err(e) = init_dll(&m) {
+        reject_mapped(&m, &e);
+        return Err(e);
+    }
     Ok(m)
+}
+
+fn reject_mapped(m: &Arc<MappedModule>, error: &str) {
+    modules::unregister_mapped(m);
+    FAILED_ATTACH.lock().unwrap().get_or_insert_with(HashMap::new).insert(m.name.clone(), error.to_owned());
 }
 
 /// Map the title's main executable.
@@ -405,5 +418,35 @@ pub fn on_tls_event(reason: u32) {
             crate::log::flush();
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provisional_dll_is_visible_to_its_loader_until_rejected() {
+        let m = Arc::new(MappedModule {
+            name: "provisional_loader_test.dll".into(),
+            path: PathBuf::from("provisional_loader_test.dll"),
+            base: 0x7fff_ffff_0000,
+            size: 4096,
+            entry_rva: 0,
+            is_dll: true,
+            exports: OwnedExports::default(),
+            tls_callbacks: Mutex::new(Vec::new()),
+            no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(false),
+            stack_reserve: 0,
+        });
+        let (_g, _lock) = LoadGuard::enter();
+        modules::register_mapped(m.clone());
+        assert!(Arc::ptr_eq(&load_game_dll(&m.path).unwrap(), &m));
+        assert!(std::thread::spawn(|| modules::find_mapped_by_name("provisional_loader_test.dll").is_none()).join().unwrap());
+        reject_mapped(&m, "test attach failed");
+        assert!(modules::find_mapped_by_name(&m.name).is_none());
+        assert!(modules::image_base_for_addr(m.base).is_none());
+        assert_eq!(load_game_dll(&m.path).err().as_deref(), Some("test attach failed"));
     }
 }

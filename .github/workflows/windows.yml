@@ -23,5 +23,7 @@ jobs:
         run: rustup toolchain install 1.99.0-x86_64-pc-windows-msvc --profile minimal
       - name: Build the runtime and test title
         run: cargo +1.99.0-x86_64-pc-windows-msvc build --locked --workspace
-      - name: Test the compatibility layer on WARP
-        run: cargo +1.99.0-x86_64-pc-windows-msvc test --locked --workspace -- --test-threads=4 --show-output
+      - name: Test APIs and software-adapter graphics
+        run: cargo +1.99.0-x86_64-pc-windows-msvc test --locked -p xcl --lib --test disasm_e2e --test rpf_e2e -- --test-threads=4 --show-output
+      - name: Test title selection
+        run: cargo +1.99.0-x86_64-pc-windows-msvc test --locked -p xcl --test e2e launcher_uses_configured_exe_in_an_ambiguous_folder -- --exact

@@ -19,7 +19,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use windows::core::Interface;
@@ -383,6 +383,7 @@ fn plan_ring_chunk(ring_write: u64, want: usize, cap: usize) -> (u64, usize) {
 unsafe impl Send for State {}
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
+static UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 /// commits before the device existed
 static EARLY: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// generation counter incremented whenever the set of mapped tiles changes (for watch_ranges cache)
@@ -410,6 +411,19 @@ fn buffer_desc(bytes: u64) -> D3D12_RESOURCE_DESC {
 /// The sparse windows' buffers on `dev`: `(window_index, buffer_raw, gpu_va)` for each
 /// sparse window in `gpu::uma` (empty: no sparse windows).
 pub unsafe fn init(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
+    let windows = open(dev);
+    if windows.is_empty() {
+        UNAVAILABLE.store(true, Ordering::Release);
+        EARLY.lock().unwrap().clear();
+    }
+    windows
+}
+
+pub fn accepts_allocations() -> bool {
+    !UNAVAILABLE.load(Ordering::Acquire)
+}
+
+unsafe fn open(dev: &ID3D12Device) -> Vec<(usize, usize, u64)> {
     let Some(u) = crate::gpu::uma::get() else { return Vec::new() };
     let mut out = Vec::new();
     let mut windows = Vec::new();
@@ -1023,6 +1037,9 @@ impl State {
 /// 4 GiB window boundary when `size <= 4 GiB`). Commits the CPU pages and maps VRAM tiles
 /// (or queues them until the D3D12 device exists). Returns `(address, rounded_size)`.
 pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
+    if !accepts_allocations() {
+        return None;
+    }
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc(size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1036,6 +1053,9 @@ pub unsafe fn alloc(size: usize, align: usize) -> Option<(usize, usize)> {
 /// Allocate a zeroed, write-watched block strictly inside sparse window `window` (e.g.
 /// window 0 for 32-bit-addressed descriptor heaps). Returns `(address, rounded_size)`.
 pub unsafe fn alloc_in(window: usize, size: usize, align: usize) -> Option<(usize, usize)> {
+    if !accepts_allocations() {
+        return None;
+    }
     let u = crate::gpu::uma::get()?;
     let (addr, rounded) = u.sparse_alloc_in(window, size, align)?;
     if VirtualAlloc(addr as *const c_void, rounded, MEM_COMMIT, PAGE_READWRITE).is_null() {
@@ -1139,7 +1159,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that
 /// lie outside the range are not committed (holes); the range's pages are.
 pub unsafe fn committed(a: usize, n: usize) {
-    if n == 0 {
+    if n == 0 || !accepts_allocations() {
         return;
     }
     let mut g = STATE.lock().unwrap();

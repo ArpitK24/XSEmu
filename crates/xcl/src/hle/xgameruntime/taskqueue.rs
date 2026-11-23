@@ -140,6 +140,11 @@ struct Timed {
     port: u32,
     item: Item,
 }
+impl Timed {
+    fn count_inflight(&self) {
+        self.queue.state.lock().unwrap().inflight[self.port as usize] += 1;
+    }
+}
 impl PartialEq for Timed {
     fn eq(&self, o: &Self) -> bool {
         self.at == o.at && self.seq == o.seq
@@ -174,8 +179,9 @@ fn timer() -> &'static (Mutex<BinaryHeap<Timed>>, Condvar) {
                         None => g = cv.wait(g).unwrap(),
                         Some(t) if t.at <= now => {
                             let t = g.pop().unwrap();
+                            t.count_inflight();
                             drop(g);
-                            let _ = submit_now(&t.queue, t.port, t.item);
+                            submit(&t.queue, t.port, t.item, true);
                             g = m.lock().unwrap();
                         }
                         Some(t) => {
@@ -270,44 +276,42 @@ fn drain_serialized(p: Arc<Port>) {
 /// Lock order is always `p.items` (or `timer`) -> `q.state` so submission and `XTaskQueueTerminate`
 /// cannot race or deadlock.
 pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
+    submit(q, port, item, false)
+}
+
+fn submit(q: &Arc<Queue>, port: u32, item: Item, counted: bool) -> bool {
     let p = &q.ports[port as usize];
+    let queued = !matches!(p.mode, MODE_IMMEDIATE | MODE_THREAD_POOL);
+    {
+        let mut items = queued.then(|| p.items.lock().unwrap());
+        let mut state = q.state.lock().unwrap();
+        if state.terminated {
+            drop(state);
+            drop(items);
+            if counted {
+                unsafe { q.execute(port, item) };
+            }
+            return counted;
+        }
+        if !counted {
+            state.inflight[port as usize] += 1;
+        }
+        if let Some(items) = &mut items {
+            items.push_back(QueuedItem { item, queue: q.clone(), port });
+        }
+    }
     match p.mode {
         MODE_IMMEDIATE => {
-            {
-                let mut state = q.state.lock().unwrap();
-                if state.terminated {
-                    return false;
-                }
-                state.inflight[port as usize] += 1;
-            }
             q.notify_monitors(port);
             // SAFETY: Caller guarantees `item.cb` is a valid `XTaskQueueCallback` for `item.ctx`.
             unsafe { q.execute(port, item) };
         }
         MODE_THREAD_POOL => {
-            {
-                let mut state = q.state.lock().unwrap();
-                if state.terminated {
-                    return false;
-                }
-                state.inflight[port as usize] += 1;
-            }
             q.notify_monitors(port);
             let q2 = q.clone();
             spawn(Box::new(move || unsafe { q2.execute(port, item) }));
         }
         MODE_SERIALIZED_THREAD_POOL => {
-            {
-                let mut items = p.items.lock().unwrap();
-                {
-                    let mut state = q.state.lock().unwrap();
-                    if state.terminated {
-                        return false;
-                    }
-                    state.inflight[port as usize] += 1;
-                }
-                items.push_back(QueuedItem { item, queue: q.clone(), port });
-            }
             q.notify_monitors(port);
             if !p.running.swap(true, Ordering::AcqRel) {
                 let p2 = p.clone();
@@ -315,17 +319,6 @@ pub fn submit_now(q: &Arc<Queue>, port: u32, item: Item) -> bool {
             }
         }
         _ => {
-            {
-                let mut items = p.items.lock().unwrap();
-                {
-                    let mut state = q.state.lock().unwrap();
-                    if state.terminated {
-                        return false;
-                    }
-                    state.inflight[port as usize] += 1;
-                }
-                items.push_back(QueuedItem { item, queue: q.clone(), port });
-            }
             p.cv.notify_one();
             q.notify_monitors(port);
         }
@@ -589,20 +582,18 @@ pub unsafe extern "system" fn XTaskQueueTerminate(h: *mut c_void, wait: bool, ct
             qi.queue.execute(qi.port, qi.item);
         }
     }
-    // Delayed callbacks of `q` still waiting for their time are canceled too, before the
-    // termination callback (libHttpClient: CancelPendingEntries when a port terminates). They
-    // only count as in flight once due, so the wait below would not hold the callback for them,
-    // and they would run (canceled) after it – when the title may already have freed its context.
     let delayed: Vec<Timed> = {
         let (m, cv) = timer();
         let mut heap = m.lock().unwrap();
         let (mine, keep): (Vec<Timed>, Vec<Timed>) = std::mem::take(&mut *heap).into_vec().into_iter().partition(|t| Arc::ptr_eq(&t.queue, &q));
         *heap = BinaryHeap::from(keep);
+        for t in &mine {
+            t.count_inflight();
+        }
         cv.notify_all();
         mine
     };
     for t in delayed {
-        t.queue.state.lock().unwrap().inflight[t.port as usize] += 1;
         t.queue.execute(t.port, t.item);
     }
     let ctx = ctx as usize; // raw pointers are not Send
@@ -845,6 +836,38 @@ mod tests {
             assert_eq!(*ORDER.lock().unwrap(), ["delayed, canceled", "terminated"]);
             XTaskQueueCloseHandle(h);
         }
+    }
+
+    #[test]
+    fn termination_waits_for_a_delayed_callback_in_transit() {
+        unsafe extern "system" fn delayed(ctx: *mut c_void, canceled: bool) {
+            let tx = Box::from_raw(ctx.cast::<mpsc::Sender<&'static str>>());
+            let _ = tx.send(if canceled { "canceled" } else { "ran" });
+        }
+        unsafe extern "system" fn terminated(ctx: *mut c_void) {
+            let tx = Box::from_raw(ctx.cast::<mpsc::Sender<&'static str>>());
+            let _ = tx.send("terminated");
+        }
+
+        let q = Queue::new(MODE_MANUAL, MODE_MANUAL);
+        let h = new_handle(q.clone()).cast();
+        let (tx, rx) = mpsc::channel::<&'static str>();
+        let t = Timed {
+            at: Instant::now(),
+            seq: 0,
+            queue: q,
+            port: PORT_WORK,
+            item: Item { cb: delayed as usize, ctx: Box::into_raw(Box::new(tx.clone())) as usize },
+        };
+        t.count_inflight();
+        let ctx = Box::into_raw(Box::new(tx)).cast();
+        unsafe {
+            assert_eq!(XTaskQueueTerminate(h, false, ctx, terminated as usize), S_OK);
+        }
+        assert!(submit(&t.queue, t.port, t.item, true));
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "canceled");
+        assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), "terminated");
+        unsafe { XTaskQueueCloseHandle(h) };
     }
 
     #[test]

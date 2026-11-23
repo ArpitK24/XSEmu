@@ -33,6 +33,10 @@ impl MappedModule {
     pub fn contains(&self, addr: usize) -> bool {
         addr >= self.base && addr < self.base + self.size
     }
+
+    fn available(&self) -> bool {
+        !self.is_dll || self.initialized.load(Ordering::Acquire) || crate::loader::on_loading_thread()
+    }
 }
 
 static MAPPED: RwLock<Vec<Arc<MappedModule>>> = RwLock::new(Vec::new());
@@ -52,6 +56,20 @@ pub fn register_mapped(m: Arc<MappedModule>) {
     MAPPED.write().unwrap().push(m);
 }
 
+pub fn unregister_mapped(m: &Arc<MappedModule>) {
+    MAPPED.write().unwrap().retain(|loaded| !Arc::ptr_eq(loaded, m));
+    let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
+    for slot in &RANGE_BASE[..n] {
+        if slot.compare_exchange(m.base, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            break;
+        }
+    }
+    let mut main = MAIN.write().unwrap();
+    if main.as_ref().is_some_and(|loaded| Arc::ptr_eq(loaded, m)) {
+        *main = None;
+    }
+}
+
 /// Lock-free: base of the mapped image containing `addr`.
 pub fn image_base_for_addr(addr: usize) -> Option<usize> {
     let n = RANGE_COUNT.load(Ordering::Acquire).min(MAX_RANGES);
@@ -66,16 +84,16 @@ pub fn image_base_for_addr(addr: usize) -> Option<usize> {
 }
 
 pub fn mapped_modules() -> Vec<Arc<MappedModule>> {
-    MAPPED.read().map(|v| v.clone()).unwrap_or_default()
+    MAPPED.read().map(|v| v.iter().filter(|m| m.available()).cloned().collect()).unwrap_or_default()
 }
 
 pub fn find_mapped_by_name(name: &str) -> Option<Arc<MappedModule>> {
     let key = crate::util::dll_key(name);
-    MAPPED.read().ok()?.iter().find(|m| m.name == key).cloned()
+    MAPPED.read().ok()?.iter().find(|m| m.name == key && m.available()).cloned()
 }
 
 pub fn find_mapped_by_base(base: usize) -> Option<Arc<MappedModule>> {
-    MAPPED.read().ok()?.iter().find(|m| m.base == base).cloned()
+    MAPPED.read().ok()?.iter().find(|m| m.base == base && m.available()).cloned()
 }
 
 pub fn find_mapped_by_addr(addr: usize) -> Option<Arc<MappedModule>> {
