@@ -1,0 +1,824 @@
+# The entry signatures and stage state DXC 1.9 (-HV 2021 -Gis -O1) builds for each snippet, in the form of
+# tests/stage_signatures.rs. A case is a line of three '=', its name, its profile and 'unsupported' when stage::begin
+# does not take it; then its HLSL, a line '---', and what DXC wrote in dx.entryPoints ('error' when it rejects the
+# snippet). Regenerate: XCL_DXIL_DXC=... XCL_DXIL_BLESS=1 cargo test --test stage_signatures
+=== vs_ret vs_6_6
+float4 main(float4 p : POSITION, out float4 c : COLOR, float2 uv : TEXCOORD3, out float2 ouv : TEXCOORD3) : SV_Position { c = p.wzyx; ouv = uv; return p; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in TEXCOORD idx=[3] ct=9 kind=0 interp=0 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[3] ct=9 kind=0 interp=2 rows=1 cols=2 at=2,0 stream=0 dyn=0 used=3
+props vs
+=== vs_pack vs_6_6
+struct O { float4 pos : SV_Position; float2 a : A; float3 b : B; float c : C; nointerpolation uint d : D; float2 e : E; float f : F; noperspective float g : G; int h : H; centroid float3 i : I; float4 j : J; };
+struct I { float3 p : POSITION; uint2 q : Q; int r : R0; bool s : S; float4 t[2] : T; };
+O main(I i) { O o = (O)0; o.pos = float4(i.p, 1); o.a = i.t[1].xy; o.d = i.q.x; o.h = i.r; o.c = i.s ? 1.0 : 2.0; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=3 at=0,0 stream=0 dyn=0 used=7
+in Q idx=[0] ct=5 kind=0 interp=0 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=1
+in R idx=[0] ct=4 kind=0 interp=0 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in S idx=[0] ct=1 kind=0 interp=0 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+in T idx=[0, 1] ct=9 kind=0 interp=0 rows=2 cols=4 at=4,0 stream=0 dyn=0 used=3
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=2,0 stream=0 dyn=0 used=7
+out C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=1,2 stream=0 dyn=0 used=1
+out D idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out E idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=4,0 stream=0 dyn=0 used=3
+out F idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=1,3 stream=0 dyn=0 used=1
+out G idx=[0] ct=9 kind=0 interp=4 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+out H idx=[0] ct=4 kind=0 interp=1 rows=1 cols=1 at=3,1 stream=0 dyn=0 used=1
+out I idx=[0] ct=9 kind=0 interp=3 rows=1 cols=3 at=6,0 stream=0 dyn=0 used=7
+out J idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=7,0 stream=0 dyn=0 used=15
+props vs
+=== vs_clip vs_6_6
+struct O { float4 pos : SV_Position; float2 a : A; float3 cd : SV_ClipDistance0; float2 cd1 : SV_ClipDistance1; float cu : SV_CullDistance; float3 b : B; uint rt : SV_RenderTargetArrayIndex; uint vp : SV_ViewportArrayIndex; float c : C; };
+O main(float4 p : POSITION, uint vid : SV_VertexID, uint iid : SV_InstanceID) { O o = (O)0; o.pos = p; o.cd = p.xyz; o.cd1 = p.xy; o.cu = p.x; o.rt = vid; o.vp = iid; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in SV_VertexID idx=[0] ct=5 kind=1 interp=0 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=1
+in SV_InstanceID idx=[0] ct=5 kind=2 interp=0 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=3 at=2,0 stream=0 dyn=0 used=7
+out SV_ClipDistance idx=[1] ct=9 kind=6 interp=2 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=3
+out SV_CullDistance idx=[0] ct=9 kind=7 interp=2 rows=1 cols=1 at=2,3 stream=0 dyn=0 used=1
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=4,0 stream=0 dyn=0 used=7
+out SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+out SV_ViewportArrayIndex idx=[0] ct=5 kind=5 interp=1 rows=1 cols=1 at=5,1 stream=0 dyn=0 used=1
+out C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=1,2 stream=0 dyn=0 used=1
+props vs
+=== vs_arr vs_6_6
+struct O { float4 pos : SV_Position; float2 a[3] : A; float b : B; float cd[2] : SV_ClipDistance; float3 c : C; };
+O main(float4 p : POSITION, uint n : N) { O o = (O)0; o.pos = p; o.a[1] = p.xy; o.cd[1] = p.x; o.cd[0] = p.y; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in N idx=[0] ct=5 kind=0 interp=0 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=0
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0, 1, 2] ct=9 kind=0 interp=2 rows=3 cols=2 at=1,0 stream=0 dyn=0 used=3
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=1,2 stream=0 dyn=0 used=1
+out SV_ClipDistance idx=[0, 1] ct=9 kind=6 interp=2 rows=2 cols=1 at=4,0 stream=0 dyn=0 used=1
+out C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=6,0 stream=0 dyn=0 used=7
+props vs
+=== vs_partial vs_6_6
+struct O { float4 pos : SV_Position; float4 a : A; float4 b : B; float3 c : C; };
+O main(float4 p : POSITION, float4 q : Q, float4 r : R) { O o = (O)0; o.pos = p; o.a.x = q.y; o.a.z = 3; o.c.yz = r.zz; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in Q idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=2
+in R idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=4
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=3,0 stream=0 dyn=0 used=7
+props vs
+=== vs_undef vs_6_6
+struct O { float4 pos : SV_Position; float4 a : A; };
+O main(float4 p : POSITION) { O o; o.pos = p; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=0
+props vs
+=== vs_nested vs_6_6
+struct In2 { float2 uv : TEXCOORD1; int k : K; };
+struct I { float3 p : POSITION; In2 n; };
+struct O { float4 pos : sv_position; In2 n; float4 c : Color01; };
+O main(I i, inout float2 w : W, in uint id : SV_VERTEXID) { O o; o.pos = float4(i.p, id); o.n = i.n; o.c = w.xyxy; w = w.yx; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=3 at=0,0 stream=0 dyn=0 used=7
+in TEXCOORD idx=[1] ct=9 kind=0 interp=0 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+in K idx=[0] ct=4 kind=0 interp=0 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in W idx=[0] ct=9 kind=0 interp=0 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=3
+in SV_VertexID idx=[0] ct=5 kind=1 interp=0 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[1] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out K idx=[0] ct=4 kind=0 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+out Color idx=[1] ct=9 kind=0 interp=2 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+out W idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,2 stream=0 dyn=0 used=3
+props vs
+=== vs_many vs_6_6
+struct O { float4 pos : SV_Position; float a : A; float3 b : B; float2 c : C; float2 d : D; float e : E; int f : F; float g : G; uint h : H; float cd : SV_ClipDistance; float3 i : I; float cu : SV_CullDistance; };
+O main(float4 p : POSITION) { O o = (O)0; o.pos = p; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=1
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=1,1 stream=0 dyn=0 used=7
+out C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=2,0 stream=0 dyn=0 used=3
+out D idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=2,2 stream=0 dyn=0 used=3
+out E idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out F idx=[0] ct=4 kind=0 interp=1 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+out G idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=3,1 stream=0 dyn=0 used=1
+out H idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=4,1 stream=0 dyn=0 used=1
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+out I idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=6,0 stream=0 dyn=0 used=7
+out SV_CullDistance idx=[0] ct=9 kind=7 interp=2 rows=1 cols=1 at=5,1 stream=0 dyn=0 used=1
+props vs
+=== vs_clip2 vs_6_6
+struct O { float4 pos : SV_Position; float cd0 : SV_ClipDistance0; float3 a : A; float4 cd1 : SV_ClipDistance1; float2 cu : SV_CullDistance; float b : B; float cu1 : SV_CullDistance1; };
+O main(float4 p : POSITION) { O o = (O)0; o.pos = p; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=1
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=2,0 stream=0 dyn=0 used=7
+out SV_ClipDistance idx=[1] ct=9 kind=6 interp=2 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+out SV_CullDistance idx=[0] ct=9 kind=7 interp=2 rows=1 cols=2 at=1,1 stream=0 dyn=0 used=3
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=1 at=2,3 stream=0 dyn=0 used=1
+out SV_CullDistance idx=[1] ct=9 kind=7 interp=2 rows=1 cols=1 at=1,3 stream=0 dyn=0 used=1
+props vs
+=== vs_present vs_6_6
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O main(uint id : SV_VertexID) { O o; o.uv = float2((id << 1) & 2, id & 2); o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }
+---
+in SV_VertexID idx=[0] ct=5 kind=1 interp=0 rows=1 cols=1 at=0,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+props vs
+=== gen_vs vs_6_6
+struct XclIn {
+    float4 a0 : POSITION0;
+    uint2 a1_1 : BLENDINDICES0;
+    int3 a2 : TEXCOORD1;
+    float2 a1_3 : TEXCOORD0;
+    uint xcl_vid : SV_VertexID;
+    uint xcl_iid : SV_InstanceID;
+};
+struct XclOut {
+    float4 pos : SV_Position;
+    float4 p0 : COLOR0;
+    uint4 p1 : TEXCOORD0;
+    int4 p2 : TEXCOORD1;
+    float4 p3 : TEXCOORD2;
+    float2 p4 : SV_ClipDistance0;
+    float p5 : SV_CullDistance0;
+};
+XclOut main(XclIn xi)
+{
+    XclOut xo = (XclOut)0;
+    uint v0 = xi.xcl_vid;
+    uint v3 = xi.xcl_iid;
+    uint v4 = asuint(xi.a0[1]);
+    xo.pos[0] = asfloat(v4); xo.pos[3] = xi.a0[3];
+    xo.p1[2] = v0 + v3 + xi.a1_1[1];
+    xo.p2 = xi.a2.xyzz;
+    xo.p4[1] = xi.a1_3[0];
+    return xo;
+}
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=10
+in BLENDINDICES idx=[0] ct=5 kind=0 interp=0 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=2
+in TEXCOORD idx=[1] ct=4 kind=0 interp=0 rows=1 cols=3 at=2,0 stream=0 dyn=0 used=7
+in TEXCOORD idx=[0] ct=9 kind=0 interp=0 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=1
+in SV_VertexID idx=[0] ct=5 kind=1 interp=0 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+in SV_InstanceID idx=[0] ct=5 kind=2 interp=0 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[0] ct=5 kind=0 interp=1 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[1] ct=4 kind=0 interp=1 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[2] ct=9 kind=0 interp=2 rows=1 cols=4 at=4,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=2 at=5,0 stream=0 dyn=0 used=3
+out SV_CullDistance idx=[0] ct=9 kind=7 interp=2 rows=1 cols=1 at=5,2 stream=0 dyn=0 used=1
+props vs
+=== gen_ps ps_6_6
+struct XclIn {
+    noperspective centroid float4 xcl_pos : SV_Position;
+     float4 a0 : COLOR0;
+    sample float4 a1 : TEXCOORD0;
+    nointerpolation uint4 a2 : TEXCOORD1;
+    noperspective sample float4 a3 : TEXCOORD2;
+    centroid float4 a4 : TEXCOORD3;
+    nointerpolation int4 a5 : TEXCOORD4;
+    noperspective float4 a6 : TEXCOORD5;
+    nointerpolation float4 a7 : TEXCOORD6;
+    noperspective centroid float4 a8 : TEXCOORD7;
+    bool xcl_ff : SV_IsFrontFace;
+    uint xcl_cov : SV_Coverage;
+};
+struct XclOut {
+    float4 t0 : SV_Target0;
+    uint4 t1 : SV_Target1;
+    int4 t3 : SV_Target3;
+    float xcl_depth : SV_DepthLessEqual;
+};
+XclOut main(XclIn xi)
+{
+    XclOut xo = (XclOut)0;
+    bool xcl_live = false;
+    uint v2 = asuint(xi.xcl_pos.x);
+    uint v5 = asuint(xi.xcl_ff ? 1.0f : 0.0f);
+    uint v6 = xi.xcl_cov;
+    xo.t0[0] = xi.a0[2] + xi.a1[0] + xi.a3[3] + xi.a4[1] + xi.a6[0] + xi.a7[1] + xi.a8[2];
+    xo.t1[1] = xi.a2[3] + v2 + v5 + v6;
+    xo.t3[2] = xi.a5[0];
+    xo.xcl_depth = asfloat(v2);
+    if (v6 != 0u) xcl_live = true;
+    if (!xcl_live) discard;
+    return xo;
+}
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=5 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=1
+in COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=4
+in TEXCOORD idx=[0] ct=9 kind=0 interp=6 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=1
+in TEXCOORD idx=[1] ct=5 kind=0 interp=1 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=8
+in TEXCOORD idx=[2] ct=9 kind=0 interp=7 rows=1 cols=4 at=4,0 stream=0 dyn=0 used=8
+in TEXCOORD idx=[3] ct=9 kind=0 interp=3 rows=1 cols=4 at=5,0 stream=0 dyn=0 used=2
+in TEXCOORD idx=[4] ct=4 kind=0 interp=1 rows=1 cols=4 at=6,0 stream=0 dyn=0 used=1
+in TEXCOORD idx=[5] ct=9 kind=0 interp=4 rows=1 cols=4 at=7,0 stream=0 dyn=0 used=1
+in TEXCOORD idx=[6] ct=9 kind=0 interp=1 rows=1 cols=4 at=8,0 stream=0 dyn=0 used=2
+in TEXCOORD idx=[7] ct=9 kind=0 interp=5 rows=1 cols=4 at=9,0 stream=0 dyn=0 used=4
+in SV_IsFrontFace idx=[0] ct=5 kind=13 interp=1 rows=1 cols=1 at=10,0 stream=0 dyn=0 used=1
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[1] ct=5 kind=16 interp=0 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out SV_Target idx=[3] ct=4 kind=16 interp=0 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+out SV_DepthLessEqual idx=[0] ct=9 kind=18 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== gen_ps_unused ps_6_6
+struct XclIn {
+    float4 xcl_pos : SV_Position;
+};
+struct XclOut {
+    float4 xcl_unused : SV_Target7;
+};
+XclOut main(XclIn xi)
+{
+    XclOut xo = (XclOut)0;
+    return xo;
+}
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=0
+out SV_Target idx=[7] ct=9 kind=16 interp=0 rows=1 cols=4 at=7,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== gen_gs gs_6_6
+struct XclOut {
+    float4 pos : SV_Position;
+    float4 p0 : COLOR0;
+    uint4 p1 : TEXCOORD0;
+    float2 p2 : SV_ClipDistance0;
+};
+[maxvertexcount(6)]
+void main(triangle XclOut v[3], inout TriangleStream<XclOut> s)
+{
+    uint c = 3u;
+    if (v[0].pos.w > 0.0 && v[1].pos.w == v[0].pos.w)
+        c = 1u;
+    if (c == 3u) {
+        s.Append(v[0]);
+        s.Append(v[1]);
+        s.Append(v[2]);
+        return;
+    }
+    XclOut k = v[c], a = v[(c + 1u) % 3u], b = v[(c + 2u) % 3u];
+    XclOut d = v[0];
+    d.pos = a.pos + b.pos - k.pos;
+    d.p0 = a.p0 + b.p0 - k.p0;
+    s.Append(v[0]);
+    s.Append(d);
+    s.RestartStrip();
+    s.Append(v[2]);
+}
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+in TEXCOORD idx=[0] ct=5 kind=0 interp=1 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+in SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=3
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[0] ct=5 kind=0 interp=1 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=3
+props gs prim=3 maxv=6 streams=1 topo=5 inst=1
+=== gen_ms ms_6_6
+RWByteAddressBuffer res : register(u1);
+struct XclVert {
+    float4 pos : SV_Position;
+    uint4 p0 : TEXCOORD0;
+    float4 p1 : COLOR0;
+    int4 p2 : TEXCOORD1;
+    float3 p3 : SV_ClipDistance0;
+};
+[outputtopology("triangle")]
+[numthreads(64, 1, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[84], out indices uint3 tris[42])
+{
+    uint rec = gid.x * 718u;
+    uint nv = min(res.Load(rec * 4u), 84u);
+    uint np = min(res.Load(rec * 4u + 4u), 42u);
+    SetMeshOutputCounts(nv, np);
+    for (uint i = gi; i < nv; i += 64u) {
+        uint b = (rec + 4u + i * 8u) * 4u;
+        XclVert o;
+        o.pos = asfloat(res.Load4(b));
+        o.p0 = res.Load4(b + 16u).xyzw;
+        o.p1 = asfloat(res.Load4(b + 32u).xyzw);
+        o.p2 = asint(res.Load4(b + 48u).xyzw);
+        o.p3 = asfloat(res.Load4(b + 64u).xyz);
+        verts[i] = o;
+    }
+    for (uint j = gi; j < np; j += 64u) {
+        uint p = res.Load((rec + 676u + j) * 4u);
+        uint3 x = uint3(p & 0x3FFu, (p >> 10) & 0x3FFu, (p >> 20) & 0x3FFu);
+        bool bad = or((p >> 31) != 0u, any(x >= nv));
+        tris[j] = select(bad, uint3(0u, 0u, 0u), x);
+    }
+}
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[0] ct=5 kind=0 interp=1 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[1] ct=4 kind=0 interp=1 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=3 at=4,0 stream=0 dyn=0 used=7
+props ms threads=64,1,1 maxv=84 maxp=42 topo=2 payload=0
+=== ps_sv ps_6_6
+struct I { float4 pos : SV_Position; float4 a : A; nointerpolation uint b : B; bool ff : SV_IsFrontFace; uint cov : SV_Coverage; uint pid : SV_PrimitiveID; uint si : SV_SampleIndex; float2 c : C; uint rt : SV_RenderTargetArrayIndex; float cd : SV_ClipDistance; uint iid : SV_InstanceID; };
+struct O { float4 t0 : SV_Target0; uint4 t2 : SV_Target2; float d : SV_Depth; uint cov : SV_Coverage; int2 t1 : SV_Target1; uint st : SV_StencilRef; };
+O main(I i) { O o = (O)0; o.t0 = i.a * i.pos + i.c.xyxy + i.cd; o.t2 = uint4(i.b, i.cov, i.pid, i.si) + i.rt + i.iid; o.d = i.ff ? 0.5 : 0.25; o.cov = i.cov & 3; o.t1 = int2(1, 2); o.st = 3; return o; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+in B idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in SV_IsFrontFace idx=[0] ct=5 kind=13 interp=1 rows=1 cols=1 at=2,1 stream=0 dyn=0 used=1
+in SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=2,2 stream=0 dyn=0 used=1
+in SV_SampleIndex idx=[0] ct=5 kind=12 interp=1 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=0
+in C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=3,0 stream=0 dyn=0 used=3
+in SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+in SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+in SV_InstanceID idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=6,0 stream=0 dyn=0 used=1
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[2] ct=5 kind=16 interp=0 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out SV_Depth idx=[0] ct=9 kind=17 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+out SV_Coverage idx=[0] ct=5 kind=14 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+out SV_Target idx=[1] ct=4 kind=16 interp=0 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_StencilRef idx=[0] ct=5 kind=20 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_eval ps_6_6
+struct I { float4 pos : SV_Position; float4 a : A; noperspective float2 b : B; sample float3 c : C; centroid float d : D; linear noperspective centroid float e : E; };
+float4 main(I i) : SV_Target { float4 r = EvaluateAttributeCentroid(i.a); r.xy += EvaluateAttributeAtSample(i.b, 2); r.xyz += EvaluateAttributeSnapped(i.c, int2(1, -3)); r.x += EvaluateAttributeCentroid(i.a.z); if (i.d > i.e) discard; return r; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=0
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=0
+in B idx=[0] ct=9 kind=0 interp=4 rows=1 cols=2 at=2,0 stream=0 dyn=0 used=0
+in C idx=[0] ct=9 kind=0 interp=6 rows=1 cols=3 at=3,0 stream=0 dyn=0 used=0
+in D idx=[0] ct=9 kind=0 interp=3 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+in E idx=[0] ct=9 kind=0 interp=5 rows=1 cols=1 at=5,0 stream=0 dyn=0 used=1
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== ps_depth ps_6_6
+struct I { noperspective centroid float4 pos : SV_Position; float4 a : A; };
+struct O { float4 t0 : SV_Target0; float d : SV_DepthGreaterEqual; };
+[earlydepthstencil]
+O main(I i) { O o = (O)0; o.t0 = i.a; o.d = i.pos.z; return o; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=5 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=4
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthGreaterEqual idx=[0] ct=9 kind=19 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=1
+=== ps_min ps_6_6
+float4 main() : SV_Target { return float4(1, 0, 1, 1); }
+---
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== ps_present ps_6_6
+Texture2D t : register(t0);
+SamplerState s : register(s0);
+float4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.SampleLevel(s, uv, 0); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=0
+in TEXCOORD idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== ps_inner ps_6_6
+float4 main(float4 p : SV_Position, uint ic : SV_InnerCoverage, uint v : SV_ViewID, float3 bary : SV_Barycentrics) : SV_Target7 { return float4(ic, v, bary.xy); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=0
+in SV_Barycentrics idx=[0] ct=9 kind=28 interp=2 rows=1 cols=3 at=-1,-1 stream=0 dyn=0 used=3
+out SV_Target idx=[7] ct=9 kind=16 interp=0 rows=1 cols=4 at=7,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== ps_dyn ps_6_6
+struct I { float4 pos : SV_Position; float4 a[3] : A; nointerpolation uint n : N; float2 b[2] : B5; };
+float4 main(I i) : SV_Target { return i.a[1] + i.b[1].xyxy + i.n; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=0
+in A idx=[0, 1, 2] ct=9 kind=0 interp=2 rows=3 cols=4 at=1,0 stream=0 dyn=0 used=15
+in N idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+in B idx=[5, 6] ct=9 kind=0 interp=2 rows=2 cols=2 at=5,0 stream=0 dyn=0 used=3
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== ps_arrout ps_6_6 unsupported
+struct O { float4 t[2] : SV_Target; float4 u : SV_Target3; };
+O main(float4 p : SV_Position) { O o; o.t[0] = p; o.t[1] = p.yxwz; o.u = 1; return o; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[1] ct=9 kind=16 interp=0 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[3] ct=9 kind=16 interp=0 rows=1 cols=4 at=3,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== gs_pt gs_6_6
+struct V { float4 pos : SV_Position; float2 a : A; uint b : B; };
+struct O { float4 pos : SV_Position; float2 a : A; uint pid : SV_PrimitiveID; uint rt : SV_RenderTargetArrayIndex; uint b : B; bool ff : SV_IsFrontFace; };
+[maxvertexcount(4)] [instance(3)]
+void main(point V v[1], uint pid : SV_PrimitiveID, uint gi : SV_GSInstanceID, inout LineStream<O> s) { O o; o.pos = v[0].pos; o.a = v[0].a; o.pid = pid; o.rt = gi; o.b = v[0].b; o.ff = gi > 1; s.Append(o); o.pos.x += 1; s.Append(o); s.RestartStrip(); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+in B idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in SV_PrimitiveID idx=[0] ct=5 kind=10 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=0
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+out SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out B idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+out SV_IsFrontFace idx=[0] ct=5 kind=13 interp=1 rows=1 cols=1 at=2,1 stream=0 dyn=0 used=1
+props gs prim=1 maxv=4 streams=1 topo=3 inst=3
+=== gs_adj gs_6_6
+struct V { float4 pos : SV_Position; };
+[maxvertexcount(2)]
+void main(triangleadj V v[6], inout PointStream<V> s) { V o; o.pos = v[5].pos + v[0].pos; s.Append(o); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props gs prim=7 maxv=2 streams=1 topo=1 inst=1
+=== gs_line gs_6_6
+struct V { float4 pos : SV_Position; float cd : SV_ClipDistance; };
+[maxvertexcount(3)]
+void main(line V v[2], inout TriangleStream<V> s) { s.Append(v[0]); s.Append(v[1]); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=1,0 stream=0 dyn=0 used=1
+props gs prim=2 maxv=3 streams=1 topo=5 inst=1
+=== gs_lineadj gs_6_6
+struct V { float4 pos : SV_Position; nointerpolation float3 n : NORMAL; };
+[maxvertexcount(3)]
+void main(lineadj V v[4], inout LineStream<V> s) { s.Append(v[3]); s.Append(v[1]); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in NORMAL idx=[0] ct=9 kind=0 interp=1 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out NORMAL idx=[0] ct=9 kind=0 interp=1 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+props gs prim=6 maxv=3 streams=1 topo=3 inst=1
+=== gs_streams gs_6_6
+struct A { float4 pos : SV_Position; float2 a : A; };
+struct B { float3 b : B; uint c : C; };
+[maxvertexcount(2)]
+void main(point A v[1], inout PointStream<A> s0, inout PointStream<B> s1) { s0.Append(v[0]); B b; b.b = v[0].pos.xyz; b.c = 1; s1.Append(b); s1.RestartStrip(); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out B idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=0,0 stream=1 dyn=0 used=7
+out C idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=1,0 stream=1 dyn=0 used=1
+props gs prim=1 maxv=2 streams=3 topo=1 inst=1
+=== ms_prim ms_6_6
+struct V { float4 pos : SV_Position; float3 a : A; };
+struct P { uint pid : SV_PrimitiveID; bool cull : SV_CullPrimitive; float2 x : X; uint rt : SV_RenderTargetArrayIndex; };
+[outputtopology("triangle")] [numthreads(4, 2, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint3 dt : SV_DispatchThreadID, out vertices V v[6], out primitives P p[2], out indices uint3 t[2]) {
+  SetMeshOutputCounts(6, 2); v[gi].pos = float4(dt.xyzz); v[gi].a = gt; v[gi + 1].a.y = 2; p[gi & 1].pid = gid.x; p[0].cull = false; p[1].x = float2(1, 2); p[1].rt = 1; t[0] = uint3(0, 1, 2); t[gi & 1] = uint3(3, 4, 5); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+pc SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=0,0 stream=0 dyn=0 used=1
+pc SV_CullPrimitive idx=[0] ct=1 kind=30 interp=1 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+pc X idx=[0] ct=9 kind=0 interp=1 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+pc SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=0,1 stream=0 dyn=0 used=1
+props ms threads=4,2,1 maxv=6 maxp=2 topo=2 payload=0
+=== ms_payload ms_6_6 unsupported
+struct V { float4 pos : SV_Position; };
+struct Pay { float4 a; uint b; };
+[outputtopology("triangle")] [numthreads(1, 1, 1)]
+void main(in payload Pay pay, out vertices V v[3], out indices uint3 t[1]) { SetMeshOutputCounts(3, 1); v[pay.b].pos = pay.a; t[0] = uint3(0, 1, 2); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ms threads=1,1,1 maxv=3 maxp=1 topo=2 payload=20
+=== ms_line ms_6_6
+struct V { float4 pos : SV_Position; };
+[outputtopology("line")] [numthreads(1, 1, 1)]
+void main(out vertices V v[2], out indices uint2 t[1]) { SetMeshOutputCounts(2, 1); v[0].pos = float4(0, 0, 0, 1); v[1].pos = float4(1, 0, 0, 1); t[0] = uint2(0, 1); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ms threads=1,1,1 maxv=2 maxp=1 topo=1 payload=0
+=== ms_stand ms_6_6
+struct V { float4 p : SV_Position; };
+[outputtopology("triangle")]
+[numthreads(1, 1, 1)]
+void main(out vertices V v[1], out indices uint3 t[1]) { SetMeshOutputCounts(1, 1); v[0].p = float4(0, 0, 0, 1); t[0] = uint3(0, 0, 0); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ms threads=1,1,1 maxv=1 maxp=1 topo=2 payload=0
+=== ms_whole ms_6_6
+struct V { float4 pos : SV_Position; uint4 a : TEXCOORD0; bool b : B; float c[2] : C; };
+[outputtopology("triangle")] [numthreads(8, 1, 1)]
+void main(uint gi : SV_GroupIndex, out indices uint3 t[4], out vertices V v[12]) { SetMeshOutputCounts(gi, 4); V o; o.pos = 1; o.a = gi; o.b = gi > 3; o.c[0] = 1; o.c[1] = 2; v[gi] = o; t[gi] = select(gi > 2, uint3(0,0,0), uint3(gi, 1, 2)); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out TEXCOORD idx=[0] ct=5 kind=0 interp=1 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out B idx=[0] ct=1 kind=0 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+out C idx=[0, 1] ct=9 kind=0 interp=2 rows=2 cols=1 at=3,0 stream=0 dyn=0 used=1
+props ms threads=8,1,1 maxv=12 maxp=4 topo=2 payload=0
+=== as_basic as_6_6 unsupported
+struct Pay { float4 a; uint b; float3 c[2]; };
+[numthreads(2, 1, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID) { Pay p; p.a = float4(gi, 1, 2, 3); p.b = gid.y; p.c[0] = 1; p.c[1] = 2; DispatchMesh(gid.x, 2, 1, p); }
+---
+props as threads=2,1,1 payload=44
+=== cs_ids cs_6_6
+RWByteAddressBuffer res : register(u1);
+[WaveSize(32)]
+[numthreads(8, 4, 2)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint2 dt : SV_DispatchThreadID) { res.Store(gi * 4u, gid.x + gt.z + dt.y); }
+---
+props cs threads=8,4,2 wave=32
+=== err_nosem vs_6_6
+float4 main(float4 p) : SV_Position { return p; }
+---
+error
+=== err_na vs_6_6
+float4 main(float4 p : POSITION, uint f : SV_PrimitiveID) : SV_Position { return p + f; }
+---
+error
+=== err_overlap ps_6_6
+float4 main(float4 p : SV_Position, float4 q : SV_Position) : SV_Target { return p + q; }
+---
+error
+=== err_overlap_arb vs_6_6
+float4 main(float4 p : A, float4 q : A0) : SV_Position { return p + q; }
+---
+error
+=== err_wavesize ms_6_6
+struct V { float4 p : SV_Position; };
+[WaveSize(32)]
+[outputtopology("triangle")]
+[numthreads(1, 1, 1)]
+void main(out vertices V v[1], out indices uint3 t[1]) { SetMeshOutputCounts(1, 1); v[0].p = float4(0, 0, 0, 1); t[0] = uint3(0, 0, 0); }
+---
+error
+=== err_gs_count gs_6_6
+struct V { float4 pos : SV_Position; };
+[maxvertexcount(2)]
+void main(triangle V v[2], inout PointStream<V> s) { s.Append(v[0]); }
+---
+error
+=== ps_sv2 ps_6_6
+struct I { float4 pos : SV_Position; float3 c : COLOR; uint pid : SV_PrimitiveID; bool ff : SV_IsFrontFace; uint si : SV_SampleIndex; uint vid : SV_ViewID; float3 bary : SV_Barycentrics; uint cov : SV_Coverage; };
+struct O { float4 c : SV_Target0; float4 d : SV_Target2; float depth : SV_Depth; uint cov : SV_Coverage; uint st : SV_StencilRef; };
+O main(I i) { O o; o.c = float4(i.c * i.bary, i.pos.z); o.d = float4(i.pid, i.si, i.vid, i.ff ? 1 : 2); o.depth = i.pos.w; o.cov = i.cov >> 1; o.st = i.pid & 255; return o; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=12
+in COLOR idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+in SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in SV_IsFrontFace idx=[0] ct=5 kind=13 interp=1 rows=1 cols=1 at=2,1 stream=0 dyn=0 used=1
+in SV_SampleIndex idx=[0] ct=5 kind=12 interp=1 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=0
+in SV_Barycentrics idx=[0] ct=9 kind=28 interp=2 rows=1 cols=3 at=-1,-1 stream=0 dyn=0 used=7
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[2] ct=9 kind=16 interp=0 rows=1 cols=4 at=2,0 stream=0 dyn=0 used=15
+out SV_Depth idx=[0] ct=9 kind=17 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+out SV_Coverage idx=[0] ct=5 kind=14 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+out SV_StencilRef idx=[0] ct=5 kind=20 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_innercov ps_6_6
+float4 main(float4 pos : SV_Position, uint ic : SV_InnerCoverage, noperspective float2 uv : UV) : SV_Target { return float4(uv, ic, pos.x); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=1
+in UV idx=[0] ct=9 kind=0 interp=4 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== vs_sv2 vs_6_6
+struct O { float4 pos : SV_Position; float2 clip : SV_ClipDistance0; float cull : SV_CullDistance0; float3 n : NORMAL; nointerpolation uint id : ID; uint rt : SV_RenderTargetArrayIndex; uint vp : SV_ViewportArrayIndex; };
+O main(float3 p : POSITION, float3 n : NORMAL, uint vid : SV_VertexID, uint iid : SV_InstanceID, uint view : SV_ViewID) { O o; o.pos = float4(p, 1); o.clip = p.xy; o.cull = p.z; o.n = n; o.id = vid + iid; o.rt = view; o.vp = iid; return o; }
+---
+in POSITION idx=[0] ct=9 kind=0 interp=0 rows=1 cols=3 at=0,0 stream=0 dyn=0 used=7
+in NORMAL idx=[0] ct=9 kind=0 interp=0 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+in SV_VertexID idx=[0] ct=5 kind=1 interp=0 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in SV_InstanceID idx=[0] ct=5 kind=2 interp=0 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_CullDistance idx=[0] ct=9 kind=7 interp=2 rows=1 cols=1 at=1,2 stream=0 dyn=0 used=1
+out NORMAL idx=[0] ct=9 kind=0 interp=2 rows=1 cols=3 at=2,0 stream=0 dyn=0 used=7
+out ID idx=[0] ct=5 kind=0 interp=1 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=3,1 stream=0 dyn=0 used=1
+out SV_ViewportArrayIndex idx=[0] ct=5 kind=5 interp=1 rows=1 cols=1 at=3,2 stream=0 dyn=0 used=1
+props vs
+=== gs_sv2 gs_6_6
+struct V { float4 pos : SV_Position; float2 uv : UV; float clip : SV_ClipDistance0; };
+struct G { float4 pos : SV_Position; float2 uv : UV; uint pid : SV_PrimitiveID; uint rt : SV_RenderTargetArrayIndex; uint vp : SV_ViewportArrayIndex; float clip : SV_ClipDistance0; };
+[instance(3)] [maxvertexcount(6)]
+void main(triangle V v[3], uint pid : SV_PrimitiveID, uint gi : SV_GSInstanceID, uint view : SV_ViewID, inout TriangleStream<G> s) {
+    for (uint i = 0; i < 3; i++) { G g; g.pos = v[i].pos; g.uv = v[i].uv; g.pid = pid; g.rt = gi; g.vp = view; g.clip = v[i].clip; s.Append(g); }
+    s.RestartStrip();
+}
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in UV idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+in SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+in SV_PrimitiveID idx=[0] ct=5 kind=10 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=0
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out UV idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+out SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=3,0 stream=0 dyn=0 used=1
+out SV_ViewportArrayIndex idx=[0] ct=5 kind=5 interp=1 rows=1 cols=1 at=3,1 stream=0 dyn=0 used=1
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=4,0 stream=0 dyn=0 used=1
+props gs prim=3 maxv=6 streams=1 topo=5 inst=3
+=== ms_sv2 ms_6_6
+struct V { float4 pos : SV_Position; float2 uv : UV; float clip : SV_ClipDistance0; };
+struct P { uint pid : SV_PrimitiveID; bool cull : SV_CullPrimitive; uint rt : SV_RenderTargetArrayIndex; nointerpolation float3 c : COLOR; };
+[outputtopology("triangle")] [numthreads(4, 2, 1)]
+void main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, uint3 gt : SV_GroupThreadID, uint3 dt : SV_DispatchThreadID, uint view : SV_ViewID, out vertices V v[8], out primitives P p[4], out indices uint3 t[4]) {
+    SetMeshOutputCounts(8, 4);
+    v[gi].pos = float4(gt, 1); v[gi].uv = dt.xy; v[gi].clip = gid.z;
+    if (gi < 4) { p[gi].pid = gid.x + view; p[gi].cull = gt.x == 1; p[gi].rt = dt.z; p[gi].c = float3(gid); t[gi] = uint3(gi, gi + 1, gi + 2); }
+}
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out UV idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=3
+out SV_ClipDistance idx=[0] ct=9 kind=6 interp=2 rows=1 cols=1 at=2,0 stream=0 dyn=0 used=1
+pc SV_PrimitiveID idx=[0] ct=5 kind=10 interp=1 rows=1 cols=1 at=0,0 stream=0 dyn=0 used=1
+pc SV_CullPrimitive idx=[0] ct=1 kind=30 interp=1 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+pc SV_RenderTargetArrayIndex idx=[0] ct=5 kind=4 interp=1 rows=1 cols=1 at=0,1 stream=0 dyn=0 used=1
+pc COLOR idx=[0] ct=9 kind=0 interp=1 rows=1 cols=3 at=1,0 stream=0 dyn=0 used=7
+props ms threads=4,2,1 maxv=8 maxp=4 topo=2 payload=0
+=== err_ps_dle ps_6_6
+float4 main(float4 pos : SV_Position, out float d : SV_DepthLessEqual) : SV_Target { d = pos.z * 0.5; return pos; }
+---
+error
+=== ps_dle_centroid ps_6_6
+float4 main(linear noperspective centroid float4 pos : SV_Position, out float d : SV_DepthLessEqual) : SV_Target { d = pos.z * 0.5; return pos; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=5 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthLessEqual idx=[0] ct=9 kind=18 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_dge_sample ps_6_6
+float4 main(float4 pos : SV_Position, sample float2 uv : UV, out float d : SV_DepthGreaterEqual) : SV_Target { d = pos.z * uv.x; return pos; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in UV idx=[0] ct=9 kind=0 interp=6 rows=1 cols=2 at=1,0 stream=0 dyn=0 used=1
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthGreaterEqual idx=[0] ct=9 kind=19 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_dge_nopos ps_6_6
+float4 main(float2 uv : UV, out float d : SV_DepthGreaterEqual) : SV_Target { d = uv.x; return uv.xyxy; }
+---
+in UV idx=[0] ct=9 kind=0 interp=2 rows=1 cols=2 at=0,0 stream=0 dyn=0 used=3
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthGreaterEqual idx=[0] ct=9 kind=19 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== err_ps_out ps_6_6
+float4 main(float4 pos : SV_Position) : COLOR { return pos; }
+---
+error
+=== err_ps_2depth ps_6_6
+float4 main(float4 c : C, out float d : SV_Depth, out float e : SV_DepthLessEqual) : SV_Target { d = c.x; e = c.y; return c; }
+---
+error
+=== err_gs_total gs_6_6
+struct V { float4 pos : SV_Position; float4 a : A; float4 b : B; };
+[maxvertexcount(100)]
+void main(point V v[1], inout PointStream<V> s) { s.Append(v[0]); }
+---
+error
+=== gs_total_max gs_6_6
+struct V { float4 pos : SV_Position; float4 a : A; };
+[maxvertexcount(128)]
+void main(point V v[1], inout PointStream<V> s) { s.Append(v[0]); }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=15
+props gs prim=1 maxv=128 streams=1 topo=1 inst=1
+=== err_ms_bytes ms_6_6
+struct V { float4 pos : SV_Position; float4 a[8] : A; };
+[outputtopology("triangle")] [numthreads(1, 1, 1)]
+void main(out vertices V v[256], out indices uint3 t[1]) { SetMeshOutputCounts(3, 1); V o = (V)0; v[0] = o; t[0] = uint3(0, 1, 2); }
+---
+error
+=== err_pos3 vs_6_6
+float3 main(float3 p : POSITION) : SV_Position { return p; }
+---
+error
+=== err_sv_idx vs_6_6
+float4 main(float4 p : POSITION) : SV_Position1 { return p; }
+---
+error
+=== err_dup_sv ps_6_6
+float4 main(uint a : SV_PrimitiveID, uint b : SV_PrimitiveID1) : SV_Target { return a + b; }
+---
+error
+=== err_target8 ps_6_6
+float4 main(float4 c : C) : SV_Target8 { return c; }
+---
+error
+=== err_clip9 vs_6_6
+struct O { float4 pos : SV_Position; float4 a : SV_ClipDistance0; float4 b : SV_ClipDistance1; float c : SV_CullDistance0; };
+O main(float4 p : POSITION) { O o; o.pos = p; o.a = p; o.b = p; o.c = p.x; return o; }
+---
+error
+=== err_bary3 ps_6_6
+float4 main(float3 a : SV_Barycentrics, noperspective float3 b : SV_Barycentrics1, centroid float3 c : SV_Barycentrics2) : SV_Target { return float4(a + b + c, 1); }
+---
+error
+=== ps_bary2 ps_6_6
+float4 main(float3 a : SV_Barycentrics, noperspective float3 b : SV_Barycentrics1) : SV_Target { return float4(a + b, 1); }
+---
+in SV_Barycentrics idx=[0] ct=9 kind=28 interp=2 rows=1 cols=3 at=-1,-1 stream=0 dyn=0 used=7
+in SV_Barycentrics idx=[1] ct=9 kind=28 interp=4 rows=1 cols=3 at=-1,-1 stream=0 dyn=0 used=7
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+props ps eds=0
+=== err_bary_same ps_6_6
+float4 main(float3 a : SV_Barycentrics, centroid float3 b : SV_Barycentrics1) : SV_Target { return float4(a + b, 1); }
+---
+error
+=== err_vid_float vs_6_6
+float4 main(float v : SV_VertexID) : SV_Position { return v; }
+---
+error
+=== err_pos_partial vs_6_6
+struct O { float4 pos : SV_Position; float2 a : A; };
+O main(float4 p : POSITION) { O o; o.pos.xyz = p.xyz; o.a = p.xy; return o; }
+---
+error
+=== err_depth_unwritten ps_6_6
+float4 main(float4 c : C, out float d : SV_Depth) : SV_Target { return c; }
+---
+error
+=== ps_target_unwritten ps_6_6
+void main(float4 c : C, out float4 a : SV_Target0, out float4 b : SV_Target1) { a = c; }
+---
+in C idx=[0] ct=9 kind=0 interp=2 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[1] ct=9 kind=16 interp=0 rows=1 cols=4 at=1,0 stream=0 dyn=0 used=0
+props ps eds=0
+=== err_int_linear ps_6_6
+float4 main(linear int a : A) : SV_Target { return a; }
+---
+error
+=== err_ff_out vs_6_6
+struct O { float4 pos : SV_Position; bool ff : SV_IsFrontFace; };
+O main(float4 p : POSITION) { O o; o.pos = p; o.ff = true; return o; }
+---
+error
+=== sv_int_vid vs_6_6
+float4 main(int v : SV_VertexID, int i : SV_InstanceID) : SV_Position { return v + i; }
+---
+error
+=== ps_ff_uint ps_6_6
+float4 main(uint ff : SV_IsFrontFace, int pid : SV_PrimitiveID) : SV_Target { return ff + pid; }
+---
+error
+=== ps_cov_int ps_6_6
+float4 main(float4 c : C, out int cov : SV_Coverage) : SV_Target { cov = 3; return c; }
+---
+error
+=== err_depth2 ps_6_6
+float4 main(float4 c : C, out float2 d : SV_Depth) : SV_Target { d = c.xy; return c; }
+---
+error
+=== err_ff_float ps_6_6
+float4 main(float ff : SV_IsFrontFace) : SV_Target { return ff; }
+---
+error
+=== err_ms_rows ms_6_6
+struct V { float4 pos : SV_Position; float a[20] : A; };
+struct P { float b[13] : B; };
+[outputtopology("triangle")] [numthreads(1, 1, 1)]
+void main(out vertices V v[3], out primitives P p[1], out indices uint3 t[1]) { SetMeshOutputCounts(3, 1); V o = (V)0; v[0] = o; P q = (P)0; p[0] = q; t[0] = uint3(0, 1, 2); }
+---
+error
+=== ms_rows_max ms_6_6
+struct V { float4 pos : SV_Position; float a[20] : A; };
+struct P { float b[11] : B; };
+[outputtopology("triangle")] [numthreads(1, 1, 1)]
+void main(out vertices V v[3], out primitives P p[1], out indices uint3 t[1]) { SetMeshOutputCounts(3, 1); V o = (V)0; v[0] = o; P q = (P)0; p[0] = q; t[0] = uint3(0, 1, 2); }
+---
+out SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out A idx=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19] ct=9 kind=0 interp=2 rows=20 cols=1 at=1,0 stream=0 dyn=0 used=1
+pc B idx=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] ct=9 kind=0 interp=1 rows=11 cols=1 at=0,0 stream=0 dyn=0 used=1
+props ms threads=1,1,1 maxv=3 maxp=1 topo=2 payload=0
+=== ps_dle_sampleindex ps_6_6
+float4 main(float4 pos : SV_Position, uint si : SV_SampleIndex, out float d : SV_DepthLessEqual) : SV_Target { d = pos.z * si; return pos; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=4 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+in SV_SampleIndex idx=[0] ct=5 kind=12 interp=1 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=0
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthLessEqual idx=[0] ct=9 kind=18 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_dge_centroid ps_6_6
+float4 main(centroid float4 pos : SV_Position, out float d : SV_DepthGreaterEqual) : SV_Target { d = pos.z; return pos; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=5 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthGreaterEqual idx=[0] ct=9 kind=19 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0
+=== ps_dge_possample ps_6_6
+float4 main(sample float4 pos : SV_Position, out float d : SV_DepthGreaterEqual) : SV_Target { d = pos.z; return pos; }
+---
+in SV_Position idx=[0] ct=9 kind=3 interp=7 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_Target idx=[0] ct=9 kind=16 interp=0 rows=1 cols=4 at=0,0 stream=0 dyn=0 used=15
+out SV_DepthGreaterEqual idx=[0] ct=9 kind=19 interp=0 rows=1 cols=1 at=-1,-1 stream=0 dyn=0 used=1
+props ps eds=0

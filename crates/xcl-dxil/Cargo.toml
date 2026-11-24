@@ -1,0 +1,28 @@
+[package]
+name = "xcl-dxil"
+description = "Direct DXIL backend: compiles the HLSL dialect XCL's shader translator emits to a signed DXIL container, without DXC"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[lib]
+name = "xcl_dxil"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xdxc"
+path = "src/bin/xdxc.rs"
+
+[[bin]]
+name = "xdiff"
+path = "src/bin/xdiff.rs"
+
+[profile.release]
+debug = 1
+
+[profile.dev]
+opt-level = 1
+
+# Standalone while the backend is brought up (it builds and tests on Linux, unlike xcl). Removed
+# when the crate joins the repository workspace.
+[workspace]
