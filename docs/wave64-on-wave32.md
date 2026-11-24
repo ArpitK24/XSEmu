@@ -1,7 +1,9 @@
 # Wave64 console programs on 32-lane GPUs
 
 Status: implemented for compute / kernel mode, the mesh (NGG) first pass and ES+GS
-(`gpu/recomp/emit.rs`, `PRELUDE_X64`). The native path is untouched: the form below is only
+(`gpu/recomp/emit.rs`, `PRELUDE_X64`); wave64 VS / PS, which cannot be paired, get the values
+of the lanes ≥ 32 they read instead (`upper_lanes.rs`, "Vertex and pixel shaders" below).
+The native path is untouched: the form below is only
 generated when the adapter cannot run 64-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1`
 `WaveLaneCountMax < 64`, e.g. NVIDIA, whose D3D12 range is 32..32). On such an adapter a
 `[WaveSize(64)]` compute shader is rejected at PSO creation, so until now wave64 compute
@@ -63,12 +65,24 @@ SGPRs of both halves and the tests fail if they ever differ.
   `lanes × (k + 1)` (k = exchange number, identical in both halves) and the others take its
   verdict (`WaveReadLaneFirst`); a fence, then the read. Slots are double-buffered by the
   parity of k: the partner can be at most one exchange ahead, so it never overwrites the
-  slot being read. The wait is bounded (2^20 polls): if it ever runs out (a desynchronised
-  pair – should not happen, see hazards), the wave stops exchanging (`xcl_x_dead`) and
+  slot being read. The wait is bounded by the group's progress, not by a count of its own
+  polls: every hardware wave adds to one groupshared word at each loop iteration, meet and
+  barrier and every 64 console instructions in between (`xcl_tick`), and a wait gives up
+  after 1024 polls during which that word stood still – no wave of the group runs any more,
+  so the partner will not come. A wait that counted its own polls gave up on partners that
+  were merely slower (32 waves of a 1024-thread group, a partner held at a barrier). When it
+  does give up (a desynchronised pair – should not happen, see hazards), the wave stops
+  exchanging (`xcl_x_dead`), says so in its counter (the partner stops without a wait of its
+  own), tests only its own word of a 64-bit mask from then on (the partner's bits in a mask
+  saved earlier never clear, and a loop over such a mask would spin to the loop budget) and
   finishes with half-local values instead of hanging the GPU until a TDR. This relies on
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
   are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
-  variant everywhere (the test suite passes with it too).
+  variant outside the native mesh stage.
+* **Native mesh** uses group barriers for exchanges. The RTX 3080 can serialize mesh
+  waves, so a wave polling another may time out even when both run identical code.
+  Multi-wave native mesh is accepted only when every wave reaches each exchange
+  together. Other mesh programs use the compute form for their exchanges.
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The
@@ -93,6 +107,13 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    is exactly one console wave, whose control flow is identical in both halves; console
    `s_barrier` stays a group barrier (all console waves reach it, as on the console). The GS
    phase (lower half only) has no exchanges and its `s_barrier` is dropped (one wave).
+   A wave that has ended is waited for at a D3D12 group barrier for ever, which the console
+   does not do. In native mesh code without LDS or memory writes, guest barriers only
+   order exports. The translator stages them and uses the uniform group barrier before
+   publishing the outputs. Barriers that synchronize memory stay real group barriers
+   only when every wave is proven to reach the same site. Elsewhere `xcl_s_barrier`
+   counts live waves and arrivals. It gives up after 1024 polls without progress, then
+   disables polling for the whole group so each pair of halves uses the same verdict.
 3. **Lane numbering** – handled by `xcl_x_thread` (see above); NVIDIA really does form waves
    of non-consecutive thread indices for 3-D groups (`gpu_split_wave64_waves_diverge` fails
    without the remap).
@@ -138,8 +159,10 @@ destination, 0 in every lane), which are the same in both halves either way.
 A wave64 program pays one exchange per mask write that is read whole (`v_cmp*` feeding
 `s_and_saveexec`, `s_cbranch_vccz`, `s_bcnt1`, …) and per readlane / readfirstlane /
 ds_bpermute / coherent scalar load, nothing per ALU, memory or DPP instruction, nor for
-masks read lane by lane (selects, 64-bit carry chains). Wave32 programs, VS / PS and everything on GPUs with 64-lane waves are
-unchanged (the HLSL of every native translation the test suite makes is byte-identical).
+masks read lane by lane (selects, 64-bit carry chains). Wave32 programs and everything on GPUs with 64-lane waves are
+unchanged (the HLSL of every native translation the test suite makes is byte-identical). A
+wave64 VS / PS pays nothing for a lane ≥ 32 read as a constant (the lane read is skipped) and
+one scalar per spill slot read from its shadow.
 
 Measured on an RTX 5070 Ti (`bench_split_wave64`, an ignored test): a loop of 8
 instructions with one exchange, 2^18 threads × 32 768 iterations, wave32 program (no
@@ -178,6 +201,101 @@ one costs, not how often real shaders gain.
 What is left is readlane / readfirstlane, `ds_bpermute`, coherent scalar loads and masks
 read whole. Not measured on real compute shaders (none on that machine); Minecraft's 273
 wave64 programs, translated as compute, have 38 mask writes, all only read lane by lane.
+
+## Vertex and pixel shaders
+
+The driver picks the wave size of a VS or PS (HLSL has no `[WaveSize]` for them), and on a
+GPU with 32-lane waves only a console wave64 VS / PS runs in waves of 32. Nothing pairs two of
+them (no groupshared memory), so such a wave stands for a console wave whose lanes 32..63 are
+not populated, as in the last, partial wave of a draw. Per-lane code is exact as it is, and so
+are masks (their upper word is 0: those lanes are inactive), DPP / `ds_swizzle` /
+`v_permlane(x)16` (inside a 32-lane half) and `v_readfirstlane`. What is not: a read of a lane
+≥ 32 – `v_readlane` with a constant lane ≥ 32 or a lane from an SGPR, `ds_bpermute` – and
+`v_writelane` to one. On the console those lanes exist, inactive, and hold what `v_writelane`
+(which ignores EXEC) or whole-wave code (EXEC's upper word set, `s_or_saveexec_b64 s, -1`)
+put there; here they do not exist, and `WaveReadLaneAt(v, l)` with l ≥ 32 is undefined (NVIDIA
+gives lane l & 31).
+
+### What the retail pack does
+
+`retail_wave64_graphics_lane_census` (an ignored test) lists every such read in the pack's
+wave64 VS / PS (13 210 programs; 749 – 748 PS, 1 VS – were flagged by the old `wave_hazards`):
+
+| pattern | reads | programs (distinct code) | the console lane ≥ 32 holds | before |
+|---|---|---|---|---|
+| whole-wave reduction: the identity into the lanes outside the mask (`v_cndmask` with mask & saved EXEC), DPP8 xor 1 / 2 / 4, row_mirror, `v_permlanex16`, `v_readlane` 32 for the upper half, `v_readlane` 0 for the total; `v_min_u32` (identity -1), `v_max_u32` (0), `v_or_b32` (0) | 1 082 | 436 (434) | the identity | right by chance: NVIDIA reads lane 0 for lane 32, and min / max / or are idempotent (a sum would double) |
+| waterfall / uniformity check: `v_readlane v, s` with s = `s_ff1_i32_b64(mask & EXEC)` | 355 | 353 (351) | nothing (the lane is < 32 unless the mask is empty; then 63, never written) | right |
+| SGPR spill slots: `v_writelane` / `v_readlane` of lanes 0..47 of one VGPR | 200 | 11 | the spilled SGPR | wrong: the write is lost, the read returns another slot (lane & 31) |
+| `ds_bpermute` | 0 | | | |
+
+### The form
+
+For a wave64 VS / PS with `split_wave64`, `upper_lanes.rs` follows what the console's lanes
+32..63 hold through the program, a forward data-flow pass over its control flow:
+- EXEC's upper word, with the SGPRs as words known to be 0, all ones, or anything: 0 at the
+  start, 0 in every mask a VALU instruction writes while it is 0, combined by the bitwise SALU
+  and saveexec forms. While it is 0 no VALU instruction writes lanes 32..63.
+- per VGPR lane ≥ 32: unwritten, a constant, a spill slot, or unknown. A VALU write while
+  EXEC's upper word is all ones is evaluated (moves, `v_cndmask`, integer min / max / and / or /
+  xor / add, their DPP16 / DPP8 forms, `v_permlane(x)16` of lanes that all hold the same);
+  `v_writelane` makes the lane a slot. Paths join lane by lane (an unwritten lane takes the
+  other path's value: any value is right for it).
+
+Each read then gets:
+- unwritten: the read as it is – the console reads what an earlier wave left in the register,
+  which no program can depend on;
+- a constant: that constant (`uint t = c; if (!xcl_hw32) t = rla(…);`);
+- a slot: its shadow `xcl_sh<vgpr>_<lane>`, a scalar every `v_writelane` of that slot also
+  writes;
+- unknown: stays a hazard – `wave_hazards` reports only these.
+
+Spill slots < 32 are read from their shadows as well, whatever the wave size, as long as no
+other instruction has written the VGPR since the slot's `v_writelane`: in a partial wave (a
+primitive's edge) a lane that was not launched loses what `v_writelane` put there. 287 pixel
+shaders of the pack (3 540 reads) spill to lanes < 32.
+
+The wave size is checked at run time (`xcl_hw32 = WaveGetLaneCount() < 64`), so a driver that
+picks 64 lanes runs the program as before.
+
+Which GPUs get the form: every GPU whose wave range includes 32 (`pso::graphics_wave32`), not
+only those without 64-lane waves. D3D12 has no `WaveSize` for graphics shaders, so the driver
+picks, and an RDNA2 driver (RX 6600 XT, issue #42) runs a wave64 PS in waves of 32 although it
+reports 32–64: without the form, `v_readlane` 32 wrapped to lane 0 there
+(`gpu_wave64_ps_whole_wave_reductions` summed twice). Compute, mesh and geometry programs set
+`[WaveSize(64)]` and still get the split form only on GPUs without 64-lane waves.
+
+On a GPU with 64-lane waves only, nothing changes: the HLSL of every program of the pack is
+identical to the one before
+(`retail_wave64_graphics_lane_forms` prints digests of the native form, and of the other modes'
+32-lane form, to compare builds).
+
+In the pack every read resolves: 1 082 constants, 355 unwritten, 3 740 slot reads; none is
+left unsafe. Only a program with a constant or a slot to read gets the form: the HLSL changes
+for 613 programs (the 436 reductions and the 287 with spill slots, which overlap), all of
+which DXC compiles. Tests on the GPU: `gpu_wave64_ps_whole_wave_reductions`
+(the pack's reduction as min and as a sum, and the waterfall read, checked per hardware wave
+against a console wave of the same lanes), `gpu_wave64_ps_spill_slots` (whole target and a
+6-pixel triangle), `gpu_wave64_vs_spill_slots_and_identity` (a wave of 3 vertices).
+
+### What is still not exact
+
+**Lanes the PC did not launch, inside a wave** – on every GPU and wave size, and before this
+change too. The console runs whole-wave code in all 64 lanes, inactive ones included; the
+translation runs it only in the lanes the PC GPU launched. In a partial wave, the reduction's
+DPP / `v_permlanex16` steps read lanes that were never launched (undefined) instead of the
+identity the console put there – not only lanes 32..63. The lanes ≥ 32 of a 32-lane wave are
+handled above because they are all missing and all hold the identity; a lane missing among
+launched ones holds a partial result that the translation does not have. Making that exact
+needs the reduction recognised as a whole (`WaveActiveMin` / `Max` / `BitOr` over the
+launched lanes, with the identity for the lanes outside the mask) – not done. Measured on an
+RTX 5070 Ti (the reduction of `gpu_wave64_ps_whole_wave_reductions` drawn as a 3-quad
+triangle, lanes 12..31 not launched): those lanes read 0, so a min reduction (identity -1)
+gives 0, while max / or / sum (identity 0) and the waterfall read are right. 325 of the 436
+reduction programs have a min reduction (322 a max, 433 an or).
+
+Spill slots of lanes that were not launched are also still lost in the native form (GPUs with
+64-lane waves, which keep the HLSL as it was), and in the 32-lane form for slots ≥ 32 when the
+driver picks 64 lanes.
 
 ## Relation to earlier work
 
