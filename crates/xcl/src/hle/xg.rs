@@ -11,7 +11,7 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, arg4, src, row pitch, slice pitch), then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -33,16 +33,18 @@ use crate::util::{HRESULT, S_OK};
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
 const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
 const E_INVALIDARG: HRESULT = 0x8007_0057u32 as i32;
+const E_FAIL: HRESULT = 0x8000_4005u32 as i32;
 
 pub const LAYOUT_BYTES: usize = 0x1B40;
 const PLANE: usize = 0x18;
 const MIP: usize = 0x38;
 const MIP_BYTES: usize = 0x70;
+/// the console's D16_UNORM_S8_UINT (XCL stores it as D32_FLOAT_S8X24_UINT)
 const PLANE_BYTES: usize = MIP + 15 * MIP_BYTES;
 const MAX_MIPS: usize = 15;
 
 pub fn exports() -> Vec<(&'static str, usize)> {
-    crate::hle_exports![XGCreateTextureComputer]
+    crate::hle_exports![XGCreateTextureComputer, XGSuggestSwizzleMode]
 }
 
 /// The swizzle mode the console's library picks for a 2D texture with `Layout` 0 / 2: 64KB_D
@@ -75,6 +77,8 @@ pub struct Surface {
     pub width: u32,
     pub height: u32,
     pub array: u32,
+    /// depth slices of a 3D texture, 0: a 2D one
+    pub depth: u32,
     pub first_tail: usize,
 }
 
@@ -103,15 +107,18 @@ pub struct Texture {
     pub mips: u32,
     /// a depth buffer in a color format: the library reports a size of 0
     pub empty: bool,
+    /// D3D12_RESOURCE_DIMENSION
+    dimension: u32,
 }
 
 /// (log2 bytes per element, pixels per element side) of a DXGI format; None for the 96-bit
-/// and packed 4:2:2 ones (not tiled) and unknown formats
+/// and packed 4:2:2 ones (not tiled) and unknown formats. The console's own 116 / 117
+/// (R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT) are 32 bits a pixel, like R10G10B10A2.
 pub fn element(f: u32) -> Option<(u32, u32)> {
     Some(match f {
         1..=4 => (4, 1),
         9..=22 => (3, 1),
-        23..=47 | 67 | 87..=93 => (2, 1),
+        23..=47 | 67 | 87..=93 | 116 | 117 => (2, 1),
         48..=59 | 85 | 86 | 115 => (1, 1),
         60..=65 => (0, 1),
         70..=72 | 79..=81 => (3, 4),
@@ -137,18 +144,31 @@ impl Texture {
         let w16 = |o: usize| u16::from_le_bytes(d[o..o + 2].try_into().unwrap()) as u32;
         let (dim, width, height, array, mips, format, samples, layout, flags) =
             (u(0), u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18), w16(0x1C), w16(0x1E), u(0x20), u(0x24), u(0x2C), u(0x30));
-        // 1D / 3D / buffers and MSAA are not modelled
-        if dim != 3 || samples > 1 {
+        // buffers and MSAA are not modelled
+        if dim == 4 && samples <= 1 {
+            return Self::volume(width, height, array, mips, format, layout, flags, pipes);
+        }
+        if !matches!(dim, 2 | 3) || samples > 1 {
             return Err(E_NOTIMPL);
+        }
+        let line = dim == 2;
+        if line && (height != 1 || flags & 3 != 0 || !matches!(layout, 0 | 1 | 0x100 | 0x11B)) {
+            return Err(E_INVALIDARG);
         }
         if width == 0 || width > 16384 || height == 0 || height > 16384 || array == 0 {
             return Err(E_INVALIDARG);
         }
         // depth + stencil formats: a 4-byte depth plane and a 1-byte stencil plane
-        let planar = matches!(format, 19..=22 | 44..=47);
-        let (e, side) = if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
+        // depth + stencil formats: a 4-byte depth plane (the console's D16_UNORM_S8_UINT family,
+        // 118 – 120: a 2-byte one) and a 1-byte stencil plane
+        // (its R16_UNORM_X8_TYPELESS view format, 119, the library lays out as a plain 2-byte
+        // colour format – and as the depth + stencil pair for a depth buffer)
+        let d16s8 = matches!(format, 118 | 120) || (format == 119 && flags & 3 == 2 && mips == 1);
+        let planar = matches!(format, 19..=22 | 44..=47) || d16s8;
+        let (e, side) = if d16s8 || format == 119 { (1, 1) } else if planar { (2, 1) } else { element(format).ok_or(E_INVALIDARG)? };
         let mode = match layout {
             1 => 0,
+            0 if line => 0, // a 1D texture is linear
             0x100..=0x11F => layout & 0x1F,
             // the choice goes by the whole format's size (D32_S8X24: 64 bits a pixel)
             0 | 2 => optimal_mode(layout, flags, if matches!(format, 19..=22) { 64 } else { (8u64 << e) / (side * side) as u64 }, width, height),
@@ -161,7 +181,7 @@ impl Texture {
         }
         let surface = |e: u32, side: u32| Surface::new(mode, e, side, width as u32, height, array, mips, pipes);
         let (rt, ds) = (flags & 1 != 0, flags & 2 != 0);
-        if planar && layout == 2 {
+        if planar && layout == 2 && format != 119 {
             return Err(E_INVALIDARG); // a stencil format with the 64KB_D choice
         }
         // a depth buffer (one level: it gets an HTILE) is in the Z modes; in a color format it
@@ -176,7 +196,10 @@ impl Texture {
         let blank = (depth_buffer && !depth_format) || ((rt || ds) && side > 1 && mips == 1);
         // and then the resource is empty – except a render target's CMASK
         let empty = blank && ds;
-        let main = if blank { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
+        // the stencil view format of D16S8 (120): its depth plane takes no room, but in a
+        // one-level depth buffer
+        let stencil_only = format == 120 && !depth_buffer;
+        let main = if blank || stencil_only { PlaneKind::Blank } else { PlaneKind::Surface(surface(e, side)?) };
         let stencil = if planar { Some(surface(0, 1)?) } else { None };
         // metadata planes, per slice: CMASK 1 byte per 128 pixels, HTILE per 16, of the size
         // padded to 1024 × 1024
@@ -210,7 +233,40 @@ impl Texture {
                 Plane { usage, offset: at, kind }
             })
             .collect();
-        Ok(Texture { planes, main: main_at, mips, empty })
+        Ok(Texture { planes, main: main_at, mips, empty, dimension: dim })
+    }
+
+    /// A 3D texture: one plane of texels, 4KB_S unless the layout names a mode or it is a UAV
+    /// (Fortnite's newer library: 4KB_S for UAVs too, in 2D as well).
+    #[allow(clippy::too_many_arguments)]
+    fn volume(width: u64, height: u32, depth: u32, mips: u32, format: u32, layout: u32, flags: u32, pipes: crate::gpu::tiling::PipeConfig) -> Result<Texture, HRESULT> {
+        if width == 0 || width > 2048 || height == 0 || height > 2048 || depth == 0 || depth > 2048 {
+            return Err(E_INVALIDARG);
+        }
+        // render targets / depth: their planes are not modelled
+        if flags & 3 != 0 {
+            return Err(E_NOTIMPL);
+        }
+        let (e, side) = element(format).ok_or(E_INVALIDARG)?;
+        let mode = match layout {
+            1 => 0,
+            0x100..=0x11F => layout & 0x1F,
+            // UAVs: the 2D choice, by the texels of all the depth slices
+            0 if flags & 4 != 0 => optimal_mode(0, flags, (8u64 << e) / (side * side) as u64 * depth as u64, width, height),
+            0 => 5,
+            2 => return Err(E_NOTIMPL),
+            _ => return Err(E_INVALIDARG),
+        };
+        let full = 32 - (width as u32).max(height).max(depth).leading_zeros();
+        let mips = if mips == 0 { full } else { mips };
+        if mips as usize > MAX_MIPS {
+            return Err(E_INVALIDARG);
+        }
+        let l = Layout::new_3d(mode, e, pipes).ok_or(E_INVALIDARG)?;
+        let chain = Chain::new_3d(l, width as u32, height, depth, side, mips);
+        let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
+        let s = Surface { chain, mode, bpe: 1 << e, side, width: width as u32, height, array: 1, depth, first_tail };
+        Ok(Texture { planes: vec![Plane { usage: 1, offset: 0, kind: PlaneKind::Surface(s) }], main: 0, mips, empty: false, dimension: 4 })
     }
 
     pub fn size(&self) -> u64 {
@@ -257,7 +313,7 @@ impl Texture {
         q(b, 8, self.alignment());
         w(b, 0x10, self.mips);
         w(b, 0x14, self.planes.len() as u32);
-        w(b, 0x1B38, 3);
+        w(b, 0x1B38, self.dimension);
         for (k, p) in self.planes.iter().enumerate() {
             let pb = PLANE + k * PLANE_BYTES;
             w(b, pb, p.usage);
@@ -310,11 +366,28 @@ impl Surface {
         let l = Layout::new(mode, e, pipes).ok_or(E_INVALIDARG)?;
         let chain = Chain::new(l, width, height, side, mips);
         let first_tail = chain.levels.iter().position(|m| m.tail.is_some()).unwrap_or(chain.levels.len());
-        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, first_tail })
+        Ok(Surface { chain, mode, bpe: 1 << e, side, width, height, array, depth: 0, first_tail })
     }
 
     pub fn size(&self) -> u64 {
-        (self.chain.slice_bytes * self.array as usize) as u64
+        let slices = if self.depth > 0 { self.chain.layers() } else { self.array as usize };
+        (self.chain.slice_bytes * slices) as u64
+    }
+
+    /// depth slices of level `i` (an array's slices) and the same padded to whole blocks
+    fn slices(&self, i: usize) -> (u32, u32) {
+        if self.depth == 0 {
+            return (self.array, self.array);
+        }
+        let d = (self.depth >> i).max(1);
+        if self.mode == 0 {
+            return (d, self.depth); // (what the library writes for every linear level)
+        }
+        if self.chain.layout.block_d == 1 && self.chain.levels.len() > 1 {
+            return (d, 1); // thin with mips: the library's sizes are per slice
+        }
+        // what a level is padded from halves rounding up, as its width and height do
+        (d, self.depth.div_ceil(1 << i).next_multiple_of(self.chain.layout.block_d as u32))
     }
 
     pub fn alignment(&self) -> u64 {
@@ -344,6 +417,9 @@ impl Surface {
     /// patterns (the XOR modes take pipe bits from it)
     pub fn element_offset(&self, i: usize, x: usize, y: usize, slice: usize) -> u64 {
         let m = &self.chain.levels[i];
+        if self.chain.layout.block_d > 1 {
+            return self.chain.element_at_z(m, x, y, slice) as u64;
+        }
         (slice * self.chain.slice_bytes + m.offset + self.chain.layout.offset_z(x + m.origin.0, y + m.origin.1, slice, m.pitch)) as u64
     }
 
@@ -364,21 +440,21 @@ impl Surface {
             let tail = i >= self.first_tail;
             let (pw, ph) = self.padded(i);
             let bytes = (pw * ph) as u64 * self.bpe as u64;
-            let size = bytes;
-            q(b, r, size);
+            let (slices, padded_slices) = self.slices(i);
+            q(b, r, if self.depth > 0 { bytes * padded_slices as u64 } else { bytes });
             q(b, r + 8, self.mip_offset(i));
-            q(b, r + 0x10, size);
+            q(b, r + 0x10, bytes);
             w(b, r + 0x18, pw as u32 * self.side);
             w(b, r + 0x1C, pw as u32 * self.bpe);
             w(b, r + 0x20, if tail { 0x100 } else { self.alignment() as u32 });
             w(b, r + 0x24, pw as u32);
             w(b, r + 0x28, ph as u32);
-            w(b, r + 0x2C, self.array);
+            w(b, r + 0x2C, padded_slices);
             w(b, r + 0x30, m.width as u32);
             w(b, r + 0x34, m.height as u32);
             w(b, r + 0x38, (self.width >> i).max(1));
             w(b, r + 0x3C, (self.height >> i).max(1));
-            w(b, r + 0x40, self.array);
+            w(b, r + 0x40, slices);
             w(b, r + 0x44, 1);
             // the tail is in 256-byte tiles of the same kind (S 1, D 2, R 3; Z keeps its mode)
             w(b, r + 0x48, if tail && !self.mode.is_multiple_of(4) { self.mode % 4 } else { self.mode });
@@ -386,7 +462,9 @@ impl Surface {
                 w(b, r + 0x50, 0x8000);
                 w(b, r + 0x58, 0x8000);
             }
-            w(b, r + 0x60, 1);
+            w(b, r + 0x60, self.chain.layout.block_d as u32);
+            // a volume's tail levels: what the library writes at +8, +0x28, +0x2C and +0x68 is not
+            // modelled (their texels are: `element_offset`)
             w(b, r + 0x64, tail as u32);
         }
     }
@@ -417,6 +495,7 @@ fn vtbl() -> &'static [usize] {
             not_implemented as usize,
             copy_into as usize,
             copy_from as usize,
+            get_resource_tiling as usize,
         ];
         for i in v.len()..12 {
             let (stub, _) = crate::stubs::make_stub_info("xg_xs.dll", &format!("XGTextureAddressComputer::#{i}"), E_NOTIMPL as u32 as u64);
@@ -431,6 +510,34 @@ unsafe fn tex<'a>(p: *mut c_void) -> &'a Texture {
 }
 
 /// `HRESULT XGCreateTextureComputer(const D3D12_RESOURCE_DESC*, XGTextureAddressComputer**)`
+/// `HRESULT XGSuggestSwizzleMode(const D3D12_RESOURCE_DESC*, UINT, D3D12_TEXTURE_LAYOUT* out)`
+/// (a newer library's; a retail game passes 0 and its desc's own layout field as `out`): the explicit
+/// layout (0x100 | mode) the library takes for `Layout` 0. The choice itself is checked against
+/// the console's library (`optimal_mode`), this function is not – none at hand exports it.
+pub unsafe extern "system" fn XGSuggestSwizzleMode(desc: *const u8, _what: u32, out: *mut u32) -> HRESULT {
+    if desc.is_null() || out.is_null() {
+        return E_POINTER;
+    }
+    let mut d: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    d[0x2C..0x30].fill(0);
+    if d[0] == 2 {
+        *out = 0x100; // a 1D texture: linear
+        return S_OK;
+    }
+    let r = Texture::new(&d).and_then(|t| t.texels().map(|s| s.mode).ok_or(E_NOTIMPL));
+    let mode = match r {
+        Ok(m) => m,
+        // not modelled (MSAA, 3D render targets): the usual choice by use
+        Err(_) => {
+            let u = |o: usize| u32::from_le_bytes(d[o..o + 4].try_into().unwrap());
+            let bits = element(u(0x20)).map_or(32, |(e, _)| 8u64 << e);
+            optimal_mode(0, u(0x30), bits, u64::from_le_bytes(d[0x10..0x18].try_into().unwrap()), u(0x18))
+        }
+    };
+    *out = 0x100 | mode;
+    S_OK
+}
+
 pub unsafe extern "system" fn XGCreateTextureComputer(desc: *const u8, out: *mut *mut c_void) -> HRESULT {
     if desc.is_null() || out.is_null() {
         return E_POINTER;
@@ -492,7 +599,7 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
         *bit = 0;
     }
     match tex(p).plane_surface(plane) {
-        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.array => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
+        Some((s, at)) if (mip as usize) < s.chain.levels.len() && slice < s.slices(mip as usize).0 => at + s.element_offset(mip as usize, x as usize, y as usize, slice as usize),
         _ => 0,
     }
 }
@@ -500,6 +607,62 @@ unsafe extern "system" fn get_texel_offset(p: *mut c_void, plane: u32, mip: u32,
 unsafe extern "system" fn not_implemented(_p: *mut c_void) -> HRESULT {
     E_NOTIMPL
 }
+
+/// #10 GetResourceTiling(&tiles, &packed mip info, &tile shape, &count, first subresource,
+/// tilings) – D3D12's, for the texture's 64 KiB tiles (as the console's library answers: other
+/// swizzle modes E_FAIL; the mip tail is tile 0 of a slice; `count` comes back as the standard
+/// – not packed – subresources among the asked ones, written at their index from `first`, the
+/// packed ones left as they were). Volumes: not modelled (E_NOTIMPL).
+unsafe extern "system" fn get_resource_tiling(p: *mut c_void, tiles: *mut u32, packed: *mut [u32; 3], shape: *mut [u32; 3], count: *mut u32, first: u32, out: *mut [u32; 3]) -> HRESULT {
+    let Some(s) = tex(p).texels() else { return E_FAIL };
+    if s.depth > 0 {
+        return E_NOTIMPL;
+    }
+    let l = &s.chain.layout;
+    if l.block_bytes != TILE_BYTES {
+        return E_FAIL;
+    }
+    let tile = TILE_BYTES as u64;
+    let mips = s.chain.levels.len();
+    let std_mips = s.first_tail.min(mips);
+    if !tiles.is_null() {
+        *tiles = s.size().div_ceil(tile) as u32;
+    }
+    if !packed.is_null() {
+        let n_packed = (mips - std_mips) as u32;
+        let tail_tiles = if n_packed > 0 { 1 } else { 0 };
+        *packed = [std_mips as u32 | n_packed << 8, tail_tiles, 0];
+    }
+    if !shape.is_null() {
+        *shape = [(l.block_w as u32) * s.side, (l.block_h as u32) * s.side, l.block_d as u32];
+    }
+    if !count.is_null() {
+        let asked = *count as usize;
+        let subs = mips * s.array as usize;
+        let mut written = 0u32;
+        for k in 0..asked {
+            let sub = first as usize + k;
+            if sub >= subs {
+                break;
+            }
+            let (i, slice) = (sub % mips, sub / mips);
+            if i >= std_mips {
+                continue;
+            }
+            written += 1;
+            if !out.is_null() {
+                let (pw, ph) = s.padded(i);
+                let start = (slice as u64 * s.chain.slice_bytes as u64 + s.mip_offset(i)) / tile;
+                *out.add(k) = [pw.div_ceil(l.block_w) as u32, ph.div_ceil(l.block_h) as u32 | 1 << 16, start as u32];
+            }
+        }
+        *count = written;
+    }
+    S_OK
+}
+
+/// bytes of a tiled resource's tile
+const TILE_BYTES: usize = 0x1_0000;
 
 /// (surface, its offset, level, slice) of a subresource (mip + slice × mips) of a plane
 fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usize, usize)> {
@@ -510,10 +673,19 @@ fn subresource(t: &Texture, plane: u32, sub: u32) -> Option<(&Surface, u64, usiz
 }
 
 /// rows of `src` (`row_pitch` apart) → the level's place in `dst` (the whole resource)
-unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, _slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    if t.depth > 0 {
+        let mut linear = vec![0u8; row * m.height * m.depth];
+        for (n, to) in linear.chunks_exact_mut(row).enumerate() {
+            let from = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            to.copy_from_slice(std::slice::from_raw_parts(src.add(from), row));
+        }
+        t.chain.tile_volume(std::slice::from_raw_parts_mut(dst.add(at as usize), t.size() as usize), i, &linear);
+        return S_OK;
+    }
     let mut linear = vec![0u8; row * m.height];
     for y in 0..m.height {
         linear[y * row..(y + 1) * row].copy_from_slice(std::slice::from_raw_parts(src.add(y * row_pitch as usize), row));
@@ -524,10 +696,18 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, _slice_pitch: u32) -> HRESULT {
+unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, _arg4: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
+    if t.depth > 0 {
+        let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
+        for (n, from) in linear.chunks_exact(row).enumerate() {
+            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
+            std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
+        }
+        return S_OK;
+    }
     let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
     let linear = t.chain.detile_level(slice, i, k);
     for y in 0..m.height {
@@ -567,5 +747,69 @@ mod tests {
         assert_eq!(offsets, [0x20000, 0x10000, 0x8000, 0x4000, 0x2000, 0x1000, 0x800, 0x600, 0x500]);
         assert_eq!((mip(2, 0), mip(2, 9), mip(2, 10), mip(2, 18), mip(6, 9), mip(6, 10)), (0x8000, 0x40, 0x80, 1, 8, 8));
         assert_eq!(optimal_mode(0, 0, 32, 256, 256), 5);
+    }
+
+    #[test]
+    fn copy_subresource_vtable_uses_distinct_signatures() {
+        type CopyInto = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type CopyFrom = unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+        let d = desc(32, 16, 1, 1, 28, 1);
+        let size = Texture::new(&d).unwrap().size() as usize;
+        let mut computer = std::ptr::null_mut();
+        let (row, pitch, height) = (128, 144, 16);
+        let src: Vec<u8> = (0..pitch * height).map(|i| (i ^ (i >> 8)) as u8).collect();
+        let mut tiled = vec![0; size];
+        let mut dst = vec![0xA5; pitch * height];
+        unsafe {
+            assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut computer), S_OK);
+            let vtable = *(computer as *const *const usize);
+            let into: CopyInto = std::mem::transmute(*vtable.add(8));
+            let from: CopyFrom = std::mem::transmute(*vtable.add(9));
+            let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*vtable.add(1));
+            let (pitch, slice) = (pitch as u32, (pitch * height) as u32);
+            assert_eq!(into(computer, tiled.as_mut_ptr(), 0, 0, src.as_ptr(), pitch, slice), S_OK);
+            assert_eq!(from(computer, dst.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), pitch, slice), S_OK);
+            release(computer);
+        }
+        for (input, output) in src.chunks_exact(pitch).zip(dst.chunks_exact(pitch)) {
+            assert_eq!(output[..row], input[..row]);
+            assert!(output[row..].iter().all(|&v| v == 0xA5));
+        }
+    }
+
+    fn usages_and_bytes(t: &Texture) -> Vec<(u32, u32)> {
+        t.planes.iter().map(|p| (p.usage, if let PlaneKind::Surface(s) = &p.kind { s.bpe } else { 0 })).collect()
+    }
+
+    /// The console's D16_UNORM_S8_UINT (118): a 2-byte depth plane and a 1-byte stencil plane,
+    /// after the HTILE in a depth buffer – a real size, which the PC's allocation info had not
+    /// (u64::MAX, and the title stopped on its assertion).
+    #[test]
+    fn d16s8_is_planar_depth_and_stencil() {
+        let mut x = desc(1920, 1080, 1, 1, 118, 0);
+        x[0x30..0x34].copy_from_slice(&2u32.to_le_bytes()); // ALLOW_DEPTH_STENCIL
+        let t = Texture::new(&x).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(4, 0), (7, 2), (8, 1)]);
+        let end = t.planes.iter().map(|p| p.offset + p.bytes()).max().unwrap();
+        assert!(t.planes.windows(2).all(|w| w[0].offset + w[0].bytes() <= w[1].offset));
+        assert_eq!(t.size(), end);
+        assert!(t.size() >= 1920 * 1080 * 3 && t.size() < 1920 * 1080 * 8, "{:#x}", t.size());
+        assert_eq!(t.alignment(), 0x1_0000);
+        // the same format, not a depth buffer: depth and stencil planes only
+        let t = Texture::new(&desc(512, 512, 1, 1, 118, 0)).unwrap();
+        assert_eq!(usages_and_bytes(&t), [(5, 2), (6, 1)]);
+        assert!(t.size() >= 512 * 512 * 3 && t.size() != u64::MAX);
+    }
+
+    /// The console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT (116 / 117): 32 bits a pixel, laid
+    /// out as R10G10B10A2 (24).
+    #[test]
+    fn console_floats_are_32_bits() {
+        let rgb10a2 = Texture::new(&desc(1920, 1080, 1, 1, 24, 0)).unwrap();
+        for f in [116, 117] {
+            let t = Texture::new(&desc(1920, 1080, 1, 1, f, 0)).unwrap();
+            assert_eq!(usages_and_bytes(&t), [(1, 4)]);
+            assert_eq!((t.size(), t.alignment()), (rgb10a2.size(), rgb10a2.alignment()));
+        }
     }
 }

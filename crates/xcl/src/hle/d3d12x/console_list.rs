@@ -132,6 +132,32 @@ pub fn user_data(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR, l.inline, args, table_at)
 }
 
+/// Bytes of a compute dispatch's arguments that go in user SGPRs: the layout's rule, but
+/// never more than the shader itself has registers for. `user_sgprs` is the shader's own
+/// count (`real::pso_user_sgprs`; None = not known, the rule alone). The console's newer
+/// compiler follows the rule; XboxBvhBuilder.dll's shaders were built with four user SGPRs
+/// whatever their root signature (s4 is the group id) and take every argument from the
+/// table, also where the first ones would fit. Parameters stay whole: the inline part ends
+/// where the last parameter that fits the shader's registers ends.
+pub fn inline_for(l: &Layout, user_sgprs: Option<u32>) -> u32 {
+    let Some(user) = user_sgprs else { return l.inline };
+    let has = 4 * user.saturating_sub(FIRST_SGPR as u32);
+    if l.inline <= has {
+        return l.inline;
+    }
+    let end = |p: &Param| match *p {
+        Param::Constants { at, count } => at + 4 * count,
+        Param::Descriptor { at } => at + 8,
+        Param::Table { at } => at + 4,
+    };
+    l.params.iter().map(end).take_while(|&e| e <= has).last().unwrap_or(0)
+}
+
+/// `user_data` for a shader with `user_sgprs` user SGPRs (`inline_for`).
+pub fn user_data_for(l: &Layout, user_sgprs: Option<u32>, args: &[u8], table_at: u64) -> Vec<u32> {
+    sgprs(FIRST_SGPR, inline_for(l, user_sgprs), args, table_at)
+}
+
 /// `user_data` of a draw: the vertex and pixel shader's user SGPRs (inline from s8).
 pub fn user_data_gfx(l: &Layout, args: &[u8], table_at: u64) -> Vec<u32> {
     sgprs(FIRST_SGPR_GFX, l.inline_gfx, args, table_at)
@@ -287,8 +313,14 @@ pub fn pending_blocks() -> (usize, usize) {
     PENDING.lock().unwrap().as_ref().map_or((0, 0), |m| (m.len(), m.values().map(|v| v.len()).sum()))
 }
 
+#[cfg(test)]
+pub(crate) fn take_pending_for_test(allocator: usize) -> Vec<usize> {
+    PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&allocator)).unwrap_or_default()
+}
+
 /// An allocator was reset: the GPU no longer uses what its recordings put in unified memory.
 pub fn allocator_reset(allocator: *mut c_void) {
+    super::indirect::allocator_reset(allocator as usize);
     let blocks = PENDING.lock().unwrap().as_mut().and_then(|m| m.remove(&(allocator as usize)));
     if let Some(b) = blocks {
         unsafe { free_uma(&b) };
@@ -304,27 +336,32 @@ unsafe fn field(obj: usize, at: usize) -> *mut usize {
 }
 
 /// start a fresh record chunk (the previous one keeps what was written)
-unsafe fn new_chunk(obj: usize, st: &mut ListState) {
+unsafe fn new_chunk(obj: usize, st: &mut ListState, record_bytes: usize) {
     if let Some(last) = st.chunks.last_mut() {
         last.1 = *field(obj, F_WRITE) - last.0.as_ptr() as usize;
     }
-    let c = vec![0u8; CHUNK].into_boxed_slice();
+    let size = CHUNK.max(record_bytes + SLACK);
+    let c = vec![0u8; size].into_boxed_slice();
     let start = c.as_ptr() as usize;
     st.chunks.push((c, 0));
     *field(obj, F_WRITE) = start;
-    *field(obj, F_END) = start + CHUNK - SLACK;
-    *field(obj, F_DISPATCH_END) = start + CHUNK - SLACK;
+    *field(obj, F_END) = start + size - SLACK;
+    *field(obj, F_DISPATCH_END) = start + size - SLACK;
 }
 
 /// append a record (methods: the same encodings the inline code writes)
 unsafe fn push(obj: usize, words: &[u32]) {
+    let bytes = std::mem::size_of_val(words);
     let w = *field(obj, F_WRITE);
-    if w + 4 * words.len() > *field(obj, F_END) + SLACK / 2 {
-        with_list(obj, |st| new_chunk(obj, st));
+    let limit = *field(obj, F_END) + SLACK / 2;
+    if bytes > limit.saturating_sub(w) {
+        if with_list(obj, |st| new_chunk(obj, st, bytes)).is_none() {
+            return;
+        }
     }
     let w = *field(obj, F_WRITE);
     std::ptr::copy_nonoverlapping(words.as_ptr(), w as *mut u32, words.len());
-    *field(obj, F_WRITE) = w + 4 * words.len();
+    *field(obj, F_WRITE) = w + bytes;
 }
 
 fn header(i: usize) -> u32 {
@@ -353,8 +390,11 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     if left == 0 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
+            super::markers::recording_ended(st.pc);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
-            release(st.pc);
+            if release(st.pc) == 0 {
+                super::residency::list_reset(st.pc);
+            }
         }
         drop(Box::from_raw(std::slice::from_raw_parts_mut(obj as *mut u8, OBJECT_BYTES)));
     }
@@ -395,9 +435,14 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     if !blocks.is_empty() {
         PENDING.lock().unwrap().get_or_insert_with(HashMap::new).entry(old_alloc).or_default().extend(blocks);
     }
-    with_list(obj, |st| new_chunk(obj, st));
+    with_list(obj, |st| new_chunk(obj, st, 0));
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
-    f(pc, allocator, pc_pso(pso))
+    let hr = f(pc, allocator, pc_pso(pso));
+    if hr >= 0 {
+        super::residency::list_reset(pc);
+        super::markers::recording_ended(pc);
+    }
+    hr
 }
 
 unsafe extern "system" fn cl_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
@@ -569,7 +614,7 @@ pub unsafe fn create_with_allocator(pc: *mut c_void, allocator: *mut c_void) -> 
     let obj = Box::into_raw(vec![0u8; OBJECT_BYTES].into_boxed_slice()) as *mut u8 as usize;
     *field(obj, 0) = list_vtable();
     let mut st = ListState { pc: pc as usize, allocator: allocator as usize, refs: 1, chunks: Vec::new(), uma: Vec::new(), arena: Default::default() };
-    new_chunk(obj, &mut st);
+    new_chunk(obj, &mut st, 0);
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(obj, st);
     obj as *mut c_void
 }
@@ -649,13 +694,21 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&(st.pc as *mut c_void)).ok_or("no PC list")?.clone();
     // created with the first translated pipeline (without one every dispatch is skipped)
     let rs = super::real::abi_rs_cached().and_then(|p| ID3D12RootSignature::from_raw_borrowed(&p).cloned());
+    let u = crate::gpu::uma::get().ok_or("no UMA")?;
+    // the whole recording is replayed into the PC list here: its transitions of textures kept
+    // in step are these
+    super::title_textures::list_reset(st.pc);
     let windows = super::real::uma_window_vas();
     let uma_va = super::real::shader_window_base(&windows)?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(uma_va);
     let mut out = Translation::default();
     let mut layout: Option<Arc<Layout>> = None;
+    let mut title_rs = 0usize;
     let mut table: Vec<u8> = Vec::new();
     let mut pso: Option<*const ConsolePso> = None;
+    // translated shaders reach memory through the shared heap (`real::mem_views`): bound before
+    // the first dispatch when the title binds none
+    let mut heaps_bound = false;
     let chunks: Vec<Vec<u32>> = st.chunks.iter().map(|(c, used)| c[..*used].chunks(4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).collect()).collect();
     'chunks: for words in &chunks {
         let mut at = 0usize;
@@ -667,8 +720,11 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 at += 7;
             } else if w0 == RS_MARKER {
                 let r = get(2) as usize | (get(3) as usize) << 32;
-                layout = layout_of(r);
-                table = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+                if r != title_rs || layout.is_none() {
+                    layout = layout_of(r);
+                    table = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
+                    title_rs = r;
+                }
                 at += 4;
             } else if w0 == HEAPS_MARKER {
                 let n = get(1) as usize;
@@ -681,6 +737,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     }
                 }
                 list.SetDescriptorHeaps(&heaps);
+                heaps_bound = true;
                 at += 2 + 2 * n;
             } else if w0 == TRANSITIONS_MARKER {
                 let n = get(1) as usize;
@@ -690,6 +747,20 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                     // borrowed (ManuallyDrop fields, nothing released)
                     let mut b: Vec<u64> = vec![0; 4 * n];
                     std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, b.as_mut_ptr() as *mut u8, 32 * n);
+                    if super::title_textures::any() {
+                        // each barrier: type | flags, resource, subresource | before, after
+                        let t: Vec<(usize, u32, D3D12_RESOURCE_STATES)> =
+                            b.chunks_exact(4).filter(|c| c[0] as u32 == 0).map(|c| (c[1] as usize, c[2] as u32, D3D12_RESOURCE_STATES(c[3] as u32 as i32))).collect();
+                        super::title_textures::note_transitions(st.pc, &t);
+                    }
+                    super::residency::note_list_resources(st.pc, b.chunks_exact(4).flat_map(|c| match c[0] as u32 {
+                        0 | 2 => [c[1] as usize, 0],
+                        1 => [c[1] as usize, c[2] as usize],
+                        _ => [0, 0],
+                    }));
+                    if super::residency::eviction_enabled() && b.chunks_exact(4).any(|c| c[0] as u32 == 1 && (c[1] == 0 || c[2] == 0)) {
+                        super::residency::note_list_untracked(st.pc);
+                    }
                     list.ResourceBarrier(std::slice::from_raw_parts(b.as_ptr() as *const D3D12_RESOURCE_BARRIER, n));
                 }
                 out.barriers += n as u32;
@@ -698,6 +769,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let q = |k: usize| get(1 + 2 * k) as u64 | (get(2 + 2 * k) as u64) << 32;
                 let (dst, src) = (q(0) as *mut c_void, q(2) as *mut c_void);
                 if let (Some(d), Some(s)) = (ID3D12Resource::from_raw_borrowed(&dst), ID3D12Resource::from_raw_borrowed(&src)) {
+                    super::residency::note_list_resources(st.pc, [dst as usize, src as usize]);
                     list.CopyBufferRegion(d, q(1), s, q(3), q(4));
                     out.copies += 1;
                 } else {
@@ -708,9 +780,10 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let q = |k: usize| get(2 + 2 * k) as u64 | (get(3 + 2 * k) as u64) << 32;
                 let values = [get(8), get(9), get(10), get(11)];
                 let res = q(2) as *mut c_void;
-                let (gpu, cpu) = (super::console_heap::gpu_slot(q(0)), super::console_heap::slot(q(1)));
+                let (gpu, cpu) = (super::console_heap::slot(q(0)), super::console_heap::slot(q(1)));
                 match (gpu, cpu, ID3D12Resource::from_raw_borrowed(&res)) {
                     (Some(g), Some(c), Some(r)) if g.pc_gpu_uav != 0 => {
+                        super::residency::note_list_resources(st.pc, [res as usize]);
                         let (gh, ch) = (D3D12_GPU_DESCRIPTOR_HANDLE { ptr: g.pc_gpu_uav }, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: c.pc_uav as usize });
                         if get(1) != 0 {
                             let f = values.map(f32::from_bits);
@@ -735,6 +808,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let bx: [u32; 6] = [get(29), get(30), get(31), get(32), get(33), get(34)];
                 let (pd, ps) = (dst[0] as *mut c_void, src[0] as *mut c_void);
                 if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() {
+                    super::residency::note_list_resources(st.pc, [pd as usize, ps as usize]);
                     list.CopyTextureRegion(
                         dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
                         get(13),
@@ -769,13 +843,23 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                             out.skipped_dispatches += 1;
                             continue;
                         }
-                        let inline = layout.as_ref().map_or(0, |l| l.inline as usize).min(table.len());
+                        let user_sgprs = super::real::pso_user_sgprs(real);
+                        let inline = layout.as_ref().map_or(0, |l| inline_for(l, user_sgprs) as usize).min(table.len());
                         let table_at = uma_copy(st, &table[inline..]).ok_or("UMA: argument table")?;
                         let mut io = match layout.as_ref() {
-                            Some(l) => user_data(l, &table, table_at as u64),
+                            Some(l) => user_data_for(l, user_sgprs, &table, table_at as u64),
                             None => vec![table_at as u32, (table_at >> 32) as u32],
                         };
                         io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+                        io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+                        io[crate::gpu::recomp::IO_MEM_VIEWS] = super::real::mem_views().ok_or("memory windows have no views")?;
+                        io[crate::gpu::recomp::IO_CARRY_AT] = super::bind::carry_watch();
+                        let raw_list = st.pc as *mut c_void;
+                        let title_pso = (*p).pc;
+                        super::markers::before_op(raw_list);
+                        let (window, offset) = super::bind::trip_watch(raw_list, title_pso, false);
+                        io[crate::gpu::recomp::IO_TRIP_WINDOW] = window;
+                        io[crate::gpu::recomp::IO_TRIP_AT] = offset;
                         let io_at = uma_copy(st, bytemuck_u32(&io)).ok_or("UMA: io")?;
                         let res_at = uma_copy(st, &[0u8; 256]).ok_or("UMA: res")?;
                         // the pipeline's own root signature when it has static samplers
@@ -786,13 +870,21 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         }
                         list.SetComputeRootUnorderedAccessView(0, va(io_at));
                         list.SetComputeRootUnorderedAccessView(1, va(res_at));
-                        for k in 0..4 {
-                            list.SetComputeRootUnorderedAccessView(2 + k as u32, windows.get(k).copied().unwrap_or(uma_va));
+                        if !heaps_bound {
+                            list.SetDescriptorHeaps(&[super::console_heap::global_heap()]);
+                            heaps_bound = true;
                         }
                         let raw = real as *mut c_void;
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
+                        super::residency::note_list_untracked(st.pc);
                         list.Dispatch(x, y, z);
+                        super::markers::after_op(raw_list, "dispatch", title_pso);
+                        if super::markers::enabled() {
+                            if let Some(layout) = layout.clone() {
+                                super::bind::note_dispatch_snapshot(st.pc, title_pso, Some([x, y, z]), layout, table.clone(), (io[..16].to_vec(), user_sgprs, inline as u32));
+                            }
+                        }
                         out.dispatches += 1;
                     }
                     _ => out.skipped_dispatches += 1,
@@ -876,6 +968,25 @@ mod tests {
         assert_eq!(l.params, vec![Param::Constants { at: 0, count: 19 }, Param::Descriptor { at: 76 }, Param::Descriptor { at: 84 }, Param::Descriptor { at: 92 }]);
         assert_eq!(l.size, 100);
         assert_eq!(l.inline, 0, "19 constants do not fit in user SGPRs: everything in the table");
+    }
+
+    /// The shader's own count of user SGPRs caps what goes inline: a shader built with four
+    /// (XboxBvhBuilder.dll's, whatever the root signature) takes every argument from the table.
+    #[test]
+    fn a_shader_with_four_user_sgprs_takes_every_argument_from_the_table() {
+        // two root descriptors and 16 constants: by the rule alone the descriptors are inline
+        let l = layout_from_blob(&rts0(&[(4, 0), (4, 0), (1, 16)])).unwrap();
+        assert_eq!((l.size, l.inline), (80, 16));
+        let args: Vec<u8> = (0..80u8).collect();
+        assert_eq!(inline_for(&l, None), 16, "count not known: the rule");
+        assert_eq!(inline_for(&l, Some(8)), 16, "four registers of arguments: the rule");
+        assert_eq!(inline_for(&l, Some(20)), 16, "more registers than the rule uses: the rule");
+        assert_eq!(inline_for(&l, Some(6)), 8, "two registers of arguments: one descriptor");
+        assert_eq!(inline_for(&l, Some(7)), 8, "three: still one descriptor, a parameter stays whole");
+        assert_eq!(inline_for(&l, Some(4)), 0, "s4 is not an argument: everything in the table");
+        assert_eq!(inline_for(&l, Some(0)), 0, "no user SGPR at all");
+        assert_eq!(user_data_for(&l, Some(4), &args, 0x7_0000_0100), vec![0x100, 7, 0, 0]);
+        assert_eq!(user_data_for(&l, Some(8), &args, 0x7_0000_0100), user_data(&l, &args, 0x7_0000_0100));
     }
 
     /// RTS0 v2 of parameters (type: 0 table, 1 constants, 2–4 CBV / SRV / UAV; constant count)

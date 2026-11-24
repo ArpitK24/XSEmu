@@ -1,8 +1,8 @@
 //! Console shaders in pipeline states: a shader blob a title passes to Create*PipelineState
 //! (DXBC container with XDAT/XBCH/FSSM, no usable DXIL) becomes DXIL through the recompiler,
 //! and the pipeline gets XCL's shader ABI root signature instead of the title's one:
-//! root UAVs u0 `io` (initial SGPRs = user data), u1 `res`, u2 `mem` (flat memory), plus the
-//! directly indexed descriptor heaps (images / samplers). Mapping the title's root arguments
+//! root UAVs u0 `io` (initial SGPRs = user data), u1 `res`, plus the directly indexed
+//! descriptor heaps (images / samplers, and the raw views of the memory windows: `mem`). Mapping the title's root arguments
 //! onto that ABI at draw time is the next step (needs the console runtime's user-data layout).
 
 use std::collections::VecDeque;
@@ -24,7 +24,53 @@ pub enum Stage {
 
 /// A console (xbox-native) shader container?
 pub fn is_console(blob: &[u8]) -> bool {
-    xbox::is_xbox(blob)
+    xbox::is_xbox(blob) || fspx(blob).is_some()
+}
+
+/// A compute program in the console driver's own container (an `ACCC` part holding `FSPX`),
+/// what AMD FidelityFX (FSR4) creates its passes from on the console: no DXIL, the RDNA2
+/// code with its thread geometry and COMPUTE_PGM_RSRC2.
+pub struct Fspx<'a> {
+    pub threads: [u32; 3],
+    pub rsrc1: u32,
+    pub rsrc2: u32,
+    /// RDNA2 code, from its first instruction to the last `s_endpgm`
+    pub code: &'a [u8],
+}
+
+/// `FSPX`: 'FSPX', version, entry count, size, then 16-byte entries (type, offset, size, 0)
+/// from +0x10, offsets from the start of FSPX. Type 0 (0x1C bytes): numthreads as u16 x3 at
+/// +0x0C, RSRC1 at +0x14, RSRC2 at +0x18; type 1: a 0x14-byte hash; type 6: the code behind
+/// a 0x24-byte header (the v_nop hash prologue); type 7: resource declarations (32-byte
+/// records). Read from FSR4's pipelines (the console upscaler's "NewBE" path).
+pub fn fspx(blob: &[u8]) -> Option<Fspx<'_>> {
+    let parts = crate::gpu::shader::container_parts(blob)?;
+    let p = parts.iter().find(|p| p.fourcc == "ACCC")?;
+    let part = blob.get(p.offset..p.offset + p.size)?;
+    let u32_at = |b: &[u8], o: usize| b.get(o..o + 4).map(|x| u32::from_le_bytes(x.try_into().unwrap()));
+    if part.get(..4)? != b"FSPX" {
+        return None;
+    }
+    let n = u32_at(part, 8)? as usize;
+    let entry = |ty: u32| -> Option<&[u8]> {
+        (0..n.min(32)).find_map(|e| {
+            let at = 0x10 + 16 * e;
+            (u32_at(part, at)? == ty).then(|| {
+                let (o, s) = (u32_at(part, at + 4)? as usize, u32_at(part, at + 8)? as usize);
+                part.get(o..o.checked_add(s)?)
+            })?
+        })
+    };
+    let head = entry(0)?;
+    let u16_at = |o: usize| head.get(o..o + 2).map(|x| u16::from_le_bytes(x.try_into().unwrap()) as u32);
+    let threads = [u16_at(0x0C)?, u16_at(0x0E)?, u16_at(0x10)?];
+    if threads.iter().any(|&t| t == 0 || t > 1024) || threads.iter().product::<u32>() > 1024 {
+        return None;
+    }
+    let code = entry(6)?.get(0x24..)?;
+    // up to the last s_endpgm (the driver pads with s_code_end)
+    let end = (0..code.len() / 4).rev().find(|&i| u32_at(code, 4 * i) == Some(0xBF81_0000))?;
+    Some(Fspx { threads, rsrc1: u32_at(head, 0x14)?, rsrc2: u32_at(head, 0x18)?, code: &code[..4 * (end + 1)] })
 }
 
 /// Memory windows of the title's unified memory (1 without it).
@@ -54,8 +100,27 @@ pub fn console_to_dxil(blob: &[u8], stage: Stage, sampler_base: u32) -> Result<C
 /// (`Options::split_wave64`) instead of `[WaveSize(64)]`, which such a driver rejects.
 /// Finished shaders are also kept in memory (`ShaderCache`): pipelines share their shaders.
 pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool) -> Result<Compiled, String> {
-    let windows = mem_windows();
-    let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+    console_to_dxil_in(blob, stage, sampler_base, split_wave64, mem_windows())
+}
+
+/// Every translation for `stage` in the disk cache of this XCL build (`translated`): what
+/// `xcl warm-up` builds the driver's blobs of.
+pub fn translated_on_disk(stage: Stage) -> Vec<Compiled> {
+    translated::all(&dxc::cache_dir(), stage)
+}
+
+/// The translation era of this XCL build: its translations' disk cache identity (0: that cache is
+/// off), what `pso_manifest` notes a pipeline was made in.
+pub fn translation_era() -> u64 {
+    translated::identity()
+}
+
+/// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
+/// fills the caches without a title: the same keys as at its run).
+pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    // the direct DXIL backend's fallback lines name the program (`dxc::for_program`)
+    let label = format!("{stage:?} {:016x}", crate::gpu::shader::fnv64(blob));
+    let compile_one = || dxc::for_program(&label, || compile_console_shader(blob, stage, sampler_base, windows, split_wave64));
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
@@ -69,9 +134,179 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
         split_wave64,
         cache_dir: dxc::cache_dir(),
     };
-    cached_shader(cache, key, blob, compile_one).map(|shader| shader.as_ref().clone())
+    let from_disk = || translated::cached(&dxc::cache_dir(), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
 }
 
+/// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
+/// does not translate again what an earlier run of the same XCL build translated. The DXIL
+/// cache is keyed by the generated HLSL, so it needs the translation first: a retail game's
+/// ~2 800 programs (611 of more than 10 000 instructions) took its loading threads 0.1 - 0.3 s
+/// each at every start. Keyed by two hashes and the length of the bytes, the stage and the
+/// translation parameters; translator sources and the DXC toolchain identify compatible builds.
+/// `XCL_TRANSLATED_CACHE=0` turns it off.
+mod translated {
+    use super::{Compiled, Stage};
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    const MAGIC: &[u8; 8] = b"XCLTRAN2";
+
+    pub(super) fn identity_for(source: &str, toolchain: &str) -> u64 {
+        let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for part in ["xcl-translated-cache-v2", source, toolchain] {
+            for byte in part.bytes().chain([0]) {
+                h ^= byte as u64;
+                h = h.wrapping_mul(0x100_0000_01b3);
+            }
+        }
+        h | 1
+    }
+
+    /// Translation semantics and the DXC DLLs, independent of link metadata and build profile,
+    /// and the adapter's float compare form (`nan_guards`). Zero means the disk cache is disabled.
+    pub(super) fn identity() -> u64 {
+        static I: OnceLock<u64> = OnceLock::new();
+        let base = *I.get_or_init(|| {
+            if std::env::var("XCL_TRANSLATED_CACHE").is_ok_and(|v| v == "0") {
+                return 0;
+            }
+            identity_for(env!("XCL_TRANSLATOR_SOURCE_ID"), &format!("{}\0{}", super::dxc::toolchain_identity(), super::dxc::opt_policy()))
+        });
+        if base == 0 {
+            return 0;
+        }
+        identity_for(&format!("{base:016x}"), &format!("{}\0loop-guard={}", if super::nan_guards() { "nan-guards" } else { "" }, super::super::loop_guard()))
+    }
+
+    /// a second hash of the bytes, independent of `fnv64`'s
+    fn hash2(b: &[u8]) -> u64 {
+        b.iter().fold(0x9E37_79B9_7F4A_7C15u64, |h, &x| (h ^ x as u64).wrapping_mul(0xFF51_AFD7_ED55_8CCD).rotate_left(29))
+    }
+
+    pub(super) fn file(dir: &Path, ident: u64, blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split: bool) -> PathBuf {
+        dir.join("translated")
+            .join("v2")
+            .join(format!("{ident:016x}"))
+            .join(format!("{:016x}_{stage:?}_{sampler_base}_{windows}_{}.bin", crate::gpu::shader::fnv64(blob), split as u8))
+    }
+
+    fn header(ident: u64, blob: &[u8]) -> Vec<u8> {
+        let mut h = MAGIC.to_vec();
+        for v in [ident, blob.len() as u64, hash2(blob)] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        h
+    }
+
+    pub(super) fn load_in(path: &Path, ident: u64, blob: &[u8]) -> Option<Compiled> {
+        let b = std::fs::read(path).ok()?;
+        body(b.strip_prefix(header(ident, blob).as_slice())?)
+    }
+
+    /// A file of build `ident`, whatever program it was made from.
+    fn load_any(path: &Path, ident: u64) -> Option<Compiled> {
+        let b = std::fs::read(path).ok()?;
+        let (id, rest) = b.strip_prefix(MAGIC.as_slice())?.split_first_chunk::<8>()?;
+        (u64::from_le_bytes(*id) == ident).then_some(())?;
+        body(rest.get(16..)?)
+    }
+
+    /// Every translation for `stage` this XCL build (`identity`) keeps in `dir`.
+    pub(super) fn all_in(dir: &Path, ident: u64, stage: Stage) -> Vec<Compiled> {
+        let tag = format!("_{stage:?}_");
+        let Ok(files) = std::fs::read_dir(dir.join("translated").join("v2").join(format!("{ident:016x}"))) else { return Vec::new() };
+        files
+            .flatten()
+            .map(|f| f.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "bin") && p.file_name().is_some_and(|n| n.to_string_lossy().contains(&tag)))
+            .filter_map(|p| load_any(&p, ident))
+            .collect()
+    }
+
+    pub(super) fn all(dir: &Path, stage: Stage) -> Vec<Compiled> {
+        match identity() {
+            0 => Vec::new(),
+            ident => all_in(dir, ident, stage),
+        }
+    }
+
+    fn body(mut r: &[u8]) -> Option<Compiled> {
+        let u32_ = |r: &mut &[u8]| -> Option<u32> {
+            let (v, rest) = r.split_first_chunk::<4>()?;
+            *r = rest;
+            Some(u32::from_le_bytes(*v))
+        };
+        let n = u32_(&mut r)? as usize;
+        let mut samplers = Vec::with_capacity(n.min(64));
+        for _ in 0..n {
+            let s = [u32_(&mut r)?, u32_(&mut r)?, u32_(&mut r)?, u32_(&mut r)?];
+            let (&cmp, rest) = r.split_first()?;
+            r = rest;
+            samplers.push((s, cmp != 0));
+        }
+        let len = u32_(&mut r)? as usize;
+        (r.len() == len && len > 0).then(|| Compiled { dxil: r.to_vec(), samplers })
+    }
+
+    pub(super) fn store_in(path: &Path, ident: u64, blob: &[u8], c: &Compiled) {
+        let mut b = header(ident, blob);
+        b.extend_from_slice(&(c.samplers.len() as u32).to_le_bytes());
+        for (s, cmp) in &c.samplers {
+            s.iter().for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+            b.push(*cmp as u8);
+        }
+        b.extend_from_slice(&(c.dxil.len() as u32).to_le_bytes());
+        b.extend_from_slice(&c.dxil);
+        let Some(dir) = path.parent() else { return };
+        let tmp = dir.join(format!("{}.{}.{:?}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), std::process::id(), std::thread::current().id()));
+        // written whole, then renamed: a reader never sees half a file
+        if std::fs::create_dir_all(dir).is_ok() && std::fs::write(&tmp, &b).is_ok() && std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    pub(super) fn cached_in(
+        dir: &Path,
+        ident: u64,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<Compiled, String>,
+    ) -> Result<Compiled, String> {
+        if ident == 0 {
+            return translate();
+        }
+        let path = file(dir, ident, blob, stage, sampler_base, windows, split);
+        if let Some(c) = load_in(&path, ident, blob) {
+            super::dxc::note_memory_hit();
+            super::dxc::note_translation(true);
+            return Ok(c);
+        }
+        super::dxc::note_translation(false);
+        let c = translate()?;
+        store_in(&path, ident, blob, &c);
+        Ok(c)
+    }
+
+    /// `translate` through the disk (`identity()` zero: not used).
+    pub(super) fn cached(
+        dir: &Path,
+        blob: &[u8],
+        stage: Stage,
+        sampler_base: u32,
+        windows: u32,
+        split: bool,
+        translate: impl FnOnce() -> Result<Compiled, String>,
+    ) -> Result<Compiled, String> {
+        cached_in(dir, identity(), blob, stage, sampler_base, windows, split, translate)
+    }
+}
+
+// build.rs keys the translated-shader cache on this file's code (comments and log lines
+// aside), so any change here that alters the cached result re-keys it on its own.
 fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
     let (mut t, profile) = console_translation(blob, stage, sampler_base, windows, split_wave64)?;
     if let Some([r, g, b]) = (stage == Stage::Pixel).then(|| debug_color(blob)).flatten() {
@@ -260,7 +495,7 @@ fn cached_shader(
 }
 
 fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"]
+    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN", "XCL_HLSL_COMMENTS", "XCL_DS_VALIDATE"]
         .iter()
         .any(|name| present(name))
         && (stage != Stage::Pixel
@@ -274,7 +509,50 @@ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
             .any(|name| present(name)))
 }
 
+/// User SGPRs of a console compute shader (COMPUTE_PGM_RSRC2 in FSPX or FSSM):
+/// s0…s3 are the driver's, so what is above 4 is the root arguments its compiler passed in
+/// registers. None: not a console compute shader.
+pub fn compute_user_sgprs(blob: &[u8]) -> Option<u32> {
+    if let Some(f) = fspx(blob) {
+        return Some(super::CsInterface::from_rsrc2(f.threads, f.rsrc2).user_sgprs);
+    }
+    let sh = xbox::parse(blob)?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 6))?;
+    match interface(blob, &sh, f)? {
+        Mode::Compute(cs) => Some(cs.user_sgprs),
+        _ => None,
+    }
+}
+
+/// Once per translation: the loops `XCL_LOOP_GUARD` may cut short in a working program.
+fn note_long_loops(blob: &[u8], t: &super::Translation) {
+    if t.long_loops.is_empty() {
+        return;
+    }
+    let more = if t.long_loops.len() > 4 { format!("; and {} more", t.long_loops.len() - 4) } else { String::new() };
+    crate::xlog_info!(
+        "[SHADER] {:016x}: {} loop(s) may run longer than the loop guard ({} iterations per lane, XCL_LOOP_GUARD): {}{more}",
+        crate::gpu::shader::fnv64(blob),
+        t.long_loops.len(),
+        super::loop_guard(),
+        t.long_loops[..t.long_loops.len().min(4)].join("; ")
+    );
+}
+
 fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<(super::Translation, &'static str), String> {
+    if let Some(f) = fspx(blob) {
+        if stage != Stage::Compute {
+            return Err("an FSPX (driver) container in a graphics slot".into());
+        }
+        let cs = super::CsInterface::from_rsrc2(f.threads, f.rsrc2);
+        let t = translate(f.code, &Options { mode: Mode::Compute(cs), wave64: super::detect_wave64(f.code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, nan_guards: nan_guards(), ..Default::default() })?;
+        if !t.complete() {
+            let missing: Vec<&String> = t.unsupported.keys().collect();
+            return Err(format!("incomplete translation, missing: {missing:?}"));
+        }
+        note_long_loops(blob, &t);
+        return Ok((t, "cs_6_6"));
+    }
     let sh = xbox::parse(blob).ok_or("not a console shader container")?;
     // the hardware variant for this pipeline slot: VS (not the ES variant used with GS), PS
     let want = match stage {
@@ -296,11 +574,12 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
     };
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    let t = translate(code, &Options { mode, wave64: super::detect_wave64(code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, ..Default::default() })?;
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, static_sampler_base: sampler_base, mem_windows: windows, nan_guards: nan_guards(), ..Default::default() })?;
     if !t.complete() {
         let missing: Vec<&String> = t.unsupported.keys().collect();
         return Err(format!("incomplete translation, missing: {missing:?}"));
     }
+    note_long_loops(blob, &t);
     Ok((t, profile))
 }
 
@@ -342,11 +621,86 @@ pub fn console_mesh(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Resul
     let record = ms.clone();
     let p = f.programs.first().ok_or("FSSM without a program")?;
     let code = &f.data[p.offset..p.offset + p.len];
-    finish_two_pass(super::translate_mesh(code, ms.clone(), super::detect_wave64(code), split_wave64)?, record, ps)
+    let t = super::translate_mesh(code, ms.clone(), super::fssm_wave64(f, code), split_wave64, mem_windows())?;
+    note_long_loops(blob, &t);
+    finish_two_pass(t, record, ps)
+}
+
+/// A console mesh (NGG) program as a host mesh shader (`super::MeshNative`).
+pub struct NativeMesh {
+    /// ms_6_6 DXIL
+    pub ms: Vec<u8>,
+    /// static samplers of the mesh shader (registers from 0; the pixel shader's follow)
+    pub samplers: Vec<StaticSampler>,
+}
+
+/// The mesh-shader program of a console MS container as a host mesh shader whose vertices carry
+/// what the pixel shader `ps` reads. `split_wave64`: `mesh_native_split` of the adapter. Err: the
+/// program cannot be one (`emit::Em::mesh_native_blocker`, an incomplete translation, DXC) – the
+/// caller falls back to `console_mesh`.
+pub fn console_mesh_native(blob: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<NativeMesh, String> {
+    let sh = xbox::parse(blob).ok_or("not a console shader container")?;
+    let f = sh.fssm.iter().find(|f| f.stages.first().is_some_and(|s| s.hw == 7)).ok_or("no NGG hardware variant")?;
+    let mode = interface(blob, &sh, f).ok_or("unknown MS interface (e.g. lines / points)")?;
+    if !matches!(mode, Mode::Mesh(_)) {
+        return Err("the container is not an MS".into());
+    }
+    let p = f.programs.first().ok_or("FSSM without a program")?;
+    let code = &f.data[p.offset..p.offset + p.len];
+    let native = super::MeshNative { ps_inputs: ps.map(|p| crate::gpu::dxbc::signatures(p).0) };
+    let t = translate(code, &Options { mode, wave64: super::fssm_wave64(f, code), split_wave64, mem_windows: mem_windows(), nan_guards: nan_guards(), mesh_native: Some(native), ..Default::default() })?;
+    if !t.complete() {
+        let missing: Vec<&String> = t.unsupported.keys().collect();
+        return Err(format!("incomplete translation, missing: {missing:?}"));
+    }
+    note_long_loops(blob, &t);
+    Ok(NativeMesh { ms: dxc::compile_cached(&t.hlsl, "main", "ms_6_6")?.0, samplers: t.static_samplers })
+}
+
+/// Whether console mesh programs can be host mesh shaders on an adapter with this wave range, and
+/// then the `split_wave64` flag of their translation. HLSL has no `WaveSize` for mesh shaders, so
+/// the translation must know the wave size the driver will use: only a range of exactly 32 lanes
+/// says so (NVIDIA) – a wave64 program then runs as two 32-lane halves. Anything else (AMD's
+/// 32..64, Intel's 8..32, WARP's 4) keeps the two-pass form, whose compute pass sets `WaveSize`.
+pub fn mesh_native_waves(wave_min: u32, wave_max: u32) -> Option<bool> {
+    (wave_min == 32 && wave_max == 32).then_some(true)
+}
+
+/// `XCL_MESH=two-pass`: console mesh programs in two passes (compute + pass-through) also where
+/// they could be host mesh shaders – to compare the two forms, and to test the fallback.
+pub fn mesh_two_pass_forced() -> bool {
+    std::env::var("XCL_MESH").is_ok_and(|v| v.eq_ignore_ascii_case("two-pass"))
+}
+
+/// `mesh_native_waves` for the device (None also when it cannot be asked, has no mesh shaders, or
+/// `XCL_MESH=two-pass`).
+pub fn mesh_native_split(device: &ID3D12Device) -> Option<bool> {
+    if mesh_two_pass_forced() {
+        return None;
+    }
+    let mut o7 = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+    unsafe { device.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS7, &mut o7 as *mut _ as _, std::mem::size_of_val(&o7) as u32) }.ok()?;
+    if o7.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
+        return None;
+    }
+    wave_range(device).and_then(|(min, max)| mesh_native_waves(min, max))
 }
 
 /// Whether the adapter runs only 32-lane waves (its wave range lacks 64): wave64 compute,
 /// mesh and geometry programs then need the split form.
+/// PCI vendor of the adapter shaders are translated for (0 until the device exists).
+static ADAPTER_VENDOR: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_adapter_vendor(vendor: u32) {
+    ADAPTER_VENDOR.store(vendor, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `Options::nan_guards`: unless the adapter is known not to be AMD's (its driver gave a
+/// later ordered compare of the same operands the unordered result, `emit::float_compare`).
+pub fn nan_guards() -> bool {
+    matches!(ADAPTER_VENDOR.load(std::sync::atomic::Ordering::Relaxed), 0 | 0x1002)
+}
+
 pub fn wave32_only(wave_min: u32, wave_max: u32) -> bool {
     !(wave_min <= 64 && wave_max >= 64)
 }
@@ -357,31 +711,56 @@ pub fn split_wave64_forced() -> bool {
     std::env::var("XCL_SPLIT_WAVE64").is_ok_and(|v| v == "1")
 }
 
-pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
-    if split_wave64_forced() {
-        return true;
-    }
+/// Whether a wave64 VS / PS can run in 32-lane waves on the adapter: D3D12 has no `WaveSize`
+/// for graphics shaders, so the driver picks, and one whose range includes 32 may pick 32 –
+/// an RDNA2 driver (RX 6600 XT, issue #42) runs pixel shaders in waves of 32 although it
+/// reports 32–64. Such a VS / PS needs the `upper_lanes` form (`Options::split_wave64`), which
+/// checks the wave size at run time, so a driver that picks 64 lanes runs it as before.
+pub fn graphics_wave32(wave_min: u32, wave_max: u32) -> bool {
+    wave32_only(wave_min, wave_max) || wave_min <= 32
+}
+
+/// The device's wave lane range; `None` when it cannot be asked.
+fn wave_range(device: &ID3D12Device) -> Option<(u32, u32)> {
     let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
-    if unsafe {
+    unsafe {
         device.CheckFeatureSupport(
             D3D12_FEATURE_D3D12_OPTIONS1,
             &mut options as *mut _ as _,
             std::mem::size_of_val(&options) as u32,
         )
     }
-    .is_err()
-    {
-        return true;
-    }
-    wave32_only(options.WaveLaneCountMin, options.WaveLaneCountMax)
+    .ok()
+    .map(|_| (options.WaveLaneCountMin, options.WaveLaneCountMax))
+}
+
+pub fn wave32_only_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| wave32_only(min, max))
+}
+
+/// `graphics_wave32` for the device: the split flag for a wave64 VS / PS. Unknown: assume so.
+pub fn graphics_wave32_for_device(device: &ID3D12Device) -> bool {
+    split_wave64_forced() || wave_range(device).is_none_or(|(min, max)| graphics_wave32(min, max))
 }
 
 /// A legacy GS pipeline: the ES variant of a console VS + the GS as one program.
 pub fn console_geometry(vs: &[u8], gs: &[u8], ps: Option<&[u8]>, split_wave64: bool) -> Result<TwoPass, String> {
     let (code, g) = super::geometry_program(vs, gs)?;
     let record = g.record();
-    let translation = super::translate_geometry(&code, g, split_wave64)?;
+    let translation = super::translate_geometry(&code, g, split_wave64, mem_windows())?;
+    note_long_loops(gs, &translation);
     finish_two_pass(translation, record, ps)
+}
+
+/// The geometry shader (gs_6_6 DXIL) that draws a console rect list's rectangles behind the
+/// console VS `vs` (its container): `emit::rect_list_gs` for the VS's output signature, which
+/// is what the translated VS's output struct is declared from.
+pub fn rect_list_gs(vs: &[u8]) -> Result<Vec<u8>, String> {
+    let outputs = crate::gpu::dxbc::signatures(vs).1;
+    if outputs.is_empty() {
+        return Err("the VS has no output signature".into());
+    }
+    Ok(dxc::compile_cached(&super::emit::rect_list_gs(&outputs), "main", "gs_6_6")?.0)
 }
 
 /// XCL shader ABI root signature (see the module docs); `graphics` allows an input layout.
@@ -419,8 +798,8 @@ pub fn static_sampler_desc(k: u32, (w, comparison): &StaticSampler) -> D3D12_STA
 pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[StaticSampler]) -> Result<ID3D12RootSignature, String> {
     let statics: Vec<D3D12_STATIC_SAMPLER_DESC> = samplers.iter().enumerate().map(|(k, s)| static_sampler_desc(k as u32, s)).collect();
     unsafe {
-        // u0 io, u1 res, u2..u5 the memory windows (`gpu::uma`; unused ones need no binding)
-        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..6)
+        // u0 io, u1 res; the memory windows are raw views in the descriptor heap (`IO_MEM_VIEWS`)
+        let params: Vec<D3D12_ROOT_PARAMETER1> = (0..2)
             .map(|i| D3D12_ROOT_PARAMETER1 {
                 ParameterType: D3D12_ROOT_PARAMETER_TYPE_UAV,
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
@@ -455,6 +834,117 @@ pub fn abi_root_signature_with(dev: &ID3D12Device, graphics: bool, samplers: &[S
 #[cfg(test)]
 mod shader_cache_tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn translated_cache_separates_shader_sources_toolchains_and_optimization() {
+        let dir = Path::new("cache");
+        let path = |source, toolchain, opt| {
+            let ident = translated::identity_for(source, &format!("{toolchain}\0{opt}"));
+            translated::file(dir, ident, b"console", Stage::Compute, 0, 1, false)
+        };
+        let base = path("source-a", "dxc-a", "default");
+        assert_eq!(base, path("source-a", "dxc-a", "default"));
+        assert_ne!(base, path("source-b", "dxc-a", "default"));
+        assert_ne!(base, path("source-a", "dxc-b", "default"));
+        assert_ne!(base, path("source-a", "dxc-a", "-O0"));
+    }
+
+    #[test]
+    fn wave_emitter_overrides_bypass_translated_cache() {
+        for option in ["XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
+            assert!(!cache_allowed(Stage::Compute, |name| name == option));
+        }
+    }
+
+    #[test]
+    fn translated_identity_tracks_sources_and_dxc() {
+        let built_source = env!("XCL_TRANSLATOR_SOURCE_ID");
+        assert_eq!(built_source.len(), 16);
+        assert!(u64::from_str_radix(built_source, 16).is_ok());
+        let a = translated::identity_for("source-a", "dxc-a");
+        assert_ne!(a, 0);
+        assert_eq!(a, translated::identity_for("source-a", "dxc-a"));
+        assert_ne!(a, translated::identity_for("source-b", "dxc-a"));
+        assert_ne!(a, translated::identity_for("source-a", "dxc-b"));
+    }
+
+    #[test]
+    fn translated_namespace_tracks_every_request_input() {
+        let dir = PathBuf::from("cache");
+        let base = translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, false);
+        let paths = [
+            base.clone(),
+            translated::file(&dir, 43, b"console", Stage::Compute, 3, 2, false),
+            translated::file(&dir, 42, b"consolf", Stage::Compute, 3, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Vertex, 3, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 4, 2, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 3, false),
+            translated::file(&dir, 42, b"console", Stage::Compute, 3, 2, true),
+        ];
+        assert_eq!(paths.iter().collect::<std::collections::HashSet<_>>().len(), paths.len());
+        assert!(base.starts_with(dir.join("translated").join("v2").join("000000000000002a")));
+    }
+
+    /// A translation on disk comes back for the same bytes and semantic identity only: other
+    /// bytes of the same length, another translator/toolchain or a cut file are misses.
+    #[test]
+    fn translations_on_disk_need_the_same_bytes_and_identity() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-{}", std::process::id()));
+        let path = dir.join("t.bin");
+        let c = Compiled { dxil: vec![1, 2, 3, 4, 5], samplers: vec![([7, 8, 9, 10], true), ([1, 2, 3, 4], false)] };
+        translated::store_in(&path, 42, b"console", &c);
+        let back = translated::load_in(&path, 42, b"console").expect("stored");
+        assert_eq!((back.dxil, back.samplers), (c.dxil.clone(), c.samplers.clone()));
+        assert!(translated::load_in(&path, 43, b"console").is_none(), "another identity");
+        assert!(translated::load_in(&path, 42, b"consolf").is_none(), "other bytes");
+        let full = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &full[..full.len() - 1]).unwrap();
+        assert!(translated::load_in(&path, 42, b"console").is_none(), "a cut file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `xcl warm-up` finds every translation of one stage and build, whatever its bytes were.
+    #[test]
+    fn the_translations_of_a_stage_and_build_are_listed() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-all-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for (blob, stage, ident, first) in [(&b"cs one"[..], Stage::Compute, 42, 1), (b"cs two", Stage::Compute, 42, 2), (b"ps", Stage::Pixel, 42, 3), (b"old cs", Stage::Compute, 43, 4)] {
+            translated::store_in(&translated::file(&dir, ident, blob, stage, 0, 1, false), ident, blob, &compiled(first));
+        }
+        let mut found: Vec<u8> = translated::all_in(&dir, 42, Stage::Compute).iter().map(|c| c.dxil[0]).collect();
+        found.sort();
+        assert_eq!(found, [1, 2]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn translated_v2_ignores_valid_entries_outside_its_namespace() {
+        let dir = std::env::temp_dir().join(format!("xcl-translated-legacy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let blob = b"console";
+        let ident = 42;
+        let unnamespaced = dir.join("translated").join(format!("{:016x}_Compute_0_1_0.bin", crate::gpu::shader::fnv64(blob)));
+        // Use a valid v2 payload so the miss proves the namespace, rather than header parsing,
+        // kept the old root-level location out of consideration.
+        let old = compiled(3);
+        translated::store_in(&unnamespaced, ident, blob, &old);
+
+        let mut calls = 0;
+        let first = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || {
+            calls += 1;
+            Ok(compiled(7))
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(first.dxil[0], 7);
+        assert!(unnamespaced.exists());
+        assert!(translated::file(&dir, ident, blob, Stage::Compute, 0, 1, false).exists());
+
+        let second = translated::cached_in(&dir, ident, blob, Stage::Compute, 0, 1, false, || panic!("v2 entry was not reused")).unwrap();
+        assert_eq!(second.dxil, first.dxil);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn key(hash: u64) -> ShaderKey {
         ShaderKey {
@@ -593,7 +1083,7 @@ mod shader_cache_tests {
 
     #[test]
     fn shader_cache_bypasses_debug_overrides() {
-        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"] {
+        for name in ["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS", "XCL_WAVE64_SPIN"] {
             assert!(!cache_allowed(Stage::Compute, |v| v == name));
             assert!(!cache_allowed(Stage::Vertex, |v| v == name));
             assert!(!cache_allowed(Stage::Pixel, |v| v == name));
@@ -706,5 +1196,741 @@ mod compile_time_bench {
             batches.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         println!("100 repeated PSO shader requests, warm DXIL cache, ms: {batches:?}");
+    }
+}
+
+
+#[cfg(test)]
+mod shader_bench {
+    //! `XCL_BENCH_SHADERS=<folder of dumped console shaders (*_cs.bin, *_ps.bin, *_vs.bin)>`:
+    //! where a pipeline's time goes (translation, DXC at each optimisation level, the driver)
+    //! and how DXC scales over threads.
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+    use std::time::{Duration, Instant};
+
+    /// (result, seconds, peak private bytes above those at the start)
+    fn measured<R: Send>(f: impl FnOnce() -> R + Send) -> (R, f64, u64) {
+        let stop = AtomicBool::new(false);
+        let base = crate::util::process_commit_bytes();
+        let peak = AtomicU64::new(base);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(Relaxed) {
+                    peak.fetch_max(crate::util::process_commit_bytes(), Relaxed);
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+            let t0 = Instant::now();
+            let r = f();
+            let secs = t0.elapsed().as_secs_f64();
+            stop.store(true, Relaxed);
+            (r, secs, peak.load(Relaxed).saturating_sub(base))
+        })
+    }
+
+    fn device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).ok()?;
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next()?;
+            crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).ok()
+        }
+    }
+
+    struct Shared<T>(T);
+    unsafe impl<T> Send for Shared<T> {}
+
+    fn compute_pso(dev: &ID3D12Device, rs: &ID3D12RootSignature, dxil: &[u8]) -> (bool, f64, u64) {
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: dxil.as_ptr() as *const _, BytecodeLength: dxil.len() },
+            ..Default::default()
+        };
+        let d = Shared((&desc, dev));
+        let r = measured(move || {
+            let d = d;
+            unsafe { d.0 .1.CreateComputePipelineState::<ID3D12PipelineState>(d.0 .0) }.is_ok()
+        });
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        r
+    }
+
+    fn median(mut v: Vec<f64>) -> f64 {
+        if v.is_empty() {
+            return 0.0;
+        }
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    }
+
+    /// Cold driver time of the console compute programs in `XCL_BENCH_SHADERS` that
+    /// `XCL_BENCH_ONLY` names, for their translation ("emit") and each `<name>.<variant>.hlsl`
+    /// in `XCL_BENCH_VARIANTS`. Every run compiles HLSL salted with a load neither compiler can
+    /// fold, so the driver never has the DXIL cached; `XCL_BENCH_RUNS` runs (3), interleaved
+    /// over the variants, and the median. `XCL_BENCH_WINDOWS=n` adds the translation with `n`
+    /// memory windows (the others have 4) as variant "w<n>".
+    #[test]
+    #[ignore]
+    fn driver_time_per_variant() {
+        let (Some(dir), Some(dev)) = (std::env::var_os("XCL_BENCH_SHADERS"), device()) else {
+            println!("XCL_BENCH_SHADERS not set, or no device");
+            return;
+        };
+        let runs: usize = std::env::var("XCL_BENCH_RUNS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+        let variants = std::env::var_os("XCL_BENCH_VARIANTS").map(PathBuf::from);
+        let seed = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        for name in std::env::var("XCL_BENCH_ONLY").unwrap_or_default().split(',').filter(|n| !n.is_empty()) {
+            let blob = std::fs::read(PathBuf::from(&dir).join(format!("{name}.bin"))).unwrap();
+            let (t, profile) = console_translation(&blob, Stage::Compute, 0, 4, false).unwrap();
+            let rs = abi_root_signature_with(&dev, true, &t.static_samplers).unwrap();
+            let mut sources = vec![("emit".to_string(), t.hlsl.clone())];
+            if let Some(n) = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse::<u32>().ok()) {
+                sources.push((format!("w{n}"), console_translation(&blob, Stage::Compute, 0, n, false).unwrap().0.hlsl));
+            }
+            if let Some(v) = &variants {
+                let mut found: Vec<_> = std::fs::read_dir(v).unwrap().flatten().filter_map(|e| {
+                    let file = e.file_name().to_string_lossy().into_owned();
+                    let variant = file.strip_prefix(&format!("{name}."))?.strip_suffix(".hlsl")?.to_string();
+                    Some((variant, std::fs::read_to_string(e.path()).unwrap()))
+                }).collect();
+                found.sort();
+                sources.extend(found);
+            }
+            let mut dxil = vec![Vec::new(); sources.len()];
+            let mut dxc_secs = vec![Vec::new(); sources.len()];
+            for (k, (_, hlsl)) in sources.iter().enumerate() {
+                let main = hlsl.find("void main(").unwrap();
+                let body = main + hlsl[main..].find("\n{\n").unwrap() + 3;
+                for run in 0..runs {
+                    let salt = seed.wrapping_mul(16).wrapping_add(run as u32);
+                    let salted = format!("{}    if (io.Load(4092u) == {salt}u) io.Store(4088u, {salt}u);\n{}", &hlsl[..body], &hlsl[body..]);
+                    let (r, secs, _) = measured(|| dxc::compile(&salted, "main", profile, &[]));
+                    dxil[k].push(r.unwrap());
+                    dxc_secs[k].push(secs);
+                }
+            }
+            let mut drv = vec![Vec::new(); sources.len()];
+            let mut peak = vec![0u64; sources.len()];
+            for run in 0..runs {
+                for k in 0..sources.len() {
+                    let (ok, secs, p) = compute_pso(&dev, &rs, &dxil[k][run]);
+                    assert!(ok, "{name}.{}: CreateComputePipelineState failed", sources[k].0);
+                    drv[k].push(secs);
+                    peak[k] = peak[k].max(p);
+                }
+            }
+            for (k, (variant, hlsl)) in sources.iter().enumerate() {
+                println!(
+                    "{name}.{variant}: HLSL {} KB, DXC {:.2} s, DXIL {} KB, driver {:.2} s {:.1?}, +{} MB",
+                    hlsl.len() >> 10,
+                    median(dxc_secs[k].clone()),
+                    dxil[k][0].len() >> 10,
+                    median(drv[k].clone()),
+                    drv[k],
+                    peak[k] >> 20
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn where_pipeline_time_goes() {
+        let Some(dir) = std::env::var_os("XCL_BENCH_SHADERS") else {
+            println!("XCL_BENCH_SHADERS not set");
+            return;
+        };
+        let n: usize = std::env::var("XCL_BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
+        let max_kb: u64 = std::env::var("XCL_BENCH_MAX_KB").ok().and_then(|v| v.parse().ok()).unwrap_or(u64::MAX >> 10);
+        let only = std::env::var("XCL_BENCH_ONLY").unwrap_or_default();
+        let mut files: Vec<(u64, PathBuf, Stage)> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stage = if name.ends_with("_cs.bin") {
+                    Stage::Compute
+                } else if name.ends_with("_ps.bin") {
+                    Stage::Pixel
+                } else if name.ends_with("_vs.bin") {
+                    Stage::Vertex
+                } else {
+                    return None;
+                };
+                let len = e.metadata().ok()?.len();
+                let wanted = only.is_empty() || only.split(',').any(|o| name.starts_with(o));
+                (len <= max_kb << 10 && wanted).then(|| (len, e.path(), stage))
+            })
+            .collect();
+        files.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
+        let take = n.min(files.len());
+        let picked: Vec<_> = (0..take).map(|k| files[k * files.len() / take].clone()).collect();
+        println!("{} console shaders in the folder, {} picked across their sizes", files.len(), picked.len());
+        let dev = device();
+        println!("driver timing: {}", if dev.is_some() { "on" } else { "no device" });
+        // `XCL_BENCH_LEVELS=0,1`: the two DXC levels to compare (default 3,1)
+        let lv: Vec<String> = std::env::var("XCL_BENCH_LEVELS").unwrap_or_else(|_| "3,1".into()).split(',').map(|l| format!("-O{}", l.trim())).collect();
+        assert_eq!(lv.len(), 2, "XCL_BENCH_LEVELS: two levels, such as 0,1");
+        let flags: Vec<[&str; 1]> = lv.iter().map(|l| [l.as_str()]).collect();
+        let levels: [(&str, &[&str]); 2] = [(&lv[0], &flags[0]), (&lv[1], &flags[1])];
+        let mut rows: Vec<(&'static str, String)> = Vec::new();
+        let mut tr = Vec::new();
+        let mut dx = vec![Vec::new(); 2];
+        let (mut dx_sum, mut dxil_sum, mut peak_max) = ([0f64; 2], [0usize; 2], [0u64; 2]);
+        // the driver at each level: (first creation, the same again) of compute programs new to
+        // it at both levels
+        let mut drv: [Vec<(f64, f64)>; 2] = [Vec::new(), Vec::new()];
+        let mut not_cold = 0;
+        for (i, (_, path, stage)) in picked.iter().enumerate() {
+            let blob = std::fs::read(path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let t0 = Instant::now();
+            let t = console_translation(&blob, *stage, 0, 4, std::env::var_os("XCL_BENCH_SPLIT").is_some());
+            let secs_t = t0.elapsed().as_secs_f64();
+            let Ok((t, profile)) = t else { continue };
+            tr.push(secs_t);
+            // `XCL_BENCH_HLSL=<dir>`: write each translation there and compile nothing
+            if let Some(d) = std::env::var_os("XCL_BENCH_HLSL") {
+                std::fs::write(PathBuf::from(d).join(format!("{name}.hlsl")), &t.hlsl).unwrap();
+                continue;
+            }
+            let mut line = format!("{name}: HLSL {} KB, translate {secs_t:.3} s", t.hlsl.len() >> 10);
+            let mut dxil = [Vec::new(), Vec::new()];
+            for (k, (label, extra)) in levels.iter().enumerate() {
+                let (r, secs, peak) = measured(|| dxc::compile(&t.hlsl, "main", profile, extra));
+                let Ok(d) = r else {
+                    line += &format!(", DXC {label} failed");
+                    continue;
+                };
+                dx[k].push(secs);
+                dx_sum[k] += secs;
+                dxil_sum[k] += d.len();
+                peak_max[k] = peak_max[k].max(peak);
+                line += &format!(", DXC {label} {secs:.2} s {} KB +{} MB", d.len() >> 10, peak >> 20);
+                dxil[k] = d;
+            }
+            if let (Some(dev), Stage::Compute, false) = (&dev, stage, dxil.iter().any(Vec::is_empty)) {
+                if let Ok(rs) = abi_root_signature_with(dev, true, &t.static_samplers) {
+                    // which level the driver sees first alternates
+                    let mut m = [(false, 0f64, 0u64, 0f64); 2];
+                    for k in if i % 2 == 0 { [0, 1] } else { [1, 0] } {
+                        let (ok, first, peak) = compute_pso(dev, &rs, &dxil[k]);
+                        let (_, again, _) = compute_pso(dev, &rs, &dxil[k]);
+                        m[k] = (ok, first, peak, again);
+                    }
+                    // new to the driver: its first creation took well over the cached one
+                    let cold = |k: usize| m[k].0 && m[k].1 > 0.02 && m[k].1 > 5.0 * m[k].3;
+                    if cold(0) && cold(1) {
+                        for k in 0..2 {
+                            drv[k].push((m[k].1, m[k].3));
+                        }
+                    } else {
+                        not_cold += 1;
+                    }
+                    for k in 0..2 {
+                        line += &format!(", driver {} {:.3} s +{} MB (again {:.3} s)", levels[k].0, m[k].1, m[k].2 >> 20, m[k].3);
+                    }
+                }
+            }
+            println!("{line}");
+            rows.push((profile, t.hlsl));
+        }
+        println!("== {} translated", rows.len());
+        println!("translation: sum {:.1} s, median {:.3} s", tr.iter().sum::<f64>(), median(tr.clone()));
+        for (k, (label, _)) in levels.iter().enumerate() {
+            println!("DXC {label}: sum {:.1} s, median {:.3} s, DXIL {} KB in all, peak commit of one compile +{} MB", dx_sum[k], median(dx[k].clone()), dxil_sum[k] >> 10, peak_max[k] >> 20);
+        }
+        for (k, (label, _)) in levels.iter().enumerate() {
+            let first: Vec<f64> = drv[k].iter().map(|d| d.0).collect();
+            println!(
+                "driver, {label} DXIL, {} compute programs new to it at both levels: sum {:.1} s, median {:.3} s; from its cache median {:.3} s",
+                first.len(),
+                first.iter().sum::<f64>(),
+                median(first.clone()),
+                median(drv[k].iter().map(|d| d.1).collect())
+            );
+        }
+        println!("compute programs left out of the driver sums (cached at a level already, or refused): {not_cold}");
+        if std::env::var_os("XCL_BENCH_SCALING").is_none() {
+            return;
+        }
+        for threads in [4usize, 8, 16, dxc::compile_threads()] {
+            if threads > dxc::compile_threads() {
+                continue;
+            }
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let t0 = Instant::now();
+            std::thread::scope(|s| {
+                for _ in 0..threads {
+                    s.spawn(|| loop {
+                        let i = next.fetch_add(1, Relaxed);
+                        let Some((profile, hlsl)) = rows.get(i) else { break };
+                        let _ = dxc::compile(hlsl, "main", profile, &[]);
+                    });
+                }
+            });
+            let wall = t0.elapsed().as_secs_f64();
+            println!("DXC default flags, {threads} at once: {wall:.1} s for {} programs ({:.2}/s; one at a time at -O1 {:.1} s)", rows.len(), rows.len() as f64 / wall, dx_sum[1]);
+        }
+    }
+
+    /// `XCL_BENCH_SHADERS` as above: each console VS there (the first `XCL_BENCH_MAX`), translated
+    /// with `XCL_BENCH_WINDOWS` memory windows (default 4), in a pipeline with `rect_list_gs`
+    /// behind it as `translated_graphics_pso` makes a rect list's. The driver must take each one
+    /// it takes without the GS. `XCL_BENCH_DEBUG=1`: the debug layer's word on the first refusals.
+    #[test]
+    #[ignore]
+    fn rect_list_gs_pipelines_behind_translated_vs() {
+        let Some(dir) = std::env::var_os("XCL_BENCH_SHADERS") else {
+            println!("XCL_BENCH_SHADERS not set");
+            return;
+        };
+        if std::env::var_os("XCL_BENCH_DEBUG").is_some() {
+            let mut d: Option<ID3D12Debug> = None;
+            if unsafe { D3D12GetDebugInterface(&mut d) }.is_ok() {
+                if let Some(d) = d {
+                    unsafe { d.EnableDebugLayer() };
+                }
+            }
+        }
+        let Some(dev) = device() else { return };
+        let windows: u32 = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let max: usize = std::env::var("XCL_BENCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).filter(|p| p.to_string_lossy().ends_with("_vs.bin")).collect();
+        paths.sort();
+        paths.truncate(max);
+        let info = windows::core::Interface::cast::<ID3D12InfoQueue>(&dev).ok();
+        let create = |rs: &ID3D12RootSignature, vs: &[u8], gs: Option<&[u8]>| -> windows::core::Result<ID3D12PipelineState> {
+            let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+            let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                VS: code(vs),
+                GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, code),
+                SampleMask: u32::MAX,
+                PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                ..Default::default()
+            };
+            pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+            pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+            pd.RasterizerState.DepthClipEnable = true.into();
+            let r = unsafe { dev.CreateGraphicsPipelineState(&pd) };
+            drop(std::mem::ManuallyDrop::into_inner(pd.pRootSignature));
+            r
+        };
+        let say = |what: String| {
+            println!("{what}");
+            let Some(q) = &info else { return };
+            for k in 0..unsafe { q.GetNumStoredMessages() } {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(k, None, &mut len) };
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if unsafe { q.GetMessage(k, Some(m), &mut len) }.is_ok() {
+                    println!("  {}", unsafe { std::ffi::CStr::from_ptr((*m).pDescription as *const std::ffi::c_char) }.to_string_lossy());
+                }
+            }
+            unsafe { q.ClearStoredMessages() };
+        };
+        let (mut tried, mut skipped, mut plain_refused, mut refused) = (0usize, 0usize, 0usize, Vec::new());
+        for path in &paths {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let vs = std::fs::read(path).unwrap();
+            let (Ok(c), Ok(gs)) = (console_to_dxil_in(&vs, Stage::Vertex, 0, std::env::var_os("XCL_BENCH_SPLIT").is_some(), windows), rect_list_gs(&vs)) else {
+                skipped += 1;
+                continue;
+            };
+            let Ok(rs) = abi_root_signature_with(&dev, true, &c.samplers) else {
+                skipped += 1;
+                continue;
+            };
+            tried += 1;
+            if let Err(e) = create(&rs, &c.dxil, None) {
+                if plain_refused < 3 {
+                    say(format!("{name}: refused without the GS: {e}"));
+                }
+                plain_refused += 1;
+                continue;
+            }
+            if let Err(e) = create(&rs, &c.dxil, Some(&gs)) {
+                if refused.len() < 3 {
+                    say(format!("{name}: refused with the rect list GS: {e}"));
+                }
+                refused.push(name);
+            }
+        }
+        println!("{} VS, {windows} windows: {tried} tried, {skipped} not translated, {plain_refused} refused without the GS, {} refused only with it", paths.len(), refused.len());
+        assert!(refused.is_empty(), "refused with the rect list GS: {:?}", &refused[..refused.len().min(20)]);
+    }
+
+    /// `XCL_BENCH_PAIRS=<file of "vs ps" console hashes>` with `XCL_BENCH_SHADERS`: each pair
+    /// translated as `translate_graphics_stages` does (PS samplers after the VS's), in a pipeline
+    /// with and without the rect list GS. `XCL_BENCH_DEBUG=1`: the debug layer's word.
+    #[test]
+    #[ignore]
+    fn rect_list_gs_pipelines_with_their_pixel_shaders() {
+        let (Some(dir), Some(pairs)) = (std::env::var_os("XCL_BENCH_SHADERS"), std::env::var_os("XCL_BENCH_PAIRS")) else {
+            println!("XCL_BENCH_SHADERS / XCL_BENCH_PAIRS not set");
+            return;
+        };
+        if std::env::var_os("XCL_BENCH_DEBUG").is_some() {
+            let mut d: Option<ID3D12Debug> = None;
+            if unsafe { D3D12GetDebugInterface(&mut d) }.is_ok() {
+                if let Some(d) = d {
+                    unsafe { d.EnableDebugLayer() };
+                }
+            }
+        }
+        let Some(dev) = device() else { return };
+        let windows: u32 = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let split = std::env::var_os("XCL_BENCH_SPLIT").is_some();
+        let info = windows::core::Interface::cast::<ID3D12InfoQueue>(&dev).ok();
+        let say = |what: String| {
+            println!("{what}");
+            let Some(q) = &info else { return };
+            for k in 0..unsafe { q.GetNumStoredMessages() } {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(k, None, &mut len) };
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if unsafe { q.GetMessage(k, Some(m), &mut len) }.is_ok() {
+                    println!("  {}", unsafe { std::ffi::CStr::from_ptr((*m).pDescription as *const std::ffi::c_char) }.to_string_lossy());
+                }
+            }
+            unsafe { q.ClearStoredMessages() };
+        };
+        let dir = PathBuf::from(dir);
+        let (mut tried, mut missing, mut plain, mut only_gs) = (0usize, 0usize, 0usize, 0usize);
+        for line in std::fs::read_to_string(pairs).unwrap().lines() {
+            let mut it = line.split_whitespace();
+            let (Some(v), Some(p)) = (it.next(), it.next()) else { continue };
+            let (Ok(vs), Ok(ps)) = (std::fs::read(dir.join(format!("{v}_vs.bin"))), std::fs::read(dir.join(format!("{p}_ps.bin")))) else {
+                missing += 1;
+                continue;
+            };
+            let Ok(vc) = console_to_dxil_in(&vs, Stage::Vertex, 0, split, windows) else { missing += 1; continue };
+            let Ok(pc) = console_to_dxil_in(&ps, Stage::Pixel, vc.samplers.len() as u32, split, windows) else { missing += 1; continue };
+            let Ok(gs) = rect_list_gs(&vs) else { missing += 1; continue };
+            let mut samplers = vc.samplers.clone();
+            samplers.extend(pc.samplers.iter().cloned());
+            let Ok(rs) = abi_root_signature_with(&dev, true, &samplers) else { missing += 1; continue };
+            tried += 1;
+            let create = |gs: Option<&[u8]>| -> windows::core::Result<ID3D12PipelineState> {
+                let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+                let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    VS: code(&vc.dxil),
+                    PS: code(&pc.dxil),
+                    GS: gs.map_or_else(D3D12_SHADER_BYTECODE::default, code),
+                    SampleMask: u32::MAX,
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                pd.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+                pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pd.RasterizerState.DepthClipEnable = true.into();
+                let r = unsafe { dev.CreateGraphicsPipelineState(&pd) };
+                drop(std::mem::ManuallyDrop::into_inner(pd.pRootSignature));
+                r
+            };
+            if let Err(e) = create(None) {
+                if plain < 3 {
+                    say(format!("VS {v} PS {p}: refused without the GS: {e}"));
+                }
+                plain += 1;
+                continue;
+            }
+            if let Err(e) = create(Some(&gs)) {
+                if only_gs < 5 {
+                    say(format!("VS {v} PS {p}: refused with the rect list GS: {e}"));
+                }
+                only_gs += 1;
+            }
+        }
+        println!("pairs: {tried} tried, {missing} not found or not translated, {plain} refused without the GS, {only_gs} refused only with it");
+    }
+
+    /// `XCL_BENCH_PAIRS` (lines naming `VS <hash> PS <hash>`): the rect list pipelines of those
+    /// pairs in the title's kept pipeline list (`pso_manifest::dir()`, or `XCL_BENCH_MANIFEST`), the
+    /// first `XCL_BENCH_MAX` (5), each made from its own description as the title's run makes it –
+    /// translated shaders, the rect list GS, a triangle topology type – with and without the GS,
+    /// under the debug layer, whose messages are printed.
+    #[test]
+    #[ignore]
+    fn rect_list_gs_pipelines_from_the_manifest() {
+        use crate::hle::d3d12x::pso_manifest::{self, stage_at, Kind, Store};
+        let Some(pairs) = std::env::var_os("XCL_BENCH_PAIRS") else {
+            println!("XCL_BENCH_PAIRS not set");
+            return;
+        };
+        let listed: std::collections::HashSet<(u64, u64)> = std::fs::read_to_string(pairs)
+            .unwrap()
+            .lines()
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                let at = |k: &str| w.iter().position(|x| *x == k).and_then(|i| w.get(i + 1)).and_then(|h| u64::from_str_radix(h, 16).ok());
+                Some((at("VS")?, at("PS").unwrap_or(0)))
+            })
+            .collect();
+        let mut d: Option<ID3D12Debug> = None;
+        if unsafe { D3D12GetDebugInterface(&mut d) }.is_ok() {
+            if let Some(d) = d {
+                unsafe { d.EnableDebugLayer() };
+            }
+        }
+        let Some(dev) = device() else { return };
+        let dev2: ID3D12Device2 = windows::core::Interface::cast(&dev).unwrap();
+        let info = windows::core::Interface::cast::<ID3D12InfoQueue>(&dev).ok();
+        println!("debug layer: {}", info.is_some());
+        let say = |print: bool| {
+            let Some(q) = &info else { return };
+            for k in 0..if print { unsafe { q.GetNumStoredMessages() } } else { 0 } {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(k, None, &mut len) };
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if unsafe { q.GetMessage(k, Some(m), &mut len) }.is_ok() {
+                    println!("    {}", unsafe { std::ffi::CStr::from_ptr((*m).pDescription as *const std::ffi::c_char) }.to_string_lossy());
+                }
+            }
+            unsafe { q.ClearStoredMessages() };
+        };
+        let windows: u32 = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let max: usize = std::env::var("XCL_BENCH_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(usize::MAX);
+        let split = std::env::var_os("XCL_BENCH_SPLIT").is_some();
+        let dir = std::env::var_os("XCL_BENCH_MANIFEST").map_or_else(pso_manifest::dir, PathBuf::from);
+        let loaded = Store::open(dir).load();
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+        let (mut done, mut refused) = (0usize, 0usize);
+        for r in &loaded.records {
+            if done == max {
+                break;
+            }
+            let shader = |stage: &str| r.shaders.iter().find(|(at, _)| stage_at(r, *at) == stage).map(|(_, b)| b.as_slice());
+            let (Some(vs), ps) = (shader("VS"), shader("PS")) else { continue };
+            let pair = (crate::gpu::shader::fnv64(vs), ps.map_or(0, crate::gpu::shader::fnv64));
+            if !listed.contains(&pair) || !matches!(r.kind, Kind::VertexStream | Kind::Graphics) {
+                continue;
+            }
+            let Ok(vc) = console_to_dxil_in(vs, Stage::Vertex, 0, split, windows) else { continue };
+            let pc = ps.map(|p| console_to_dxil_in(p, Stage::Pixel, vc.samplers.len() as u32, split, windows));
+            let pc = match pc {
+                Some(Ok(c)) => Some(c),
+                Some(Err(_)) => continue,
+                None => None,
+            };
+            let Ok(gs) = rect_list_gs(vs) else { continue };
+            let mut samplers = vc.samplers.clone();
+            samplers.extend(pc.iter().flat_map(|c| c.samplers.iter().cloned()));
+            let Ok(rs) = abi_root_signature_with(&dev, true, &samplers) else { continue };
+            done += 1;
+            // the input layout's elements with their names
+            let names: Vec<std::ffi::CString> = r.layout.iter().flat_map(|(_, e)| e.iter().map(|(n, _)| std::ffi::CString::new(n.iter().copied().take_while(|&c| c != 0).collect::<Vec<u8>>()).unwrap())).collect();
+            let elems: Vec<[u8; pso_manifest::ELEMENT]> = r
+                .layout
+                .iter()
+                .flat_map(|(_, e)| e.iter())
+                .zip(&names)
+                .map(|((_, e), n)| {
+                    let mut e = *e;
+                    e[..8].copy_from_slice(&(n.as_ptr() as usize as u64).to_le_bytes());
+                    e
+                })
+                .collect();
+            let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+            let create = |with_gs: bool, verbose: bool| -> windows::core::Result<ID3D12PipelineState> {
+                match r.kind {
+                    Kind::VertexStream => {
+                        let mut out: Vec<u8> = Vec::new();
+                        let mut put = |ty: u32, payload: &[u8], align8: bool| {
+                            out.extend_from_slice(&ty.to_le_bytes());
+                            if align8 {
+                                out.extend_from_slice(&[0; 4]);
+                            }
+                            out.extend_from_slice(payload);
+                            out.resize(out.len().div_ceil(8) * 8, 0);
+                        };
+                        let as_bytes = |c: &D3D12_SHADER_BYTECODE| unsafe { std::slice::from_raw_parts(c as *const _ as *const u8, 16) }.to_vec();
+                        put(0, &(windows::core::Interface::as_raw(&rs) as usize as u64).to_le_bytes(), true);
+                        put(1, &as_bytes(&code(&vc.dxil)), true);
+                        if let Some(c) = &pc {
+                            put(2, &as_bytes(&code(&c.dxil)), true);
+                        }
+                        if with_gs {
+                            put(5, &as_bytes(&code(&gs)), true);
+                        }
+                        put(14, &3u32.to_le_bytes(), false);
+                        let (b, mut off) = (&r.desc, 0usize);
+                        while off + 8 <= b.len() {
+                            let ty = u32_at(b, off);
+                            let Some((size, align)) = crate::hle::d3d12x::null::subobject_payload(ty) else { break };
+                            let p = off + if align == 8 { 8 } else { 4 };
+                            let mut payload = b[p..p + size].to_vec();
+                            off = (p + size + 7) & !7;
+                            if matches!(ty, 0..=6 | 14 | 19 | 24 | 25) {
+                                continue;
+                            }
+                            if ty == 12 {
+                                payload[..8].copy_from_slice(&(elems.as_ptr() as usize as u64).to_le_bytes());
+                            }
+                            // the console's view formats the PC's, as `pc_topology_type` makes them
+                            if matches!(ty, 15 | 16) {
+                                for k in 0..if ty == 15 { 8 } else { 1 } {
+                                    let f = u32_at(&payload, 4 * k);
+                                    let v = if ty == 15 { crate::hle::d3d12x::device_x::pc_target_format(f) } else { crate::hle::d3d12x::device_x::pc_view_format(f) };
+                                    payload[4 * k..4 * k + 4].copy_from_slice(&v.to_le_bytes());
+                                }
+                            }
+                            if verbose {
+                                println!("  subobject {ty}: {}", hex(&payload));
+                            }
+                            put(ty, &payload, align == 8);
+                        }
+                        let desc = D3D12_PIPELINE_STATE_STREAM_DESC { SizeInBytes: out.len(), pPipelineStateSubobjectStream: out.as_mut_ptr() as *mut _ };
+                        unsafe { dev2.CreatePipelineState(&desc) }
+                    }
+                    _ => {
+                        assert_eq!(r.desc.len(), std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>());
+                        let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = unsafe { std::ptr::read_unaligned(r.desc.as_ptr() as *const _) };
+                        if verbose {
+                            println!("  stream output {}, rasterizer {}, flags {:#x}", hex(&r.desc[std::mem::offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, StreamOutput)..][..32]), hex(&r.desc[std::mem::offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, RasterizerState)..][..44]), g.Flags.0);
+                        }
+                        g.pRootSignature = std::mem::ManuallyDrop::new(Some(rs.clone()));
+                        g.VS = code(&vc.dxil);
+                        g.PS = pc.as_ref().map_or_else(D3D12_SHADER_BYTECODE::default, |c| code(&c.dxil));
+                        g.GS = if with_gs { code(&gs) } else { D3D12_SHADER_BYTECODE::default() };
+                        g.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr() as *const _, NumElements: elems.len() as u32 };
+                        g.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+                        g.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+                        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+                        g.DSVFormat = DXGI_FORMAT(crate::hle::d3d12x::device_x::pc_view_format(g.DSVFormat.0 as u32) as i32);
+                        for f in g.RTVFormats.iter_mut() {
+                            *f = DXGI_FORMAT(crate::hle::d3d12x::device_x::pc_target_format(f.0 as u32) as i32);
+                        }
+                        let r = unsafe { dev.CreateGraphicsPipelineState(&g) };
+                        drop(std::mem::ManuallyDrop::into_inner(g.pRootSignature));
+                        r
+                    }
+                }
+            };
+            let (plain, with) = (create(false, false), create(true, false));
+            if plain.is_ok() && with.is_ok() {
+                say(false);
+                continue;
+            }
+            refused += 1;
+            if refused <= 5 {
+                println!("VS {:016x} PS {:016x}: {:?}, {} input elements; without the GS {:?}, with it {:?}", pair.0, pair.1, r.kind, elems.len(), plain.as_ref().map(|_| ()), with.as_ref().map(|_| ()));
+                say(true);
+                let _ = create(false, true);
+                say(false);
+            }
+        }
+        println!("{done} pipelines of the listed pairs made ({refused} refused with or without the GS), of {} kept", loaded.records.len());
+    }
+
+    /// `XCL_BENCH_PAIRS` / `XCL_BENCH_SHADERS` as above: each pair's VS, PS and rect list GS
+    /// compiled by DXC and by the direct DXIL backend, and the pipeline made with every mix of
+    /// the two (as a run's shared DXIL cache can hand out), under the debug layer.
+    #[test]
+    #[ignore]
+    fn rect_list_gs_pipelines_across_compilers() {
+        let (Some(dir), Some(pairs)) = (std::env::var_os("XCL_BENCH_SHADERS"), std::env::var_os("XCL_BENCH_PAIRS")) else {
+            println!("XCL_BENCH_SHADERS / XCL_BENCH_PAIRS not set");
+            return;
+        };
+        let mut d: Option<ID3D12Debug> = None;
+        if unsafe { D3D12GetDebugInterface(&mut d) }.is_ok() {
+            if let Some(d) = d {
+                unsafe { d.EnableDebugLayer() };
+            }
+        }
+        let Some(dev) = device() else { return };
+        let info = windows::core::Interface::cast::<ID3D12InfoQueue>(&dev).ok();
+        let say = |print: bool| {
+            let Some(q) = &info else { return };
+            for k in 0..if print { unsafe { q.GetNumStoredMessages() } } else { 0 } {
+                let mut len = 0usize;
+                let _ = unsafe { q.GetMessage(k, None, &mut len) };
+                let mut buf = vec![0u64; len.div_ceil(8)];
+                let m = buf.as_mut_ptr() as *mut D3D12_MESSAGE;
+                if unsafe { q.GetMessage(k, Some(m), &mut len) }.is_ok() {
+                    println!("    {}", unsafe { std::ffi::CStr::from_ptr((*m).pDescription as *const std::ffi::c_char) }.to_string_lossy());
+                }
+            }
+            unsafe { q.ClearStoredMessages() };
+        };
+        let windows: u32 = std::env::var("XCL_BENCH_WINDOWS").ok().and_then(|v| v.parse().ok()).unwrap_or(4);
+        let split = std::env::var_os("XCL_BENCH_SPLIT").is_some();
+        let both = |hlsl: &str, profile: &str| -> Option<[Vec<u8>; 2]> {
+            Some([dxc::compile(hlsl, "main", profile, &["-O1"]).ok()?, xcl_dxil::compile(hlsl, "main", profile).map_err(|e| println!("  direct {profile}: {e}")).ok()?])
+        };
+        let dir = PathBuf::from(dir);
+        let mut printed = 0usize;
+        let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in std::fs::read_to_string(pairs).unwrap().lines() {
+            let mut it = line.split_whitespace();
+            let (Some(v), Some(p)) = (it.next(), it.next()) else { continue };
+            let (Ok(vs), Ok(ps)) = (std::fs::read(dir.join(format!("{v}_vs.bin"))), std::fs::read(dir.join(format!("{p}_ps.bin")))) else { continue };
+            let Ok((vt, vprof)) = console_translation(&vs, Stage::Vertex, 0, windows, split) else { continue };
+            let Ok((pt, pprof)) = console_translation(&ps, Stage::Pixel, vt.static_samplers.len() as u32, windows, split) else { continue };
+            let gs_hlsl = super::super::emit::rect_list_gs(&crate::gpu::dxbc::signatures(&vs).1);
+            let (Some(vsx), Some(psx), Some(gsx)) = (both(&vt.hlsl, vprof), both(&pt.hlsl, pprof), both(&gs_hlsl, "gs_6_6")) else {
+                println!("VS {v} PS {p}: not compiled by both");
+                continue;
+            };
+            let mut samplers = vt.static_samplers.clone();
+            samplers.extend(pt.static_samplers.iter().cloned());
+            let Ok(rs) = abi_root_signature_with(&dev, true, &samplers) else { continue };
+            let code = |b: &[u8]| D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as _, BytecodeLength: b.len() };
+            let name = ["dxc", "direct"];
+            let mut row = Vec::new();
+            for (a, b, c) in (0..2).flat_map(|a| (0..2).flat_map(move |b| (0..3).map(move |c| (a, b, c)))) {
+                let mut pd = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::ManuallyDrop::new(Some(rs.clone())),
+                    VS: code(&vsx[a]),
+                    PS: code(&psx[b]),
+                    GS: if c == 2 { D3D12_SHADER_BYTECODE::default() } else { code(&gsx[c]) },
+                    SampleMask: u32::MAX,
+                    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+                    NumRenderTargets: 1,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                    ..Default::default()
+                };
+                pd.RTVFormats[0] = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM;
+                pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+                pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+                pd.RasterizerState.DepthClipEnable = true.into();
+                let r: windows::core::Result<ID3D12PipelineState> = unsafe { dev.CreateGraphicsPipelineState(&pd) };
+                drop(std::mem::ManuallyDrop::into_inner(pd.pRootSignature));
+                let combo = format!("VS {} PS {} GS {}", name[a], name[b], if c == 2 { "none" } else { name[c] });
+                match r {
+                    Ok(_) => {
+                        say(false);
+                        row.push(combo);
+                    }
+                    Err(e) => {
+                        let print = printed < 6;
+                        if print {
+                            printed += 1;
+                            println!("VS {v} PS {p}: {combo}: {e}");
+                        }
+                        say(print);
+                        *refused.entry(combo).or_default() += 1;
+                    }
+                }
+            }
+            println!("VS {v} PS {p}: made {}/12", row.len());
+        }
+        for (combo, n) in &refused {
+            println!("refused {n:4}: {combo}");
+        }
     }
 }

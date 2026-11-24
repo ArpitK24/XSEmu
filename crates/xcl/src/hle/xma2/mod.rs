@@ -1433,9 +1433,18 @@ impl StreamDecoder {
     /// Decode one WMA/XMA frame from `self.reservoir`.
     /// Returns `(more_frames, got_frame)`.
     fn decode_frame(&mut self, out_frame: &mut [[f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM]) -> (bool, bool) {
+        let bytes = std::mem::take(&mut self.reservoir.buf);
+        let frame = self.decode_frame_bits(BitReader::new(&bytes, self.num_saved_bits), out_frame);
+        self.reservoir.buf = bytes;
+        frame
+    }
+
+    fn decode_frame_bits(
+        &mut self,
+        mut br: BitReader<'_>,
+        out_frame: &mut [[f32; SAMPLES_PER_FRAME]; MAX_CHANNELS_PER_STREAM],
+    ) -> (bool, bool) {
         let st = static_tables();
-        let data = self.reservoir.buf.clone();
-        let mut br = BitReader::new(&data, self.num_saved_bits);
         br.skip_bits(self.frame_offset);
 
         let len = if self.len_prefix {

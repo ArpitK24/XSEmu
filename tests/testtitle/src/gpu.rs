@@ -1763,6 +1763,163 @@ pub fn descriptor_heaps_after_a_large_graphics_reservation() -> Result<(), Strin
     }
 }
 
+pub fn external_placed_buffer() -> Result<(), String> {
+    const TILE: usize = 0x1_0000;
+    const REPLACE_64K: u32 = 0x2040_6000;
+    const OFFSET: usize = TILE - 4;
+    type Place = unsafe extern "system" fn(
+        *mut c_void, u64, *const D3D12_RESOURCE_DESC, D3D12_BARRIER_LAYOUT,
+        *const D3D12_CLEAR_VALUE, *const windows::core::GUID, *mut *mut c_void,
+    ) -> HRESULT;
+
+    unsafe {
+        let dev = device()?;
+        let base = crate::XMemVirtualAlloc(std::ptr::null(), 2 * TILE, 0x42000, 0, 1);
+        ensure!(!base.is_null(), "external placeholder");
+        ensure!(crate::VirtualFree(base, TILE, 0x8002) != 0, "split external placeholder");
+        let mut pages = [0u64; 2];
+        let mut count = pages.len();
+        ensure!(crate::XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()) != 0 && count == 2, "allocate physical pages");
+        for (i, page) in pages.iter_mut().enumerate() {
+            let at = base.byte_add(i * TILE);
+            ensure!(crate::XMemVirtualAlloc(at, TILE, REPLACE_64K, 0, 4) == at, "replace external placeholder {i}");
+            ensure!(crate::XMemMapPhysicalPages(at, 1, page) == at, "map physical page {i}");
+        }
+        let buf = |width| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER, Width: width, Height: 1, DepthOrArraySize: 1, MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR, ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC { Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..buf((2 * TILE) as u64) };
+        let place: Place = transmute_copy(&*(*(dev.as_raw() as *const *const usize)).add(133));
+        let words = base.byte_add(OFFSET).cast::<[u32; 2]>();
+        words.write([0x1122, 0x3344]);
+        let mut raw = std::ptr::null_mut();
+        let hr = place(dev.as_raw(), base as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &ID3D12Resource::IID, &mut raw);
+        ensure!(hr >= 0 && !raw.is_null(), "slot #133 returned {hr:#x}, resource {raw:p}");
+        let resource = ID3D12Resource::from_raw(raw);
+
+        let mut output = raw;
+        let hr = place(dev.as_raw(), base as u64, &desc, D3D12_BARRIER_LAYOUT_COMMON, std::ptr::null(), &ID3D12Resource::IID, &mut output);
+        ensure!(hr < 0 && output.is_null(), "unsupported layout left {output:p} ({hr:#x})");
+        output = raw;
+        let hr = place(dev.as_raw(), base as u64, &desc, D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &ID3D12Resource::IID, &mut output);
+        ensure!(hr < 0 && output.is_null(), "overlapping external placement left {output:p} ({hr:#x})");
+
+        let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, NumDescriptors: 1,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, NodeMask: 0,
+        }).map_err(e)?;
+        let heap_start: unsafe extern "system" fn(*mut c_void) -> usize =
+            transmute_copy(&*(*(heap.as_raw() as *const *const usize)).add(9));
+        let uav = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS, ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Buffer: D3D12_BUFFER_UAV {
+                NumElements: (2 * TILE / 4) as u32, Flags: D3D12_BUFFER_UAV_FLAG_RAW, ..Default::default()
+            } },
+        };
+        dev.CreateUnorderedAccessView(&resource, None, Some(&uav), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: heap_start(heap.as_raw()) });
+        let mut mapped = std::ptr::null_mut();
+        resource.Map(0, Some(&D3D12_RANGE::default()), Some(&mut mapped)).map_err(e)?;
+        ensure!(mapped == base, "Map returned {mapped:p} instead of {base:p}");
+        resource.Unmap(0, None);
+
+        let make_buffer = |ty, state| -> Result<ID3D12Resource, String> {
+            let mut out = None;
+            dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: ty, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &buf(8), state, None, &mut out).map_err(e)?;
+            out.ok_or("copy buffer".into())
+        };
+        let readback = make_buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST)?;
+        let upload = make_buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        upload.Map(0, None, Some(&mut mapped)).map_err(e)?;
+        mapped.cast::<[u32; 2]>().write([0x99aa, 0xbbcc]);
+        upload.Unmap(0, None);
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).map_err(e)?;
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(e)?;
+        let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
+        let submit = |dst: &ID3D12Resource, d_off, src: &ID3D12Resource, s_off, value| -> Result<(), String> {
+            alloc.Reset().map_err(e)?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(e)?;
+            list.CopyBufferRegion(dst, d_off, src, s_off, 8);
+            list.Close().map_err(e)?;
+            queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
+            wait(&queue, &fence, value)
+        };
+        for (i, values) in [[0x1122, 0x3344], [0x5566, 0x7788]].into_iter().enumerate() {
+            if i != 0 {
+                words.write(values);
+            }
+            submit(&readback, 0, &resource, OFFSET as u64, (i + 1) as u64)?;
+            readback.Map(0, None, Some(&mut mapped)).map_err(e)?;
+            let got = mapped.cast::<[u32; 2]>().read();
+            readback.Unmap(0, None);
+            ensure!(got == values, "GPU copy {i} across mappings: {got:x?}, expected {values:x?}");
+        }
+        submit(&resource, OFFSET as u64, &upload, 0, 3)?;
+        let cpu_word = base.byte_add(OFFSET - 64).cast::<u32>();
+        cpu_word.write(0xddee);
+        let range = D3D12_RANGE { Begin: OFFSET - 64, End: OFFSET + 8 };
+        resource.Map(0, Some(&range), Some(&mut mapped)).map_err(e)?;
+        ensure!(mapped == base && words.read() == [0x99aa, 0xbbcc], "Map did not copy GPU writes back: {:x?}", words.read());
+        ensure!(cpu_word.read() == 0xddee, "Map lost a pending CPU write");
+        resource.Unmap(0, None);
+        drop(heap);
+        drop(resource);
+        ensure!(words.read() == [0x99aa, 0xbbcc], "resource release changed title memory");
+        ensure!(crate::VirtualFree(base, 0, 0x8000) != 0 && crate::VirtualFree(base.byte_add(TILE), 0, 0x8000) != 0, "free title pages");
+        ensure!(crate::XMemFreePhysicalPages(count, pages.as_mut_ptr()) != 0, "free physical pages");
+        Ok(())
+    }
+}
+
+#[cfg(target_env = "msvc")]
+pub fn title_backed_display_textures(optimized_clear: bool) -> Result<(), String> {
+    type Create = unsafe extern "system" fn(
+        *mut c_void, *const D3D12_HEAP_PROPERTIES, D3D12_HEAP_FLAGS, *const D3D12_RESOURCE_DESC1,
+        D3D12_BARRIER_LAYOUT, *const D3D12_CLEAR_VALUE, *const c_void, u32, *const c_void,
+        *const windows::core::GUID, *mut *mut c_void,
+    ) -> HRESULT;
+    unsafe {
+        let dev = device()?;
+        let create: Create = transmute_copy(&*(*(dev.as_raw() as *const *const usize)).add(127));
+        let props = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_DEFAULT, CreationNodeMask: 1, VisibleNodeMask: 1, ..Default::default()
+        };
+        let mut desc = D3D12_RESOURCE_DESC1 {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D, Width: 3840, Height: 2160,
+            DepthOrArraySize: 1, MipLevels: 1, Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 }, Layout: D3D12_TEXTURE_LAYOUT(0x102),
+            Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, ..Default::default()
+        };
+        let clear = D3D12_CLEAR_VALUE { Format: desc.Format, Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0, 0.0, 0.0, 1.0] } };
+        if optimized_clear {
+            desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        }
+        let iid = &ID3D12Resource::IID as *const windows::core::GUID;
+        let clear = if optimized_clear { &clear as *const _ } else { std::ptr::null() };
+        let call = |layout, out| create(dev.as_raw(), &props, D3D12_HEAP_FLAG_ALLOW_DISPLAY, &desc,
+            layout, clear, iid.cast(), 0, iid.cast(), iid, out);
+        let mut targets = Vec::new();
+        for _ in 0..2 {
+            let mut raw = std::ptr::null_mut();
+            let hr = call(D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS, &mut raw);
+            ensure!(hr >= 0 && !raw.is_null(), "slot #127 returned {hr:#x}, resource {raw:p}");
+            let tex = ID3D12Resource::from_raw(raw);
+            let d = tex.GetDesc();
+            ensure!((d.Width, d.Height, d.Format) == (desc.Width, desc.Height, desc.Format)
+                && d.Flags == desc.Flags, "unexpected native texture: {d:?}");
+            targets.push(tex);
+        }
+        let mut out = targets[0].as_raw();
+        let hr = call(D3D12_BARRIER_LAYOUT_VIDEO_DECODE_READ, &mut out);
+        ensure!(hr < 0 && out.is_null(), "unsupported display layout left output {out:p} ({hr:#x})");
+        crate::XMemSetAllocationHooks(0, 0);
+        drop(targets);
+        Ok(())
+    }
+}
+
 #[cfg(target_env = "msvc")]
 pub fn title_backed_view_descriptor_heap(backing: usize) -> Result<(), String> {
     unsafe {

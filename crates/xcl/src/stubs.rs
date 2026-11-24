@@ -37,7 +37,6 @@ static ALL: Mutex<Vec<&'static StubInfo>> = Mutex::new(Vec::new());
 static ARENA: Mutex<(usize, usize)> = Mutex::new((0, 0)); // (next, end)
 static BY_KEY: OnceLock<Mutex<HashMap<String, (usize, &'static StubInfo)>>> = OnceLock::new();
 
-const THUNK_SIZE: usize = 48;
 const ARENA_CHUNK: usize = 64 * 1024;
 
 /// Count a call, log the first one, run the hook.
@@ -97,8 +96,30 @@ pub fn alloc_code(size: usize) -> *mut u8 {
     p as *mut u8
 }
 
-fn alloc_thunk() -> *mut u8 {
-    alloc_code(THUNK_SIZE)
+pub(crate) fn alloc_code_with_stack_unwind(mut code: Vec<u8>, end: usize, prolog: u8, frame: u16) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    debug_assert!(usize::from(prolog) <= end && end <= code.len() && frame != 0 && frame % 8 == 0);
+    code.resize(code.len().next_multiple_of(4), 0xCC);
+    let unwind = code.len() as u32;
+    if frame <= 128 {
+        code.extend_from_slice(&[1, prolog, 1, 0, prolog, (((frame / 8 - 1) as u8) << 4) | 2, 0, 0]);
+    } else {
+        code.extend_from_slice(&[1, prolog, 2, 0, prolog, 1]);
+        code.extend_from_slice(&(frame / 8).to_le_bytes());
+    }
+    let entry = code.len();
+    code.extend_from_slice(&0u32.to_le_bytes());
+    code.extend_from_slice(&(end as u32).to_le_bytes());
+    code.extend_from_slice(&unwind.to_le_bytes());
+    let dst = alloc_code(code.len());
+    unsafe {
+        std::ptr::copy_nonoverlapping(code.as_ptr(), dst, code.len());
+        FlushInstructionCache(GetCurrentProcess(), dst.cast(), code.len());
+    }
+    crate::eh::register_function_table(dst as usize, entry as u32, (code.len() - entry) as u32);
+    dst as usize
 }
 
 pub fn info_of_stub(addr: usize) -> Option<&'static StubInfo> {
@@ -128,9 +149,9 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
         first_caller: AtomicUsize::new(0),
         hook: AtomicUsize::new(0),
     }));
-    let p = alloc_thunk();
-    let mut code: Vec<u8> = Vec::with_capacity(THUNK_SIZE);
+    let mut code: Vec<u8> = Vec::with_capacity(48);
     code.extend_from_slice(&[0x48, 0x83, 0xEC, 0x28]); // sub rsp, 0x28
+    let prolog = code.len() as u8;
     code.extend_from_slice(&[0x48, 0xB9]); // mov rcx, imm64
     code.extend_from_slice(&(info as *const StubInfo as u64).to_le_bytes());
     code.extend_from_slice(&[0x48, 0x8B, 0x54, 0x24, 0x28]); // mov rdx, [rsp+0x28]
@@ -139,18 +160,10 @@ pub fn make_stub_info(dll: &str, name: &str, ret: u64) -> (usize, &'static StubI
     code.extend_from_slice(&[0xFF, 0xD0]); // call rax
     code.extend_from_slice(&[0x48, 0x83, 0xC4, 0x28]); // add rsp, 0x28
     code.push(0xC3); // ret
-    debug_assert!(code.len() <= THUNK_SIZE);
-    // SAFETY: `p` is freshly allocated with at least `THUNK_SIZE >= code.len()` bytes of RWX memory.
-    unsafe {
-        std::ptr::copy_nonoverlapping(code.as_ptr(), p, code.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            p as *const _,
-            code.len(),
-        );
-    }
+    let end = code.len();
+    let addr = alloc_code_with_stack_unwind(code, end, prolog, 0x28);
     ALL.lock().unwrap().push(info);
-    let entry = (p as usize, info);
+    let entry = (addr, info);
     g.insert(key, entry);
     entry
 }

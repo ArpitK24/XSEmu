@@ -181,13 +181,14 @@ pub fn model_native_wave64(
 }
 
 /// Standalone shader proving the dispatcher contract is expressible in HLSL.
-/// Scratch is an external UAV and therefore consumes none of `xcl_lds`.
+/// Scratch is an external UAV (the memory view, io[`IO_MEM_VIEWS`]) and therefore consumes
+/// none of `xcl_lds`.
 pub fn validation_hlsl() -> String {
     format!(
         r#"RWStructuredBuffer<uint> io : register(u0);
-RWByteAddressBuffer scratch : register(u2);
 [numthreads({GROUP_THREADS}, 1, 1)]
 void main(uint gi : SV_GroupIndex) {{
+    RWByteAddressBuffer scratch = ResourceDescriptorHeap[io[{mem_views}]];
     uint record_base = io[0];
     uint wave = gi / {LOGICAL_WAVE_LANES}u;
     uint lane = gi % {LOGICAL_WAVE_LANES}u;
@@ -221,7 +222,8 @@ void main(uint gi : SV_GroupIndex) {{
         state_bytes = STATE_WORDS * 4,
         state_header_bytes = STATE_HEADER_WORDS * 4,
         mailbox_base = STATE_WORDS * LOGICAL_WAVES * 4,
-        result_base = (STATE_WORDS * LOGICAL_WAVES + MAILBOX_WORDS) * 4
+        result_base = (STATE_WORDS * LOGICAL_WAVES + MAILBOX_WORDS) * 4,
+        mem_views = super::IO_MEM_VIEWS
     )
 }
 

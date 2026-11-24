@@ -109,10 +109,15 @@ impl Inner {
     }
 }
 
+enum Provider {
+    Guest { callback: usize, context: usize },
+    Owned(Payload),
+}
+
 pub struct State {
     id: u64,
-    provider: usize,
-    context: usize,
+    queue: Result<Arc<taskqueue::Queue>, HRESULT>,
+    provider: Option<Provider>,
     identity: usize,
     /// For XAsyncRun.
     work: usize,
@@ -121,6 +126,10 @@ pub struct State {
 }
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+unsafe fn resolve_queue(handle: *mut c_void) -> Result<Arc<taskqueue::Queue>, HRESULT> {
+    taskqueue::queue_from(handle).ok_or(if handle.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG })
+}
 
 fn active_map() -> &'static Mutex<HashMap<usize, Arc<State>>> {
     static ACTIVE: OnceLock<Mutex<HashMap<usize, Arc<State>>>> = OnceLock::new();
@@ -187,12 +196,15 @@ unsafe fn register_state(b: *mut XAsyncBlock, s: Arc<State>) {
 }
 
 unsafe fn call_provider(s: &State, op: u32, b: *mut XAsyncBlock, buffer: *mut c_void, size: usize) -> HRESULT {
-    if s.provider == 0 {
-        return S_OK;
+    match &s.provider {
+        Some(Provider::Guest { callback, context }) => {
+            let data = XAsyncProviderData { async_: b, buffer_size: size, buffer, context: *context as *mut c_void };
+            let f: XAsyncProvider = std::mem::transmute(*callback);
+            f(op, &data)
+        }
+        Some(Provider::Owned(payload)) => payload_operation(payload, op, b, buffer, size),
+        None => S_OK,
     }
-    let data = XAsyncProviderData { async_: b, buffer_size: size, buffer, context: s.context as *mut c_void };
-    let f: XAsyncProvider = std::mem::transmute(s.provider);
-    f(op, &data)
 }
 
 unsafe extern "system" fn do_work_cb(ctx: *mut c_void, canceled: bool) {
@@ -229,20 +241,39 @@ pub unsafe extern "system" fn XAsyncBegin(
     b: *mut XAsyncBlock,
     context: *mut c_void,
     identity: *const c_void,
-    _identity_name: *const u8,
+    identity_name: *const u8,
     provider: usize,
+) -> HRESULT {
+    begin(b, identity, identity_name, Provider::Guest { callback: provider, context: context as usize })
+}
+
+unsafe fn begin(
+    b: *mut XAsyncBlock,
+    identity: *const c_void,
+    identity_name: *const u8,
+    provider: Provider,
 ) -> HRESULT {
     if let Some((o, f)) = pc(7) {
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, *mut c_void, *const c_void, *const u8, usize) -> HRESULT = std::mem::transmute(f);
-        return f(o, b, context, identity, _identity_name, provider);
+        return match provider {
+            Provider::Guest { callback, context } => f(o, b, context as *mut c_void, identity, identity_name, callback),
+            Provider::Owned(payload) => {
+                let p = Box::into_raw(Box::new(payload));
+                let hr = f(o, b, p.cast(), identity, identity_name, pc_payload_provider as usize);
+                if hr < 0 {
+                    drop(Box::from_raw(p));
+                }
+                hr
+            }
+        };
     }
-    if b.is_null() || provider == 0 {
+    if b.is_null() || matches!(&provider, Provider::Guest { callback: 0, .. }) {
         return E_INVALIDARG;
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        provider,
-        context: context as usize,
+        queue: resolve_queue((*b).queue),
+        provider: Some(provider),
         identity: identity as usize,
         work: 0,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
@@ -263,14 +294,13 @@ pub unsafe extern "system" fn XAsyncSchedule(b: *mut XAsyncBlock, delay_ms: u32)
         let f: unsafe extern "system" fn(usize, *mut XAsyncBlock, u32) -> HRESULT = std::mem::transmute(f);
         return f(o, b, delay_ms);
     }
-    if b.is_null() {
-        return E_INVALIDARG;
-    }
-    let Some(q) = taskqueue::queue_from((*b).queue) else {
-        return if (*b).queue.is_null() { taskqueue::E_NO_TASK_QUEUE } else { E_INVALIDARG };
+    let Lookup::Active(s) = lookup(b) else { return E_INVALIDARG };
+    let q = match &s.queue {
+        Ok(q) => q,
+        Err(hr) => return *hr,
     };
     // a terminated queue takes no new work (libHttpClient: XTaskQueueSubmitDelayedCallback)
-    if !taskqueue::submit_delayed(&q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
+    if !taskqueue::submit_delayed(q, PORT_WORK, delay_ms, Item { cb: do_work_cb as usize, ctx: b as usize }) {
         return E_ABORT;
     }
     S_OK
@@ -300,9 +330,9 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         g.result_size = if status >= 0 { required } else { 0 };
         cleanup_now = g.result_size == 0;
     }
-    // Snapshot callback/queue before publishing completion so a waiter woken from
+    // Snapshot the callback before publishing completion so a waiter woken from
     // `XAsyncGetStatus(b, true)` can safely destroy a stack-allocated `XAsyncBlock`.
-    let (cb, queue_ptr) = ((*b).callback, (*b).queue);
+    let cb = (*b).callback;
     if cleanup_now {
         call_provider(&s, OP_CLEANUP, b, std::ptr::null_mut(), 0);
     }
@@ -319,8 +349,8 @@ pub unsafe extern "system" fn XAsyncComplete(b: *mut XAsyncBlock, result: HRESUL
         g.phase = if cleanup_now { Phase::Consumed } else { Phase::Done };
     }
     if cb != 0 {
-        if let Some(q) = taskqueue::queue_from(queue_ptr) {
-            let _ = taskqueue::submit_now(&q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
+        if let Ok(q) = &s.queue {
+            let _ = taskqueue::submit_now(q, PORT_COMPLETION, Item { cb: completion_cb as usize, ctx: b as usize });
         }
     }
     s.cv.notify_all();
@@ -469,8 +499,8 @@ pub unsafe extern "system" fn XAsyncRun(b: *mut XAsyncBlock, work: usize) -> HRE
     }
     let s = Arc::new(State {
         id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
-        provider: 0,
-        context: 0,
+        queue: resolve_queue((*b).queue),
+        provider: None,
         identity: 0,
         work,
         inner: Mutex::new(Inner { status: E_PENDING, result_size: 0, phase: Phase::Pending }),
@@ -501,11 +531,25 @@ struct Payload {
     work: Mutex<Option<Box<dyn FnOnce() -> Result<PayloadBuf, HRESULT> + Send>>>,
 }
 
-unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
+unsafe extern "system" fn pc_payload_provider(op: u32, data: *const XAsyncProviderData) -> HRESULT {
     let d = &*data;
-    let p = &*(d.context as *const Payload);
+    let p = d.context.cast::<Payload>();
+    if op == OP_CLEANUP {
+        drop(Box::from_raw(p));
+        return S_OK;
+    }
+    payload_operation(&*p, op, d.async_, d.buffer, d.buffer_size)
+}
+
+unsafe fn payload_operation(
+    p: &Payload,
+    op: u32,
+    b: *mut XAsyncBlock,
+    buffer: *mut c_void,
+    buffer_size: usize,
+) -> HRESULT {
     match op {
-        OP_BEGIN => XAsyncSchedule(d.async_, 0),
+        OP_BEGIN => XAsyncSchedule(b, 0),
         OP_DO_WORK => {
             let w = p.work.lock().unwrap().take();
             let r = w.map(|f| f()).unwrap_or(Err(crate::util::E_FAIL));
@@ -514,13 +558,13 @@ unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderD
                 Err(e) => (*e, 0),
             };
             *p.result.lock().unwrap() = Some(r);
-            XAsyncComplete(d.async_, hr, size);
+            XAsyncComplete(b, hr, size);
             S_OK
         }
         OP_GET_RESULT => {
             if let Some(Ok(pb)) = p.result.lock().unwrap().as_ref() {
-                let n = pb.bytes.len().min(d.buffer_size);
-                let dst = d.buffer as *mut u8;
+                let n = pb.bytes.len().min(buffer_size);
+                let dst = buffer as *mut u8;
                 std::ptr::copy_nonoverlapping(pb.bytes.as_ptr(), dst, n);
                 let base = dst as usize;
                 for &off in &pb.fixups {
@@ -531,10 +575,6 @@ unsafe extern "system" fn payload_provider(op: u32, data: *const XAsyncProviderD
                     }
                 }
             }
-            S_OK
-        }
-        OP_CLEANUP => {
-            drop(Box::from_raw(d.context as *mut Payload));
             S_OK
         }
         _ => S_OK,
@@ -554,14 +594,8 @@ pub unsafe fn begin_with_fixups<F>(b: *mut XAsyncBlock, identity: usize, work: F
 where
     F: FnOnce() -> Result<PayloadBuf, HRESULT> + Send + 'static,
 {
-    let p = Box::into_raw(Box::new(Payload { result: Mutex::new(None), work: Mutex::new(Some(Box::new(work))) }));
-    let hr = XAsyncBegin(b, p as *mut c_void, identity as *const c_void, std::ptr::null(), payload_provider as usize);
-    if hr < 0 {
-        // SAFETY: `XAsyncBegin` rejected the call before adopting `p`, so `OP_CLEANUP` will
-        // never run; reclaim the `Box<Payload>` allocated above to avoid leaking it.
-        drop(Box::from_raw(p));
-    }
-    hr
+    let payload = Payload { result: Mutex::new(None), work: Mutex::new(Some(Box::new(work))) };
+    begin(b, identity as *const c_void, std::ptr::null(), Provider::Owned(payload))
 }
 
 #[cfg(test)]
@@ -731,6 +765,48 @@ mod tests {
     }
     unsafe extern "system" fn begins_without_work(_op: u32, _data: *const XAsyncProviderData) -> HRESULT {
         S_OK
+    }
+
+    unsafe extern "system" fn count_queue_completion(b: *mut XAsyncBlock) {
+        (*(*b).context.cast::<AtomicU32>()).fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn async_work_and_completion_keep_the_queue_after_handle_close() {
+        let _g = ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            for run in [false, true] {
+                let mut q = std::ptr::null_mut();
+                assert_eq!(taskqueue::XTaskQueueCreate(taskqueue::MODE_MANUAL, taskqueue::MODE_IMMEDIATE, &mut q), S_OK);
+                let mut dispatch_handle = std::ptr::null_mut();
+                assert_eq!(taskqueue::XTaskQueueDuplicateHandle(q, &mut dispatch_handle), S_OK);
+                let queue = Arc::downgrade(&taskqueue::queue_from(q).unwrap());
+                let mut calls = AtomicU32::new(0);
+                let mut b: XAsyncBlock = std::mem::zeroed();
+                b.queue = q;
+                b.context = (&mut calls as *mut AtomicU32).cast();
+                b.callback = count_queue_completion as usize;
+                let started = if run {
+                    XAsyncRun(&mut b, run_work as usize)
+                } else {
+                    XAsyncBegin(&mut b, std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), begins_without_work as usize)
+                };
+                taskqueue::XTaskQueueCloseHandle(q);
+                let scheduled = if run { S_OK } else { XAsyncSchedule(&mut b, 0) };
+                let dispatched = taskqueue::XTaskQueueDispatch(dispatch_handle, PORT_WORK, 0);
+                taskqueue::XTaskQueueCloseHandle(dispatch_handle);
+                let status = XAsyncGetStatus(&mut b, false);
+                if status == E_PENDING {
+                    XAsyncComplete(&mut b, E_ABORT, 0);
+                }
+                assert_eq!(started, S_OK);
+                assert_eq!(scheduled, S_OK);
+                assert!(dispatched);
+                assert_eq!(status, if run { 7 } else { S_OK });
+                assert_eq!(calls.load(Ordering::Relaxed), 1);
+                assert!(queue.upgrade().is_none());
+            }
+        }
     }
 
     #[test]

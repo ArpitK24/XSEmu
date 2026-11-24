@@ -36,6 +36,7 @@ pub enum PeError {
     BadMagic(&'static str),
     NotX64(u16),
     BadRva(u32),
+    HeaderWriteTarget(u32),
 }
 
 impl fmt::Display for PeError {
@@ -45,6 +46,7 @@ impl fmt::Display for PeError {
             PeError::BadMagic(w) => write!(f, "invalid signature {w} (not a PE file)"),
             PeError::NotX64(m) => write!(f, "architecture 0x{m:04x} is not x64 (0x8664)"),
             PeError::BadRva(r) => write!(f, "RVA 0x{r:x} outside the image"),
+            PeError::HeaderWriteTarget(r) => write!(f, "write target RVA 0x{r:x} in the image headers"),
         }
     }
 }
@@ -405,11 +407,21 @@ impl<'a> Pe<'a> {
         u32::try_from(r).ok()
     }
 
+    fn validate_data_write(&self, rva: u32, bytes: u32) -> Result<(), PeError> {
+        if rva < self.size_of_headers {
+            return Err(PeError::HeaderWriteTarget(rva));
+        }
+        if rva.checked_add(bytes).is_none_or(|end| end > self.size_of_image) {
+            return Err(PeError::BadRva(rva));
+        }
+        Ok(())
+    }
+
     fn thunks(&self, int_rva: u32, iat_rva: u32) -> Result<Vec<ImportEntry>, PeError> {
         let mut out = Vec::new();
         let names_rva = if int_rva != 0 { int_rva } else { iat_rva };
         for i in 0..65536u32 {
-            let slot = names_rva + i * 8;
+            let slot = names_rva.checked_add(i * 8).ok_or(PeError::BadRva(names_rva))?;
             let v = self.u64_at(slot).ok_or(PeError::BadRva(slot))?;
             if v == 0 {
                 break;
@@ -419,10 +431,12 @@ impl<'a> Pe<'a> {
             } else {
                 let hn = (v & 0x7FFF_FFFF) as u32;
                 let hint = self.u16_at(hn).ok_or(PeError::BadRva(hn))?;
-                let name = self.cstr_at(hn + 2).ok_or(PeError::BadRva(hn + 2))?;
+                let name = self.cstr_at(hn.wrapping_add(2)).ok_or(PeError::BadRva(hn))?;
                 ImportName::Name { hint, name }
             };
-            out.push(ImportEntry { iat_rva: iat_rva + i * 8, what });
+            let iat_rva = iat_rva.checked_add(i * 8).ok_or(PeError::BadRva(iat_rva))?;
+            self.validate_data_write(iat_rva, 8)?;
+            out.push(ImportEntry { iat_rva, what });
         }
         Ok(out)
     }
@@ -434,10 +448,14 @@ impl<'a> Pe<'a> {
             return Ok(out);
         }
         for i in 0..4096u32 {
-            let o = d.rva + i * 20;
-            let int_rva = self.u32_at(o).ok_or(PeError::BadRva(o))?;
-            let name_rva = self.u32_at(o + 12).ok_or(PeError::BadRva(o))?;
-            let iat_rva = self.u32_at(o + 16).ok_or(PeError::BadRva(o))?;
+            let o = d.rva.checked_add(i * 20).ok_or(PeError::BadRva(d.rva))?;
+            let g = |offset: u32| {
+                let rva = o.checked_add(offset).ok_or(PeError::BadRva(o))?;
+                self.u32_at(rva).ok_or(PeError::BadRva(rva))
+            };
+            let int_rva = g(0)?;
+            let name_rva = g(12)?;
+            let iat_rva = g(16)?;
             if int_rva == 0 && name_rva == 0 && iat_rva == 0 {
                 break;
             }
@@ -455,12 +473,16 @@ impl<'a> Pe<'a> {
             return Ok(out);
         }
         for i in 0..4096u32 {
-            let o = d.rva + i * 32;
-            let attrs = self.u32_at(o).ok_or(PeError::BadRva(o))?;
-            let mut name_rva = self.u32_at(o + 4).ok_or(PeError::BadRva(o))?;
-            let mut hmod_rva = self.u32_at(o + 8).ok_or(PeError::BadRva(o))?;
-            let mut iat_rva = self.u32_at(o + 12).ok_or(PeError::BadRva(o))?;
-            let mut int_rva = self.u32_at(o + 16).ok_or(PeError::BadRva(o))?;
+            let o = d.rva.checked_add(i * 32).ok_or(PeError::BadRva(d.rva))?;
+            let g = |offset: u32| {
+                let rva = o.checked_add(offset).ok_or(PeError::BadRva(o))?;
+                self.u32_at(rva).ok_or(PeError::BadRva(rva))
+            };
+            let attrs = g(0)?;
+            let mut name_rva = g(4)?;
+            let mut hmod_rva = g(8)?;
+            let mut iat_rva = g(12)?;
+            let mut int_rva = g(16)?;
             if name_rva == 0 && iat_rva == 0 {
                 break;
             }
@@ -471,6 +493,9 @@ impl<'a> Pe<'a> {
                 hmod_rva = fix(hmod_rva);
                 iat_rva = fix(iat_rva);
                 int_rva = fix(int_rva);
+            }
+            if hmod_rva != 0 {
+                self.validate_data_write(hmod_rva, 8)?;
             }
             let dll = self.cstr_at(name_rva).ok_or(PeError::BadRva(name_rva))?;
             let entries = self.thunks(int_rva, iat_rva)?;
@@ -485,23 +510,30 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(out);
         }
+        // the block sizes come from the file: a block past the directory's end (or one whose
+        // offsets overflow) is a malformed image, not a panic or a 2^31-entry loop
         let mut pos = 0u32;
-        while pos + 8 <= d.size {
-            let page = self.u32_at(d.rva + pos).ok_or(PeError::BadRva(d.rva + pos))?;
-            let block = self.u32_at(d.rva + pos + 4).ok_or(PeError::BadRva(d.rva + pos))?;
+        while pos.saturating_add(8) <= d.size {
+            let at = d.rva.checked_add(pos).ok_or(PeError::BadRva(d.rva))?;
+            let page = self.u32_at(at).ok_or(PeError::BadRva(at))?;
+            let block_rva = at.checked_add(4).ok_or(PeError::BadRva(at))?;
+            let block = self.u32_at(block_rva).ok_or(PeError::BadRva(block_rva))?;
             if block < 8 {
                 break;
             }
+            if block > d.size - pos {
+                return Err(PeError::BadRva(at));
+            }
             let n = (block - 8) / 2;
             for i in 0..n {
-                let e = self
-                    .u16_at(d.rva + pos + 8 + i * 2)
-                    .ok_or(PeError::BadRva(d.rva + pos))?;
+                let entry_rva = at.checked_add(8).and_then(|rva| rva.checked_add(i * 2))
+                    .ok_or(PeError::BadRva(at))?;
+                let e = self.u16_at(entry_rva).ok_or(PeError::BadRva(entry_rva))?;
                 let kind = e >> 12;
                 if kind == IMAGE_REL_BASED_ABSOLUTE {
                     continue;
                 }
-                out.push(Reloc { rva: page + (e & 0x0FFF) as u32, kind });
+                out.push(Reloc { rva: page.checked_add((e & 0x0FFF) as u32).ok_or(PeError::BadRva(at))?, kind });
             }
             pos += block;
         }
@@ -513,14 +545,23 @@ impl<'a> Pe<'a> {
         if d.rva == 0 || d.size == 0 {
             return Ok(None);
         }
-        let r = |o: u32| self.u64_at(d.rva + o).ok_or(PeError::BadRva(d.rva + o));
+        let field = |o: u32| d.rva.checked_add(o).ok_or(PeError::BadRva(d.rva));
+        let r = |o: u32| {
+            let rva = field(o)?;
+            self.u64_at(rva).ok_or(PeError::BadRva(rva))
+        };
+        let address_of_index = r(16)?;
+        if address_of_index != 0 {
+            let index_rva = self.va_to_rva(address_of_index).ok_or(PeError::BadRva(d.rva))?;
+            self.validate_data_write(index_rva, 4)?;
+        }
         Ok(Some(TlsDir {
             start_raw: r(0)?,
             end_raw: r(8)?,
-            address_of_index: r(16)?,
+            address_of_index,
             address_of_callbacks: r(24)?,
-            size_of_zero_fill: self.u32_at(d.rva + 32).ok_or(PeError::BadRva(d.rva + 32))?,
-            characteristics: self.u32_at(d.rva + 36).ok_or(PeError::BadRva(d.rva + 36))?,
+            size_of_zero_fill: self.u32_at(field(32)?).ok_or(PeError::BadRva(d.rva))?,
+            characteristics: self.u32_at(field(36)?).ok_or(PeError::BadRva(d.rva))?,
         }))
     }
 
@@ -586,9 +627,9 @@ impl OwnedExports {
     pub fn from_pe(pe: &Pe<'_>) -> Result<Self, PeError> {
         let mut out = OwnedExports::default();
         if let Some(ex) = pe.exports()? {
-            for (i, &rva) in ex.functions.iter().enumerate() {
+            for (ordinal, &rva) in (ex.ordinal_base..=u32::MAX).zip(&ex.functions) {
                 if let Some(t) = pe.export_target(&ex, rva) {
-                    out.by_ordinal.insert(ex.ordinal_base + i as u32, t);
+                    out.by_ordinal.insert(ordinal, t);
                 }
             }
             for (name, idx) in &ex.names {
@@ -623,6 +664,134 @@ mod tests {
         assert_eq!(Pe::parse(&buf, Layout::File).err(), Some(PeError::BadMagic("PE")));
     }
 
+    // A small file can map readable directory fields near the u32 RVA limit. Using an
+    // unmapped high RVA would fail the first read and miss overflow in later fields.
+    fn directory_at_rva(dir: usize, rva: u32, payload: &[u8]) -> Vec<u8> {
+        let mut data = vec![0u8; 0x200 + payload.len()];
+        data[..2].copy_from_slice(b"MZ");
+        data[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+        data[0x40..0x44].copy_from_slice(b"PE\0\0");
+        data[0x44..0x46].copy_from_slice(&IMAGE_FILE_MACHINE_AMD64.to_le_bytes());
+        data[0x46..0x48].copy_from_slice(&1u16.to_le_bytes());
+        data[0x54..0x56].copy_from_slice(&240u16.to_le_bytes());
+        let opt = 0x58;
+        data[opt..opt + 2].copy_from_slice(&0x20Bu16.to_le_bytes());
+        data[opt + 60..opt + 64].copy_from_slice(&0x200u32.to_le_bytes());
+        data[opt + 108..opt + 112].copy_from_slice(&16u32.to_le_bytes());
+        let d = opt + 112 + dir * 8;
+        data[d..d + 4].copy_from_slice(&rva.to_le_bytes());
+        data[d + 4..d + 8].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        let sec = opt + 240;
+        data[sec + 8..sec + 12].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        data[sec + 12..sec + 16].copy_from_slice(&rva.to_le_bytes());
+        data[sec + 16..sec + 20].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+        data[sec + 20..sec + 24].copy_from_slice(&0x200u32.to_le_bytes());
+        data[0x200..].copy_from_slice(payload);
+        data
+    }
+
+    #[test]
+    fn export_ordinals_stop_at_u32_max() {
+        let rva = 0x1000u32;
+        let mut payload = [0u8; 48];
+        payload[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        payload[20..24].copy_from_slice(&2u32.to_le_bytes());
+        payload[28..32].copy_from_slice(&(rva + 40).to_le_bytes());
+        payload[40..44].copy_from_slice(&0x2000u32.to_le_bytes());
+        payload[44..48].copy_from_slice(&0x2004u32.to_le_bytes());
+        let data = directory_at_rva(DIR_EXPORT, rva, &payload);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let exports = OwnedExports::from_pe(&pe).unwrap();
+        assert_eq!(exports.by_ordinal.len(), 1);
+        assert_eq!(exports.by_ordinal.get(&u32::MAX), Some(&ExportTarget::Rva(0x2000)));
+    }
+
+    #[test]
+    fn import_descriptor_field_rva_overflow_is_error() {
+        for offset in [12u32, 16] {
+            let rva = u32::MAX - offset + 1;
+            let data = directory_at_rva(DIR_IMPORT, rva, &[0; 20]);
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            assert_eq!(pe.u32_at(rva), Some(0));
+            assert!(matches!(pe.imports(), Err(PeError::BadRva(_))), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn delay_import_descriptor_field_rva_overflow_is_error() {
+        for offset in [4u32, 8, 12, 16] {
+            let rva = u32::MAX - offset + 1;
+            let data = directory_at_rva(DIR_DELAY_IMPORT, rva, &[0; 32]);
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            assert_eq!(pe.u32_at(rva), Some(0));
+            assert!(matches!(pe.delay_imports(), Err(PeError::BadRva(_))), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn relocation_block_field_rva_overflow_is_error() {
+        let data = directory_at_rva(DIR_BASERELOC, 0xFFFF_FFFC, &[0; 8]);
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert_eq!(pe.u32_at(0xFFFF_FFFC), Some(0));
+        assert!(matches!(pe.relocations(), Err(PeError::BadRva(_))));
+    }
+
+    #[test]
+    fn relocation_entry_rva_overflow_is_error() {
+        for (rva, size) in [(0xFFFF_FFF8, 10u32), (0xFFFF_FFF0, 18)] {
+            let mut payload = vec![0u8; size as usize];
+            payload[4..8].copy_from_slice(&size.to_le_bytes());
+            let data = directory_at_rva(DIR_BASERELOC, rva, &payload);
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            assert_eq!(pe.u32_at(rva + 4), Some(size));
+            assert!(matches!(pe.relocations(), Err(PeError::BadRva(_))), "RVA {rva:#x}");
+        }
+    }
+
+    #[test]
+    fn tls_field_rva_overflow_is_error() {
+        for offset in [8u32, 16, 24, 32, 36] {
+            let rva = u32::MAX - offset + 1;
+            let data = directory_at_rva(DIR_TLS, rva, &[0; 40]);
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            assert_eq!(pe.u64_at(rva), Some(0));
+            assert!(matches!(pe.tls(), Err(PeError::BadRva(_))), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn high_rva_directories_without_overflow_are_readable() {
+        for rva in [0x1000, 0xFFFF_FF00] {
+            let data = directory_at_rva(DIR_IMPORT, rva, &[0; 20]);
+            assert!(Pe::parse(&data, Layout::File).unwrap().imports().unwrap().is_empty());
+            let data = directory_at_rva(DIR_DELAY_IMPORT, rva, &[0; 32]);
+            assert!(Pe::parse(&data, Layout::File).unwrap().delay_imports().unwrap().is_empty());
+            let mut reloc = [0u8; 10];
+            reloc[4..8].copy_from_slice(&10u32.to_le_bytes());
+            reloc[8..10].copy_from_slice(&((IMAGE_REL_BASED_DIR64 << 12) | 0x20).to_le_bytes());
+            let data = directory_at_rva(DIR_BASERELOC, rva, &reloc);
+            assert_eq!(Pe::parse(&data, Layout::File).unwrap().relocations().unwrap(),
+                vec![Reloc { rva: 0x20, kind: IMAGE_REL_BASED_DIR64 }]);
+            let data = directory_at_rva(DIR_TLS, rva, &[0; 40]);
+            assert_eq!(Pe::parse(&data, Layout::File).unwrap().tls().unwrap(), Some(TlsDir::default()));
+        }
+    }
+
+    #[test]
+    fn directory_writes_stay_within_image_data() {
+        let data = directory_at_rva(DIR_TLS, 0x1000, &[0; 40]);
+        let mut pe = Pe::parse(&data, Layout::File).unwrap();
+        pe.size_of_headers = 0x200;
+        pe.size_of_image = 0x1200;
+        for width in [4, 8] {
+            assert_eq!(pe.validate_data_write(0x200, width), Ok(()));
+            assert_eq!(pe.validate_data_write(0x1200 - width, width), Ok(()));
+            assert!(pe.validate_data_write(0x1ff, width).is_err());
+            assert!(pe.validate_data_write(0x1201 - width, width).is_err());
+            assert!(pe.validate_data_write(u32::MAX, width).is_err());
+        }
+    }
+
     #[test]
     fn parses_kernel32_exports_and_imports() {
         let data = system_file("kernel32.dll");
@@ -638,6 +807,39 @@ mod tests {
         assert!(imps.iter().any(|d| d.dll.to_ascii_lowercase().starts_with("api-ms-win-")
             || d.dll.eq_ignore_ascii_case("ntdll.dll")));
         assert!(pe.relocations().unwrap().iter().all(|r| r.kind == IMAGE_REL_BASED_DIR64));
+    }
+
+    /// Malformed directories are errors, not panics or runaway loops (#106): a relocation block
+    /// claiming more than the directory holds, import descriptors at the end of the address space.
+    #[test]
+    fn malformed_relocations_and_imports_are_errors() {
+        let mut data = system_file("kernel32.dll");
+        let (reloc, import) = {
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            (pe.dir(DIR_BASERELOC), pe.dir(DIR_IMPORT))
+        };
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        let first_block = pe.rva_to_offset(reloc.rva).unwrap();
+        drop(pe);
+        // the first block's size: larger than the whole directory
+        data[first_block + 4..first_block + 8].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.relocations(), Err(PeError::BadRva(_))));
+        drop(pe);
+        data[first_block + 4..first_block + 8].copy_from_slice(&(reloc.size + 8).to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(matches!(pe.relocations(), Err(PeError::BadRva(_))));
+        drop(pe);
+        // the import directory at the top of the address space: its descriptors' offsets overflow
+        let dirs_off = {
+            let pe = Pe::parse(&data, Layout::File).unwrap();
+            // the data directories follow the optional header: find the import entry by value
+            let needle = [import.rva.to_le_bytes(), import.size.to_le_bytes()].concat();
+            data[..pe.size_of_headers as usize].windows(8).position(|w| w == needle.as_slice()).unwrap()
+        };
+        data[dirs_off..dirs_off + 4].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
+        let pe = Pe::parse(&data, Layout::File).unwrap();
+        assert!(pe.imports().is_err());
     }
 
     #[test]

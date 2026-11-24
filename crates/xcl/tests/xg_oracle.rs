@@ -361,6 +361,7 @@ fn subresource_copies_match_the_console_library() {
     let theirs = proc(m, "XGCreateTextureComputer");
     let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
     type Copy = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8, u32, u32, *const u8, u32, u32) -> i32;
+    type CopyFrom = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> i32;
     let mut seed = 0x9E37_79B9u32;
     let mut cases = 0;
     for &(f, w, h, array, layout) in &[
@@ -400,9 +401,9 @@ fn subresource_copies_match_the_console_library() {
                     assert_eq!(into(c)(c, a.as_mut_ptr(), 0, sub, lin.as_ptr(), pitch as u32, (pitch * l.height) as u32), 0);
                     assert_eq!(into(o)(o, b.as_mut_ptr(), 0, sub, lin.as_ptr(), pitch as u32, (pitch * l.height) as u32), 0);
                     // ours reads the console's bytes back
-                    let from: Copy = std::mem::transmute(*(*(o as *const *const usize)).add(9));
+                    let from: CopyFrom = std::mem::transmute(*(*(o as *const *const usize)).add(9));
                     let mut back = vec![0u8; pitch * l.height];
-                    assert_eq!(from(o, back.as_mut_ptr(), 0, sub, a.as_ptr(), pitch as u32, 0), 0);
+                    assert_eq!(from(o, back.as_mut_ptr(), 0, sub, 0, a.as_ptr(), pitch as u32, 0), 0);
                     for y in 0..l.height {
                         assert_eq!(back[y * pitch..y * pitch + row], lin[y * pitch..y * pitch + row], "layout {layout:#x} format {f} mip {i} slice {s} row {y}");
                     }
@@ -516,7 +517,7 @@ fn render_target_and_depth_layouts_match() {
     let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
     let mut bad = std::collections::BTreeMap::<String, (usize, String)>::new();
     let (mut cases, mut same) = (0, 0);
-    for f in [28u32, 71, 40, 55, 45, 20, 41, 39, 44] {
+    for f in [28u32, 71, 40, 55, 45, 20, 41, 39, 44, 118, 119, 120] {
         for (w, h) in [(1u64, 1u32), (100, 60), (256, 256), (1920, 1080)] {
             for mips in [1u16, 3] {
                 for array in [1u16, 6] {
@@ -616,4 +617,156 @@ fn print_line_modes() {
         let h2 = unsafe { layout(create, &desc(2, 256, 2, 1, 1, f, 0, 0)).0 };
         println!("fmt {f}: layouts {ok:?}, UAV {uav:?}, RT hr {rt:#x}, height 2 hr {h2:#x}");
     }
+}
+
+/// 3D textures: the layouts (size, alignment, levels outside the mip tail) and the texel offsets
+/// of every level are the console library's.
+#[test]
+fn volume_layouts_and_texels_match_the_console_library() {
+    let Some(m) = console() else { return };
+    let theirs = proc(m, "XGCreateTextureComputer");
+    let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
+    let (mut cases, mut same, mut refused, mut texels) = (0, 0, 0, 0);
+    let mut fields: std::collections::BTreeMap<String, (usize, String)> = Default::default();
+    let mut note = |k: String, ex: String| {
+        let e = fields.entry(k).or_default();
+        e.0 += 1;
+        if e.1.is_empty() {
+            e.1 = ex;
+        }
+    };
+    for f in [28u32, 61, 49, 10, 2, 71, 98] {
+        for (w, h, d) in [(1u64, 1u32, 1u16), (4, 4, 4), (16, 16, 16), (32, 32, 32), (64, 64, 16), (33, 17, 5), (128, 64, 32), (256, 32, 8), (100, 60, 20)] {
+            for mips in [1u16, 0, 3] {
+                for (lay, flags) in [(0u32, 0u32), (0, 4), (1, 0), (0x105, 0), (0x109, 0), (0x115, 0), (0x119, 0), (0x11A, 0), (0x106, 0)] {
+                    if mips == 3 && w.max(h as u64).max(d as u64) < 4 {
+                        continue;
+                    }
+                    let x = desc(4, w, h, d, mips, f, lay, flags);
+                    let what = format!("fmt {f} {w}x{h}x{d} mips {mips} layout {lay:#x} flags {flags}");
+                    let (hc, lc) = unsafe { layout(theirs, &x) };
+                    let (ho, lo) = unsafe { layout(ours, &x) };
+                    cases += 1;
+                    if hc < 0 && ho < 0 {
+                        refused += 1;
+                        continue;
+                    }
+                    if (hc < 0) != (ho < 0) {
+                        note(format!("HRESULT {hc:#x} vs ours {ho:#x}"), what);
+                        continue;
+                    }
+                    let t = xcl::hle::xg::Texture::new(&x).unwrap();
+                    // the fields of the levels in a thick tail are not modelled
+                    let first_tail = t.texels().unwrap().first_tail;
+                    let levels = 0x18 + 0x38..0x18 + 0x6C8;
+                    let diff: Vec<usize> = (0..0x1B40).step_by(4).filter(|&o| lc[o..o + 4] != lo[o..o + 4] && !(levels.contains(&o) && (o - levels.start) / 0x70 >= first_tail)).collect();
+                    same += diff.is_empty() as usize;
+                    for o in diff.iter().take(3) {
+                        let v = |l: &[u8]| u32::from_le_bytes(l[*o..*o + 4].try_into().unwrap());
+                        note(field(*o), format!("{what}: console {:#x}, ours {:#x}", v(&lc), v(&lo)));
+                    }
+                    type Offset = unsafe extern "system" fn(*mut std::ffi::c_void, u32, u32, u64, u32, u32, u32, *mut u32) -> u64;
+                    let mut c = std::ptr::null_mut();
+                    unsafe { std::mem::transmute::<usize, CreateFn>(theirs)(x.as_ptr(), &mut c) };
+                    let off: Offset = unsafe { std::mem::transmute(*(*(c as *const *const usize)).add(6)) };
+                    for (i, l) in t.texels().unwrap().chain.levels.iter().enumerate() {
+                        for (px, py, pz) in [(0, 0, 0), (l.width - 1, l.height - 1, l.depth - 1), (l.width / 2, l.height / 3, l.depth / 2), (l.width / 3, l.height / 2, 0)] {
+                            let mut bit = 0u32;
+                            let a = unsafe { off(c, 0, i as u32, px as u64, py as u32, pz as u32, 0, &mut bit) };
+                            let b = t.element_offset(i, px, py, pz);
+                            texels += 1;
+                            // (u64::MAX: the library has no answer, e.g. 64-bit elements in 64KB_D_X)
+                            if a != b && a != u64::MAX {
+                                note(format!("texel offset, level {}", if l.tail.is_some() { "in the tail" } else { "outside the tail" }), format!("{what} level {i} ({px},{py},{pz}): console {a:#x}, ours {b:#x}"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{cases} cases: {same} identical, {refused} refused by both; {texels} texels");
+    for (k, (n, ex)) in &fields {
+        println!("  {k}: {n} - e.g. {ex}");
+    }
+    assert!(fields.is_empty(), "3D layouts differ from the console library");
+}
+
+/// 1D textures: linear, refused in a tiled mode, laid out as the console library does.
+#[test]
+fn line_layouts_match_the_console_library() {
+    let Some(m) = console() else { return };
+    let theirs = proc(m, "XGCreateTextureComputer");
+    let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
+    let mut bad = Vec::new();
+    for f in [28u32, 61, 10, 2, 29] {
+        for w in [1u64, 5, 256, 1000, 4096] {
+            for (array, mips) in [(1u16, 1u16), (1, 0), (4, 0), (3, 1)] {
+                for (lay, flags) in [(0u32, 0u32), (0, 4), (1, 0), (0x100, 0), (0x105, 0), (0x109, 0), (0x119, 0), (0x11B, 4)] {
+                    let x = desc(2, w, 1, array, mips, f, lay, flags);
+                    let ((hc, lc), (ho, lo)) = unsafe { (layout(theirs, &x), layout(ours, &x)) };
+                    if (hc < 0) != (ho < 0) {
+                        bad.push(format!("fmt {f} {w} array {array} mips {mips} layout {lay:#x} flags {flags}: console {hc:#x}, ours {ho:#x}"));
+                    } else if hc >= 0 {
+                        if let Some(o) = (0..0x1B40).step_by(4).find(|&o| lc[o..o + 4] != lo[o..o + 4]) {
+                            bad.push(format!("fmt {f} {w} array {array} mips {mips} layout {lay:#x} flags {flags}: {}", field(o)));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{} differ", bad.len());
+    for b in bad.iter().take(20) {
+        println!("  {b}");
+    }
+    assert!(bad.is_empty());
+}
+
+/// Computer method #10 (GetResourceTiling): tile counts, the packed mip info, the tile shape and
+/// the subresource tilings of 2D textures as the console's library answers.
+#[test]
+fn resource_tiling_matches_the_console_library() {
+    let Some(m) = console() else { return };
+    let theirs = proc(m, "XGCreateTextureComputer");
+    let ours = xcl::hle::xg::XGCreateTextureComputer as *const () as usize;
+    type T = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32, *mut [u32; 3], *mut [u32; 3], *mut u32, u32, *mut [u32; 3]) -> i32;
+    let run = |create: usize, x: &[u8; 0x38], first: u32, asked: u32| unsafe {
+        let mut c = std::ptr::null_mut();
+        if std::mem::transmute::<usize, CreateFn>(create)(x.as_ptr(), &mut c) < 0 {
+            return None;
+        }
+        let vt = *(c as *const *const usize);
+        let f: T = std::mem::transmute(*vt.add(10));
+        let (mut tiles, mut packed, mut shape, mut n, mut subs) = (0xAAAAu32, [0xAAAA_AAAAu32; 3], [0xAAAA_AAAAu32; 3], asked, [[0xAAAA_AAAAu32; 3]; 32]);
+        let hr = f(c, &mut tiles, &mut packed, &mut shape, &mut n, first, subs.as_mut_ptr());
+        let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vt.add(1));
+        release(c);
+        // (packed: NumStandardMips and NumPackedMips are bytes – the rest of the word is padding)
+        Some(if hr < 0 { (hr, 0, [0; 3], [0; 3], 0, Vec::new()) } else { (hr, tiles, [packed[0] & 0xFFFF, packed[1], packed[2]], shape, n, subs.to_vec()) })
+    };
+    let (mut cases, mut bad) = (0, Vec::new());
+    for f in [28u32, 61, 10, 2, 71, 77, 98, 49] {
+        for (w, h) in [(256u64, 256u32), (300, 200), (4096, 4096), (2048, 512), (64, 64), (1, 1), (1000, 37)] {
+            for (a, mips) in [(1u16, 0u16), (1, 1), (2, 3), (6, 0), (3, 2)] {
+                for lay in [0x109u32, 0x10A, 0x119, 0x11A, 0x11B, 0x105, 0x101, 0] {
+                    let x = desc(3, w, h, a, mips, f, lay, 0);
+                    for (first, asked) in [(0u32, 32u32), (0, 2), (1, 32), (3, 7)] {
+                        let (Some(c), Some(o)) = (run(theirs, &x, first, asked), run(ours, &x, first, asked)) else { continue };
+                        cases += 1;
+                        if c != o {
+                            bad.push(format!("fmt {f} {w}x{h} a{a} mips {mips} layout {lay:#x} first {first} asked {asked}:
+   console {c:x?}
+   ours    {o:x?}"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!("{cases} cases, {} differ", bad.len());
+    for b in bad.iter().take(6) {
+        println!("  {b}");
+    }
+    assert!(bad.is_empty());
 }

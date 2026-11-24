@@ -24,6 +24,7 @@ const SNAPSHOTS: [&str; 2] = ["~xclsave.0", "~xclsave.1"];
 static SAVE_FILES: RwLock<()> = RwLock::new(());
 
 pub const E_GS_INVALID_CONTAINER_NAME: HRESULT = 0x8083_0001u32 as i32;
+pub const E_GS_OUT_OF_LOCAL_STORAGE: HRESULT = 0x8083_0003u32 as i32;
 pub const E_GS_PROVIDED_BUFFER_TOO_SMALL: HRESULT = 0x8083_0007u32 as i32;
 pub const E_GS_BLOB_NOT_FOUND: HRESULT = 0x8083_0008u32 as i32;
 pub const E_GS_CONTAINER_NOT_FOUND: HRESULT = 0x8083_0010u32 as i32;
@@ -106,8 +107,8 @@ fn dec(file: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&file[i + 1..i + 3], 16) {
-                out.push(v);
+            if let (Some(hi), Some(lo)) = ((b[i + 1] as char).to_digit(16), (b[i + 2] as char).to_digit(16)) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
@@ -154,13 +155,29 @@ fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
+#[cfg(windows)]
+fn verbatim_wide_path(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::{Component, Prefix};
+
+    let absolute = std::path::absolute(path)?;
+    let (prefix, skip) = match absolute.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(_) => (r"\\?\", 0),
+            Prefix::UNC(..) => (r"\\?\UNC\", 2),
+            _ => ("", 0),
+        },
+        _ => return Err(io::Error::new(ErrorKind::InvalidInput, "missing absolute Windows path prefix")),
+    };
+    Ok(prefix.encode_utf16().chain(absolute.as_os_str().encode_wide().skip(skip)).chain(std::iter::once(0)).collect())
+}
+
 fn replace_file(tmp: &Path, dest: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
-        use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
-        let src: Vec<u16> = tmp.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        let dst: Vec<u16> = dest.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let src = verbatim_wide_path(tmp)?;
+        let dst = verbatim_wide_path(dest)?;
         // SAFETY: `src` and `dst` are valid NUL-terminated UTF-16 paths that outlive the call.
         let ok = unsafe { MoveFileExW(src.as_ptr(), dst.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
         if ok != 0 {
@@ -682,8 +699,20 @@ fn commit_update(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u
     result
 }
 
+fn update_error(error: io::Error) -> HRESULT {
+    use windows_sys::Win32::Foundation::{ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL};
+
+    if error.kind() == ErrorKind::StorageFull
+        || error.raw_os_error().is_some_and(|code| matches!(code as u32, ERROR_DISK_FULL | ERROR_HANDLE_DISK_FULL))
+    {
+        E_GS_OUT_OF_LOCAL_STORAGE
+    } else {
+        E_FAIL
+    }
+}
+
 fn apply(dir: &Path, display: Option<&str>, ops: &[(String, Option<Vec<u8>>)]) -> HRESULT {
-    commit_update(dir, display, ops).map_or(E_FAIL, |()| S_OK)
+    commit_update(dir, display, ops).map_or_else(update_error, |()| S_OK)
 }
 
 pub unsafe extern "system" fn XGameSaveSubmitUpdate(u: *mut Update) -> HRESULT {
@@ -716,6 +745,17 @@ mod tests {
     use crate::util::{E_ABORT, E_PENDING};
 
     const DELETE_TEST_NAME: &str = "slot/1";
+
+    #[test]
+    fn save_update_reports_full_host_storage() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL};
+
+        for code in [ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL] {
+            assert_eq!(update_error(io::Error::from_raw_os_error(code as i32)), E_GS_OUT_OF_LOCAL_STORAGE);
+        }
+        assert_eq!(update_error(ErrorKind::StorageFull.into()), E_GS_OUT_OF_LOCAL_STORAGE);
+        assert_eq!(update_error(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED as i32)), E_FAIL);
+    }
 
     struct DeleteFixture {
         root: PathBuf,
@@ -964,6 +1004,44 @@ mod tests {
     unsafe extern "system" fn blob_names(i: *const BlobInfo, ctx: *mut c_void) -> bool {
         (*(ctx as *mut Vec<(String, u32)>)).push((from_cstr_ptr((*i).name).unwrap(), (*i).size));
         true
+    }
+
+    #[test]
+    fn save_updates_replace_files_past_max_path() {
+        let nonce = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("xcl-gamesave-long-{}-{nonce}", std::process::id()));
+        let dir = root.join("a".repeat(150)).join("b".repeat(150));
+        let first = apply(&dir, Some("Long"), &[("data".into(), Some(b"old".to_vec()))]);
+        let second = apply(&dir, None, &[("data".into(), Some(b"new".to_vec()))]);
+        let contents = current_snapshot(&dir).and_then(|p| fs::read(p.join("b").join("data")));
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(first, S_OK);
+        assert_eq!(second, S_OK);
+        assert_eq!(contents.unwrap(), b"new");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn move_file_paths_are_extended_length() {
+        for (path, expected) in [
+            (r"C:\save\blob", r"\\?\C:\save\blob"),
+            (r"\\server\share\blob", r"\\?\UNC\server\share\blob"),
+            (r"\\?\C:\save\blob", r"\\?\C:\save\blob"),
+        ] {
+            assert_eq!(
+                verbatim_wide_path(Path::new(path)).unwrap(),
+                expected.encode_utf16().chain(std::iter::once(0)).collect::<Vec<_>>(),
+            );
+        }
+    }
+
+    #[test]
+    fn decode_names_with_malformed_percent_escapes() {
+        for name in ["%aé", "%é", "%+1", "%A", "%", "%GG"] {
+            assert_eq!(dec(name), name);
+        }
+        assert_eq!(dec("%2F%2f"), "//");
+        assert_eq!(dec("%C3%A9"), "é");
     }
 
     /// Names Windows does not keep as file names (device names, a trailing dot or space,

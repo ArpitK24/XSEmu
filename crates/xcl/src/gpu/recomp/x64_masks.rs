@@ -127,6 +127,17 @@ pub fn uses(d: &Decoded) -> (Regs, Regs) {
     (whole, written)
 }
 
+/// SGPRs an instruction may write, in whole or in part: `uses`' overwritten ones, or all of them
+/// where it cannot tell (`s_movrel*`, writes that keep part of the old value, an SDWA form it
+/// cannot read).
+pub fn may_write(d: &Decoded) -> Regs {
+    let (whole, written) = uses(d);
+    if whole == ALL || d.inst.name.starts_with("S_MOVREL") || keeps_destination(d.inst.name) {
+        return ALL;
+    }
+    written
+}
+
 /// For each instruction (index in `insts`): the SGPRs whose whole value may be read after it.
 /// `end_reads_all`: the program's end reads every SGPR (kernel mode).
 pub fn whole_live_out(insts: &[Decoded], end_reads_all: bool) -> Vec<Regs> {

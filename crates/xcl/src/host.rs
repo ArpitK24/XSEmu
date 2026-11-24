@@ -8,6 +8,33 @@ use crate::config::Boot;
 
 pub static HOST_MODE: AtomicBool = AtomicBool::new(false);
 
+#[link(name = "winmm")]
+extern "system" {
+    fn timeBeginPeriod(period: u32) -> u32;
+}
+
+/// The console's waits time out to the millisecond; Windows' default 15.6 ms timer tick turns a
+/// title's 3–4 ms waits (an audio mixer's) into ~10 ms ones, and its audio plays at half speed.
+/// The process asks for a fine timer (`XCL_TIMER_MS`, default 1; 0 keeps the default tick) and
+/// keeps it when minimised (Windows 11 ignores a hidden process's request otherwise).
+fn fine_timer() {
+    use windows_sys::Win32::System::Threading as thr;
+    let ms = std::env::var("XCL_TIMER_MS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1);
+    if ms == 0 {
+        return;
+    }
+    let state = thr::PROCESS_POWER_THROTTLING_STATE {
+        Version: thr::PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: thr::PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0,
+    };
+    let throttling = unsafe {
+        thr::SetProcessInformation(thr::GetCurrentProcess(), thr::ProcessPowerThrottling, &state as *const _ as *const std::ffi::c_void, std::mem::size_of_val(&state) as u32)
+    };
+    let period = unsafe { timeBeginPeriod(ms) };
+    crate::xlog_info!("timer: {ms} ms resolution requested ({}), timer requests kept when hidden: {}", if period == 0 { "granted" } else { "refused" }, throttling != 0);
+}
+
 pub fn host_main(boot_path: &Path) -> i32 {
     let boot: Boot = match std::fs::read_to_string(boot_path).map_err(|e| e.to_string()).and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string())) {
         Ok(b) => b,
@@ -29,6 +56,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
         std::env::set_var("XCL_UMA_MB", boot.config.uma_mb.to_string());
     }
     crate::state::set_boot(boot.clone());
+    fine_timer();
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -36,16 +64,47 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (p, e) = crate::hle::d3d12x::present::activity();
                 let (d, x) = crate::hle::d3d12x::bind::activity();
                 let f = crate::hle::d3d12x::frame::activity();
-                [p, e, d, x, f[0], f[1], f[2], f[3]]
+                let (r, b, fail) = crate::hle::dstorage::counters();
+                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
             };
             let mut last = snap();
-            loop {
+            for tick in 1u64.. {
                 std::thread::sleep(std::time::Duration::from_secs(2));
+                if tick % 15 == 0 {
+                    let (live, idle, again) = crate::hle::d3d12x::pso_async::live();
+                    crate::xlog_info!(
+                        "caches: {}; {}; pipelines live {live} (released unbound {idle}, built again {again}), commit {} MB; {}",
+                        crate::gpu::recomp::dxc::stage_summary(),
+                        crate::hle::d3d12x::real::driver_compiles_summary(),
+                        crate::util::process_commit_bytes() >> 20,
+                        crate::hle::d3d12x::bind::indirect_calls()
+                    );
+                    crate::xlog_info!("commit: {}", commit_breakdown());
+                }
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
-                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped)",
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]
+                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed, {} entries waiting for Submit",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], crate::hle::dstorage::waiting_for_submit()
+                );
+                // where the memory is: the process's commit, video memory, and XCL's parts of it
+                let private = crate::util::process_commit_bytes();
+                let (local, non_local) = crate::hle::d3d12x::real::video_memory().unwrap_or((0, 0));
+                let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
+                let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
+                let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let mb = |b: u64| b >> 20;
+                crate::xlog_info!(
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    mb(private),
+                    mb(local),
+                    mb(non_local),
+                    mb(pages as u64),
+                    mb(page_pools as u64),
+                    mb(arenas as u64),
+                    mb(arenas_made as u64),
+                    mb(pools as u64),
+                    mb(pools_mapped as u64)
                 );
                 last = now;
             }
@@ -70,7 +129,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     if let Some(secs) = std::env::var("XCL_RUN_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()) {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(secs));
-            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title");
+            let (shown, presented) = crate::hle::d3d12x::present::counters();
+            crate::xlog_info!("XCL_RUN_SECONDS: {secs} s – ending the title ({shown} frames shown, {presented} PresentX calls)");
             crate::report::write_final(None);
             crate::log::flush();
             crate::hle::d3d12x::real::end_title(0);
@@ -78,6 +138,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
     }
     crate::stubs::init_db(&boot.config.stub_returns);
     crate::hle::init(&boot.config);
+    crate::hle::kernelx::fine_timer();
     crate::loader::set_cache_dir(boot.cache_dir());
     let mut dirs = vec![boot.game_root.clone()];
     if let Some(p) = boot.exe_path.parent() {
@@ -88,11 +149,20 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::resolver::set_search_dirs(dirs);
 
     let mounts: Vec<(String, String)> = boot.config.mounts.iter().map(|(k, v)| (k.clone(), boot.expand(v))).collect();
-    crate::vfs::init(crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts));
+    // (the shader cache is XCL's too: on a drive a console mount names it must stay where it is)
+    let shader_cache = crate::gpu::recomp::dxc::cache_dir();
+    crate::vfs::init(
+        crate::vfs::Vfs::new(&boot.game_root, &boot.data_dir, mounts)
+            .own_folder(&shader_cache)
+            .own_folder(&crate::gpu::recomp::dxc::normalized_cache_dir(&shader_cache)),
+    );
     let _ = std::fs::create_dir_all(boot.data_dir.join("temp"));
 
     if let Err(e) = crate::vfs_hooks::install() {
         crate::xlog_error!("VFS: not all hooks installed: {e}");
+    }
+    if let Err(e) = crate::wait_handles::install() {
+        crate::xlog_error!("XCL_TRACE_HANDLES: {e}");
     }
     if let Err(e) = crate::eh::install_pc_hook() {
         crate::xlog_error!("hook RtlPcToFileHeader: {e} – C++ exceptions in the game may not work");
@@ -109,10 +179,62 @@ pub fn host_main(boot_path: &Path) -> i32 {
             return 0x7C1_0002;
         }
     };
+    unsafe { crate::hle::kernelx::adopt_title_hooks(&main) };
     crate::report::write_final(None);
     let code = crate::loader::run_main(&main);
     crate::xlog_info!("game entry point returned code {code}");
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+/// The process's committed memory by owner, from a walk of its address space: private commit in
+/// XCL's unified memory and sparse windows, the title's watched graphics reservations and
+/// physical-page reservations, the rest of what the title allocated (`memmap`), and what nobody
+/// records (heaps: XCL's, the driver's, DXC's, the title's) by allocation size.
+fn commit_breakdown() -> String {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE};
+    let uma = crate::gpu::uma::get();
+    let (mut sparse, mut unified, mut watched, mut physical, mut title, mut mapped, mut image) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
+    let mut untracked: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    let mut at = 0x1_0000usize;
+    while at < 0x7FFF_FFFF_0000 {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.RegionSize == 0 {
+            break;
+        }
+        let (base, size) = (m.BaseAddress as usize, m.RegionSize as u64);
+        at = base + m.RegionSize;
+        if m.State != MEM_COMMIT {
+            continue;
+        }
+        match m.Type {
+            MEM_MAPPED => mapped += size,
+            MEM_IMAGE => image += size,
+            MEM_PRIVATE if uma.is_some_and(|u| u.is_sparse(base)) => sparse += size,
+            MEM_PRIVATE if uma.is_some_and(|u| u.contains(base)) => unified += size,
+            MEM_PRIVATE if crate::hle::kernelx::in_graphics_reservation(base) => watched += size,
+            MEM_PRIVATE if crate::hle::kernelx::in_reservation(base) => physical += size,
+            MEM_PRIVATE if crate::memmap::reservation(base).is_some() => title += size,
+            _ => *untracked.entry(m.AllocationBase as usize).or_default() += size,
+        }
+    }
+    let (mut large, mut medium, mut small, mut n_large, mut n_medium) = (0u64, 0u64, 0u64, 0, 0);
+    for &b in untracked.values() {
+        if b >= 64 << 20 {
+            large += b;
+            n_large += 1;
+        } else if b >= 1 << 20 {
+            medium += b;
+            n_medium += 1;
+        } else {
+            small += b;
+        }
+    }
+    let mb = |b: u64| b >> 20;
+    format!(
+        "private {} MB in sparse windows, {} MB in unified memory, {} MB in watched graphics reservations, {} MB in physical-page reservations, {} MB other title allocations; untracked {} MB ({} allocations of 64 MB+: {} MB, {} of 1-64 MB: {} MB, smaller: {} MB; the title's XMemAlloc heap memory {} MB of it); mapped {} MB, images {} MB",
+        mb(sparse), mb(unified), mb(watched), mb(physical), mb(title),
+        mb(large + medium + small), n_large, mb(large), n_medium, mb(medium), mb(small), mb(crate::hle::kernelx::xmem_heap_bytes() as u64), mb(mapped), mb(image)
+    )
 }

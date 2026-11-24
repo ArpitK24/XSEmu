@@ -14,6 +14,7 @@ use std::sync::{Mutex, RwLock};
 use serde::Serialize;
 
 use crate::hle::{registry, HleModule, Route};
+use crate::loader::LoadOrigin;
 use crate::modules;
 use crate::pe::{ExportTarget, ImportName};
 use crate::stubs;
@@ -74,12 +75,15 @@ fn cached_system_module(
     {
         let g = cache.lock().unwrap();
         if let Some(&h) = g.as_ref().and_then(|m| m.get(&key)) {
-            return (h != 0).then_some(h);
+            return Some(h);
         }
     }
     let h = load();
+    if h == 0 {
+        return None;
+    }
     cache.lock().unwrap().get_or_insert_with(HashMap::new).insert(key, h);
-    (h != 0).then_some(h)
+    Some(h)
 }
 
 pub fn system_proc_in(h: usize, what: &ImportName) -> Option<usize> {
@@ -98,6 +102,14 @@ pub fn system_proc_in(h: usize, what: &ImportName) -> Option<usize> {
 
 pub fn system_proc(dll: &str, what: &ImportName) -> Option<usize> {
     system_proc_in(system_module(dll)?, what)
+}
+
+/// A title's import of a host function: XCL's own function where it has one (`eh::host_override`).
+fn override_or_system_proc(key: &str, what: &ImportName) -> Option<usize> {
+    match what {
+        ImportName::Name { name, .. } => crate::eh::host_override(key, name).or_else(|| system_proc(key, what)),
+        ImportName::Ordinal(_) => system_proc(key, what),
+    }
 }
 
 fn inspect_system_proc(dll: &str, what: &ImportName) -> Option<usize> {
@@ -196,7 +208,7 @@ pub fn find_game_dll(name: &str) -> Option<PathBuf> {
 }
 
 pub fn resolve_export_of_mapped(m: &modules::MappedModule, what: &ImportName, depth: u32) -> Option<usize> {
-    resolve_export_of_mapped_inner(m, what, depth, false)
+    resolve_export_of_mapped_inner(m, what, depth, false, LoadOrigin::Runtime)
 }
 
 fn resolve_export_of_mapped_inner(
@@ -204,6 +216,7 @@ fn resolve_export_of_mapped_inner(
     what: &ImportName,
     depth: u32,
     allow_stub: bool,
+    origin: LoadOrigin,
 ) -> Option<usize> {
     let t = match what {
         ImportName::Name { name, .. } => m.exports.by_name.get(name)?,
@@ -228,7 +241,7 @@ fn resolve_export_of_mapped_inner(
             } else {
                 dll_key(&format!("{dll}.dll"))
             };
-            resolve_inner_opt(&target_key, &what, depth + 1, allow_stub).map(|(a, _)| a)
+            resolve_inner_opt(&target_key, &what, depth + 1, allow_stub, origin).map(|(a, _)| a)
         }
     }
 }
@@ -239,11 +252,12 @@ fn stub_for(key: &str, fallback_dll: Option<&str>, what: &ImportName) -> (usize,
     (stubs::make_stub(key, &name, ret), Source::Stub)
 }
 
+#[cfg(test)]
 fn resolve_inner(key: &str, what: &ImportName, depth: u32) -> (usize, Source) {
-    resolve_inner_opt(key, what, depth, true).expect("allow_stub=true always resolves")
+    resolve_inner_opt(key, what, depth, true, LoadOrigin::Runtime).expect("allow_stub=true always resolves")
 }
 
-fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool) -> Option<(usize, Source)> {
+fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool, origin: LoadOrigin) -> Option<(usize, Source)> {
     let reg = registry();
     match reg.route(key) {
         Some(Route::Stub) => {
@@ -253,7 +267,7 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
             });
         }
         Some(Route::System) => {
-            return match system_proc(key, what) {
+            return match override_or_system_proc(key, what) {
                 Some(a) => Some((a, Source::System(key.to_string()))),
                 None => allow_stub.then(|| stub_for(key, None, what)),
             }
@@ -267,15 +281,15 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
     }
     // DLL shipped with the game → our loader
     if let Some(m) = modules::find_mapped_by_name(key) {
-        if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
+        if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub, origin) {
             return Some((a, Source::GameDll(key.to_string())));
         }
         return allow_stub.then(|| stub_for(key, None, what));
     }
     if let Some(path) = find_game_dll(key) {
-        match crate::loader::load_game_dll(&path) {
+        match crate::loader::load_game_dll_from(&path, origin) {
             Ok(m) => {
-                if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub) {
+                if let Some(a) = resolve_export_of_mapped_inner(&m, what, depth, allow_stub, origin) {
                     return Some((a, Source::GameDll(key.to_string())));
                 }
                 return allow_stub.then(|| stub_for(key, None, what));
@@ -284,7 +298,7 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
         }
     }
     // Real Windows DLL
-    if let Some(a) = system_proc(key, what) {
+    if let Some(a) = override_or_system_proc(key, what) {
         return Some((a, Source::System(key.to_string())));
     }
     // A known console function imported from an unexpected DLL
@@ -296,11 +310,74 @@ fn resolve_inner_opt(key: &str, what: &ImportName, depth: u32, allow_stub: bool)
     allow_stub.then(|| stub_for(key, None, what))
 }
 
+/// `XCL_TRACE_IMPORTS`: which imports get a call tracer (arguments and result of every call
+/// logged). Comma-separated: `1`/`hle` – every HLE function (the default); `all` – system
+/// functions too (a data export imported from a system DLL would be wrapped as well, so this
+/// is for short runs); any other word – a prefix of `dll!Function` to include, `-word` one to
+/// exclude (e.g. `hle,-kernelx!GetTickCount,gameinput`).
+struct TraceFilter {
+    hle: bool,
+    all: bool,
+    include: Vec<String>,
+    exclude: Vec<String>,
+}
+
+fn trace_filter() -> Option<&'static TraceFilter> {
+    static FILTER: std::sync::OnceLock<Option<TraceFilter>> = std::sync::OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let v = std::env::var("XCL_TRACE_IMPORTS").ok()?;
+            let mut f = TraceFilter { hle: false, all: false, include: Vec::new(), exclude: Vec::new() };
+            for w in v.split(',').map(|w| w.trim().to_ascii_lowercase()).filter(|w| !w.is_empty()) {
+                match w.as_str() {
+                    "1" | "hle" => f.hle = true,
+                    "all" => f.all = true,
+                    _ => match w.strip_prefix('-') {
+                        Some(x) => f.exclude.push(x.to_string()),
+                        None => f.include.push(w),
+                    },
+                }
+            }
+            if !f.all && f.include.is_empty() {
+                f.hle = true;
+            }
+            Some(f)
+        })
+        .as_ref()
+}
+
+impl TraceFilter {
+    fn wants(&self, key: &str, function: &str, source: &Source) -> bool {
+        let full = format!("{key}!{function}").to_ascii_lowercase();
+        if self.exclude.iter().any(|p| full.starts_with(p.as_str())) {
+            return false;
+        }
+        match source {
+            Source::Stub => false, // a stub logs its own calls
+            Source::Hle(_) | Source::HleOther(_) if self.hle => true,
+            _ => self.all || self.include.iter().any(|p| full.starts_with(p.as_str())),
+        }
+    }
+}
+
 /// Resolve one static/delay import and record the outcome for the report.
 pub fn resolve_import(dll: &str, what: &ImportName, importer: &str, delay: bool) -> usize {
+    resolve_import_from(dll, what, importer, delay, LoadOrigin::Runtime)
+}
+
+pub(crate) fn resolve_import_from(dll: &str, what: &ImportName, importer: &str, delay: bool, origin: LoadOrigin) -> usize {
     let key = dll_key(dll);
-    let (addr, source) = resolve_inner(&key, what, 0);
+    let origin = if delay { LoadOrigin::Runtime } else { origin };
+    let (mut addr, source) = resolve_inner_opt(&key, what, 0, true, origin).expect("allow_stub=true always resolves");
+    if let (Source::GameDll(_), ImportName::Name { name, .. }) = (&source, what) {
+        addr = crate::hle::bink::wrap(&key, name, addr);
+    }
     crate::xlog_debug!("import {importer}: {key}!{what} → {source:?}");
+    if let Some(f) = trace_filter() {
+        if f.wants(&key, &fname(what), &source) {
+            addr = crate::hle::d3d12x::guard::make_call_tracer(addr, format!("{key}!{what}"));
+        }
+    }
     RECORDS.lock().unwrap().push(ImportRecord {
         importer: importer.to_string(),
         dll: key,
@@ -407,7 +484,11 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
         return r;
     }
     if let Some(m) = modules::find_mapped_by_base(h) {
-        return resolve_export_of_mapped(&m, what, 0);
+        let a = resolve_export_of_mapped(&m, what, 0)?;
+        return Some(match what {
+            ImportName::Name { name, .. } => crate::hle::bink::wrap(&dll_key(&m.name), name, a),
+            ImportName::Ordinal(_) => a,
+        });
     }
     // A real module: kernel-family modules prefer our overrides.
     let mut buf = [0u16; 260];
@@ -415,6 +496,11 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
     if n > 0 {
         let full = String::from_utf16_lossy(&buf[..n as usize]);
         let key = dll_key(&full);
+        if let ImportName::Name { name, .. } = what {
+            if let Some(a) = crate::eh::host_override(&key, name) {
+                return Some(a);
+            }
+        }
         if let Some(m) = reg.hle_for(&key) {
             if let ImportName::Name { name, .. } = what {
                 if let Some(&a) = m.exports.get(name.as_str()) {
@@ -429,6 +515,14 @@ pub fn get_proc_address(h: usize, what: &ImportName) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_module_cache_retries_failed_loads() {
+        let cache = Mutex::new(None);
+        assert_eq!(cached_system_module(&cache, "example.dll", || 0), None);
+        assert_eq!(cached_system_module(&cache, "EXAMPLE.DLL", || 1), Some(1));
+        assert_eq!(cached_system_module(&cache, "example.dll", || panic!("module should be cached")), Some(1));
+    }
 
     /// advapi32 imports go to kernelx: the registry functions the GDK thunks use for the device
     /// type are XCL's, everything else is the real advapi32.
@@ -447,6 +541,8 @@ mod tests {
         assert!(a != 0 && matches!(s, Source::System(ref d) if d == "user32.dll"), "{s:?}");
         let (a, s) = resolve_inner("kernel32legacy.dll", &name("GetProcessAffinityMask"), 0);
         assert!(a != 0 && matches!(s, Source::System(_)), "{s:?}");
+        let (a, s) = resolve_inner("kernel32legacy.dll", &name("SetThreadAffinityMask"), 0);
+        assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("minappmodelx.dll", &name("RegisterAppStateChangeNotification"), 0);
         assert!(a != 0 && matches!(s, Source::Hle(ref m) if m == crate::hle::KERNELX), "{s:?}");
         let (a, s) = resolve_inner("advapi32legacy.dll", &name("RegOpenKeyW"), 0);

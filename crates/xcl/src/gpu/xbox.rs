@@ -18,6 +18,7 @@
 //!            +0x18 zlib stream → FSSM
 //! FSSM       +0 "FSSM"  +4 u32 version (0x101)  +8 u32 size of everything after the 16-B header
 //!            +0xC0 u64 code offset, +0xC8 u64 code size (offsets relative to +0x10)
+//!            +0xD4 u32 flags: bit 5 marks a wave32 program
 //!            +0x100 hardware-stage descriptor u64 0x000000C0_0002_AAHH
 //!                   (HH = PAL hardware stage, AA = API stage; one more every 0x88 B,
 //!                   e.g. GS + its VS copy shader); unused fields are 0xDEADBEEF.
@@ -143,6 +144,11 @@ impl Fssm {
         }
     }
 
+    pub fn wave32(&self) -> bool {
+        self.version == 0x101
+            && rd32(&self.data, 0xD4).is_some_and(|flags| flags != 0xDEAD_BEEF && flags & (1 << 5) != 0)
+    }
+
     pub fn stage_label(&self) -> String {
         if self.stages.is_empty() {
             return "?".into();
@@ -178,6 +184,11 @@ fn find_xdat(blob: &[u8]) -> Option<(super::shader::Part, usize)> {
 /// Is this a console shader container (DXIL part carrying XDAT instead of bitcode)?
 pub fn is_xbox(blob: &[u8]) -> bool {
     find_xdat(blob).is_some()
+}
+
+pub(crate) fn program_kind(blob: &[u8]) -> Option<u32> {
+    let (dxil, _) = find_xdat(blob)?;
+    Some(rd32(&blob[dxil.offset..dxil.offset + dxil.size], 0)? >> 16)
 }
 
 /// Parse a console shader container. `None` when the blob is not one (no DXBC container,
@@ -797,6 +808,28 @@ pub(crate) mod tests {
         let f = &sh.fssm[0];
         assert!(!f.code_from_header);
         assert!(f.programs.iter().any(|p| p.offset == 0x308), "{:?}", f.programs);
+    }
+
+    #[test]
+    fn wave32_header_overrides_instruction_heuristic() {
+        use crate::gpu::recomp::{detect_wave64, fssm_wave64};
+
+        assert!(detect_wave64(&CODE));
+        for (version, flags, wave64) in [
+            (0x101u32, 0x20u32, false),
+            (0x101, 0x40, true),
+            (0x101, 0xDEAD_BEEF, true),
+            (0x100, 0x20, true),
+        ] {
+            let mut raw = fssm(&CODE, &[(5, 1)]);
+            raw[4..8].copy_from_slice(&version.to_le_bytes());
+            raw[0xD4..0xD8].copy_from_slice(&flags.to_le_bytes());
+            let shader = parse(&sample(0, &[raw])).unwrap();
+            let f = &shader.fssm[0];
+            let p = &f.programs[0];
+            assert_eq!(fssm_wave64(f, &f.data[p.offset..p.offset + p.len]), wave64);
+        }
+        assert!(fssm_wave64(&Fssm { version: 0x101, ..Default::default() }, &CODE));
     }
 
     #[test]

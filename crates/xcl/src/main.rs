@@ -38,8 +38,181 @@ Usage:
       Lists or extracts readable inline records. Archives larger than 1 GB use a
       bounded-memory header probe; --probe requests it explicitly and --full overrides it.
       Use --probe only for header summaries, without --find, --extract, --out or --full.
+  xcl warm-up [--full]
+      Builds the pipelines earlier runs made, so a game needs fewer driver compiles while it
+      loads: first those an earlier run bound, then every compute pipeline and the driver's
+      blob of every translated compute program (giants over 1 MB of DXIL left out), then the
+      rest largest first for 20 minutes (XCL_WARMUP_BUDGET_S), leaving out those no run of the
+      last 3 made. --full: everything, giants and stale ones too, with no time limit, going on
+      where an earlier --full pass stopped.
+  xcl warm-up --mesh-only [--recent-used N]
+      Builds only missing driver blobs for the mesh pipelines kept in the manifest.
+  xcl warm-up --giants-only --floor-mb N
+      Builds, one at a time, the driver blob of each giant compute program (over 1 MB of DXIL,
+      no blob kept yet) that the normal 6 GB floor leaves no room for now, keeping N MB
+      available instead (N at least 1024). Nothing else should run meanwhile.
   xcl --version
 ";
+
+/// Other xcl.exe and game processes running now, as "name pid".
+fn other_xcl_processes() -> Vec<String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let me = std::process::id();
+    let mut found = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return found;
+        }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+            if e.th32ProcessID != me && (name.eq_ignore_ascii_case("xcl.exe") || name.eq_ignore_ascii_case("game_scarlett_master.exe")) {
+                found.push(format!("{name} {}", e.th32ProcessID));
+            }
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    found
+}
+
+fn warm_up_mesh(recent_used: Option<std::num::NonZeroU32>) -> i32 {
+    let others = other_xcl_processes();
+    if !others.is_empty() {
+        eprintln!("xcl warm-up: refusing to start – another XCL process is running ({}); one XCL process tree at a time: stop it or wait for it to end", others.join(", "));
+        return 3;
+    }
+    match xcl::hle::d3d12x::real::warm_up_mesh(recent_used) {
+        Ok(w) => {
+            println!(
+                "warm-up --mesh-only: {} pipelines, {} already cached, {} warmed, {} failed, {} left for the memory limits; {:.2} s on {} threads",
+                w.kept + w.built + w.failed + w.too_big, w.kept, w.built, w.failed, w.too_big, w.took.as_secs_f64(), w.threads
+            );
+            (w.failed + w.too_big != 0) as i32
+        }
+        Err(e) => {
+            eprintln!("xcl warm-up --mesh-only: {e}");
+            2
+        }
+    }
+}
+
+/// `xcl warm-up --giants-only --floor-mb N`: `real::warm_up_giants`, each giant's outcome on the console.
+fn warm_up_giants(floor_mb: u64) -> i32 {
+    let others = other_xcl_processes();
+    if !others.is_empty() {
+        eprintln!("xcl warm-up: refusing to start – another XCL process is running ({}); one XCL process tree at a time: stop it or wait for it to end", others.join(", "));
+        return 3;
+    }
+    let started = std::time::Instant::now();
+    match xcl::hle::d3d12x::real::warm_up_giants(floor_mb << 20) {
+        Ok((giants, peak_commit)) => {
+            for g in &giants {
+                println!("warm-up giant: DXIL {:016x} ({} B): {} ({:.0} s)", g.hash, g.len, g.outcome, g.took.as_secs_f64());
+            }
+            println!(
+                "warm-up --giants-only: {} giants without a driver blob, floor {floor_mb} MB; {:.0} s, peak commit {} MB",
+                giants.len(),
+                started.elapsed().as_secs_f64(),
+                peak_commit >> 20
+            );
+            giants.iter().any(|g| !g.outcome.starts_with("built") && !g.outcome.starts_with("fits")) as i32
+        }
+        Err(e) => {
+            eprintln!("xcl warm-up: no D3D12 device: {e}");
+            2
+        }
+    }
+}
+
+/// `xcl warm-up`: `real::warm_up`, with its progress and result on the console: with
+/// `XCL_PROGRESS` on (the default) a line at most every second with the blobs built, the DXIL
+/// they came from, the driver compiles in flight and the RAM free.
+fn warm_up(full: bool) -> i32 {
+    let others = other_xcl_processes();
+    if !others.is_empty() {
+        eprintln!("xcl warm-up: refusing to start – another XCL process is running ({}); one XCL process tree at a time: stop it or wait for it to end", others.join(", "));
+        return 3;
+    }
+    let dxil = std::sync::atomic::AtomicU64::new(0);
+    let last = std::sync::Mutex::new(None::<std::time::Instant>);
+    let report = |done: usize, total: usize, len: usize, took: std::time::Duration, hash: u64| {
+        let dxil = dxil.fetch_add(len as u64, Ordering::Relaxed) + len as u64;
+        xcl::progress::warm_up(done, total);
+        if !xcl::progress::enabled() {
+            if done % 25 == 0 || took.as_secs() >= 30 || done == total {
+                println!("  {done}/{total} (last: {hash:016x}, {len} B, {:.1} s)", took.as_secs_f32());
+            }
+            return;
+        }
+        let mut last = last.lock().unwrap();
+        if last.is_some_and(|t| t.elapsed().as_secs() < 1) && done != total {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        let s = xcl::progress::snapshot();
+        println!(
+            "  warm-up {done}/{total} ({}%), {} MB DXIL built, {} in flight ({} large), {} MB RAM free (last: {hash:016x}, {len} B, {:.1} s)",
+            done * 100 / total.max(1),
+            dxil >> 20,
+            s.driver.pending,
+            s.large,
+            xcl::hle::d3d12x::real::available_physical() >> 20,
+            took.as_secs_f32()
+        );
+    };
+    match xcl::hle::d3d12x::real::warm_up(full, report) {
+        Ok(w) => {
+            println!(
+                "warm-up{}: {} pipelines earlier runs made ({} kept entries dropped), {} last made in this translation, {} stale left out (none made by the last {} of {} runs){}; {} compute programs, {} driver blobs kept already, {} too big for the memory limits; {} stale blobs deleted ({} MB); {:.0} s on {} threads, peak commit {} MB",
+                if w.full { " --full" } else { "" },
+                w.pipelines,
+                w.dropped,
+                w.this_era,
+                w.stale_left,
+                xcl::hle::d3d12x::pso_manifest::STALE_AFTER_RUNS,
+                w.runs,
+                match (w.full, w.complete) {
+                    (false, _) => String::new(),
+                    (true, true) => format!(", {} done by an earlier pass, this pass complete", w.resumed),
+                    (true, false) => format!(", {} done by an earlier pass, this pass stopped part way", w.resumed),
+                },
+                w.programs,
+                w.kept,
+                w.too_big(),
+                w.pruned.0,
+                w.pruned.1 >> 20,
+                w.took.as_secs_f32(),
+                w.threads,
+                w.peak_commit >> 20
+            );
+            for p in &w.phases {
+                println!(
+                    "warm-up phase {}: {} of {} built, {} failed, {} too big for the memory limits (after retries), {} giants left for later, {} not started within the budget; {:.0} s",
+                    p.name,
+                    p.built,
+                    p.of,
+                    p.failed,
+                    p.too_big,
+                    p.giants_left,
+                    p.not_started,
+                    p.took.as_secs_f32()
+                );
+            }
+            println!("warm-up shaders: {}", xcl::gpu::recomp::dxc::stage_summary());
+            (w.failed() != 0) as i32
+        }
+        Err(e) => {
+            eprintln!("xcl warm-up: no D3D12 device: {e}");
+            2
+        }
+    }
+}
 
 fn main() {
     // keep the TLS callback from being discarded by the linker
@@ -66,6 +239,30 @@ fn main() {
         Some("disasm") if args.len() >= 2 => xcl::disasm::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("shaders") if args.len() >= 2 => xcl::shaders::run(&PathBuf::from(&args[1]), &args[2..]),
         Some("rpf") if args.len() >= 2 => xcl::rpf::run(&PathBuf::from(&args[1]), &args[2..]),
+        Some("minidump") => xcl::eh::write_minidump_of(&args[1..]),
+        Some("warm-up") if args.iter().any(|a| a == "--mesh-only") => {
+            match &args[1..] {
+                [mesh] if mesh == "--mesh-only" => warm_up_mesh(None),
+                [mesh, scope, n] if mesh == "--mesh-only" && scope == "--recent-used" && n.parse::<std::num::NonZeroU32>().is_ok() => {
+                    warm_up_mesh(n.parse().ok())
+                }
+                _ => {
+                    eprintln!("xcl warm-up --mesh-only accepts only an optional --recent-used N (N >= 1)");
+                    2
+                }
+            }
+        }
+        Some("warm-up") if args.iter().any(|a| a == "--giants-only") => {
+            let floor = args.iter().position(|a| a == "--floor-mb").and_then(|i| args.get(i + 1)).and_then(|v| v.parse::<u64>().ok());
+            match floor {
+                Some(mb) if mb >= 1024 => warm_up_giants(mb),
+                _ => {
+                    eprintln!("xcl warm-up --giants-only needs --floor-mb N with N at least 1024");
+                    2
+                }
+            }
+        }
+        Some("warm-up") => warm_up(args.iter().any(|a| a == "--full")),
         Some("--version") | Some("-V") => {
             println!("xcl {}", env!("CARGO_PKG_VERSION"));
             0

@@ -121,6 +121,17 @@ pub fn name(desc: &DXGI_ADAPTER_DESC1) -> String {
     String::from_utf16_lossy(&desc.Description[..n])
 }
 
+pub(crate) fn software_adapter(factory: &IDXGIFactory6) -> Result<IDXGIAdapter1, String> {
+    unsafe {
+        let adapter: IDXGIAdapter1 = factory.EnumWarpAdapter().map_err(|e| format!("WARP enumeration: {e}"))?;
+        let desc = adapter.GetDesc1().map_err(|e| format!("WARP adapter description: {e}"))?;
+        if desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 == 0 {
+            return Err(format!("WARP returned a non-software adapter: {}", name(&desc)));
+        }
+        Ok(adapter)
+    }
+}
+
 /// The hardware adapters (software ones skipped) in high-performance order.
 pub fn hardware(factory: &IDXGIFactory6) -> Vec<(IDXGIAdapter1, DXGI_ADAPTER_DESC1)> {
     let mut out = Vec::new();

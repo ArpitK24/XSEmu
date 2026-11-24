@@ -1,0 +1,8 @@
+[package]
+name = "xcl-bcpack"
+description = "BCPack (console DirectStorage texture packing) decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

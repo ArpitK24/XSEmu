@@ -8,6 +8,7 @@
 #[macro_use]
 pub mod log;
 pub mod manifest;
+pub mod memmap;
 pub mod config;
 pub mod disasm;
 pub mod eh;
@@ -15,11 +16,14 @@ pub mod gpu;
 pub mod hle;
 pub mod hooks;
 pub mod host;
+pub mod insn;
 pub mod inspect;
 pub mod launcher;
 pub mod loader;
 pub mod modules;
 pub mod pe;
+pub mod preflight;
+pub mod progress;
 pub mod report;
 pub mod resolver;
 pub mod rpf;
@@ -31,3 +35,4 @@ pub mod tls;
 pub mod util;
 pub mod vfs;
 pub mod vfs_hooks;
+pub mod wait_handles;

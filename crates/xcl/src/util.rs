@@ -18,12 +18,26 @@ pub const E_NOT_SUFFICIENT_BUFFER: HRESULT = 0x8007_007Au32 as i32;
 pub const E_NOT_FOUND: HRESULT = 0x8007_0490u32 as i32;
 pub const E_NOT_SUPPORTED: HRESULT = 0x8007_0032u32 as i32;
 
+pub(crate) fn process_commit_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of_val(&counters) as u32;
+    if unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters as *mut _ as *mut _, counters.cb) } == 0 {
+        return 0;
+    }
+    if counters.PrivateUsage != 0 { counters.PrivateUsage as u64 } else { counters.PagefileUsage as u64 }
+}
+
 pub(crate) fn memory_is_writable(p: usize, n: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
         PAGE_GUARD, PAGE_READWRITE, PAGE_WRITECOPY,
     };
     let Some(end) = p.checked_add(n) else { return false };
+    if let Some(a) = crate::memmap::access(p, n) {
+        return a == crate::memmap::Access::Write;
+    }
     let mut at = p;
     while at < end {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -109,7 +123,25 @@ pub unsafe fn from_cstr_ptr(p: *const u8) -> Option<String> {
 
 /// ANSI (current code page) → String. Falls back to lossy UTF-8.
 pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
-    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    from_code_page_ptr(p, windows_sys::Win32::Globalization::CP_ACP)
+}
+
+pub(crate) unsafe fn from_file_ansi_ptr(p: *const u8) -> Option<String> {
+    use windows_sys::Win32::Globalization::{CP_ACP, CP_OEMCP};
+    use windows_sys::Win32::Storage::FileSystem::AreFileApisANSI;
+    if p.is_null() {
+        return None;
+    }
+    let code_page = if AreFileApisANSI() != 0 {
+        CP_ACP
+    } else {
+        CP_OEMCP
+    };
+    from_code_page_ptr(p, code_page)
+}
+
+unsafe fn from_code_page_ptr(p: *const u8, code_page: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
     if p.is_null() {
         return None;
     }
@@ -117,13 +149,23 @@ pub unsafe fn from_ansi_ptr(p: *const u8) -> Option<String> {
     if len == 0 {
         return Some(String::new());
     }
-    let n = MultiByteToWideChar(CP_ACP, 0, p, len as i32, std::ptr::null_mut(), 0);
+    let n = MultiByteToWideChar(code_page, 0, p, len as i32, std::ptr::null_mut(), 0);
     if n <= 0 {
         return from_cstr_ptr(p);
     }
     let mut buf = vec![0u16; n as usize];
-    MultiByteToWideChar(CP_ACP, 0, p, len as i32, buf.as_mut_ptr(), n);
+    MultiByteToWideChar(code_page, 0, p, len as i32, buf.as_mut_ptr(), n);
     Some(String::from_utf16_lossy(&buf))
+}
+
+/// The process runs under Wine (its ntdll exports `wine_get_version`).
+pub fn under_wine() -> bool {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
+    static WINE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: ntdll is always loaded; both names are NUL-terminated.
+    *WINE.get_or_init(|| unsafe {
+        GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some()
+    })
 }
 
 /// Normalised DLL key: lower-case file name, ".dll" appended when no extension.

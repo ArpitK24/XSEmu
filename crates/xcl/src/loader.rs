@@ -1,7 +1,6 @@
 //! The XCL PE loader: maps console executables/DLLs into the current process and wires
 //! them to HLE modules, game DLLs and real Windows DLLs (design §5.1).
 
-use std::collections::HashMap;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,7 +12,7 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use crate::modules::{self, MappedModule};
-use crate::pe::{self, ExportTarget, Layout, OwnedExports, Pe};
+use crate::pe::{self, Layout, OwnedExports, Pe};
 use crate::resolver;
 
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -21,7 +20,6 @@ static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// map it twice. Re-entrant loads (import resolution mapping dependencies) happen on the
 /// same thread, so a re-entrant flag is used instead of holding the mutex across them.
 static LOAD_LOCK: Mutex<()> = Mutex::new(());
-static FAILED_ATTACH: Mutex<Option<HashMap<String, String>>> = Mutex::new(None);
 thread_local! {
     static IN_LOAD: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
@@ -57,17 +55,18 @@ type TlsCallback = unsafe extern "system" fn(*mut c_void, u32, *mut c_void);
 type DllMain = unsafe extern "system" fn(*mut c_void, u32, *mut c_void) -> i32;
 type ExeEntry = unsafe extern "system" fn(*mut c_void) -> u32;
 
+#[derive(Clone, Copy)]
+pub(crate) enum LoadOrigin {
+    Startup,
+    Runtime,
+}
+
 /// Map an image, apply relocations, resolve imports, set up TLS / exception data and
 /// page protections. Does NOT run any code of the image.
-fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String> {
+fn map_image_ex(path: &Path, is_main: bool, origin: LoadOrigin) -> Result<Arc<MappedModule>, String> {
     let file = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
     let pe = Pe::parse(&file, Layout::File).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = crate::util::dll_key(&path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
-    let mut all = pe.imports().map_err(|e| format!("{name}: import table: {e}"))?;
-    match pe.delay_imports() {
-        Ok(v) => all.extend(v),
-        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
-    }
     let size = pe.size_of_image as usize;
 
     // 1. reserve + commit
@@ -116,7 +115,16 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
             Err(e) => return fail(format!("{name}: relocations: {e}")),
         };
         for r in relocs {
-            let p = base + r.rva as usize;
+            let width = match r.kind {
+                pe::IMAGE_REL_BASED_DIR64 => std::mem::size_of::<u64>(),
+                pe::IMAGE_REL_BASED_HIGHLOW => std::mem::size_of::<u32>(),
+                _ => 0,
+            };
+            let offset = r.rva as usize;
+            if width != 0 && offset.checked_add(width).is_none_or(|end| end > size) {
+                return fail(format!("{name}: relocation at {:#x} outside the image", r.rva));
+            }
+            let p = base + offset;
             unsafe {
                 match r.kind {
                     pe::IMAGE_REL_BASED_DIR64 => {
@@ -160,10 +168,24 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         if delta != 0 { ", relocated" } else { "" }
     );
 
-    // 4. imports (normal + delay-load, resolved eagerly)
+    // 4. imports (normal + delay-load, resolved eagerly). A failure from here on takes the
+    // module out of the registry again: a later load must not find it (its memory freed, or
+    // never initialised) and take it for loaded
+    let mut all = match pe.imports() {
+        Ok(v) => v,
+        Err(e) => {
+            // nothing was resolved against it yet: its memory goes too
+            modules::unregister_mapped(base);
+            return fail(format!("{name}: import table: {e}"));
+        }
+    };
+    match pe.delay_imports() {
+        Ok(v) => all.extend(v),
+        Err(e) => crate::xlog_warn!("{name}: delay-imports: {e}"),
+    }
     for dll in &all {
         for e in &dll.entries {
-            let addr = resolver::resolve_import(&dll.dll, &e.what, &name, dll.delay);
+            let addr = resolver::resolve_import_from(&dll.dll, &e.what, &name, dll.delay, origin);
             unsafe { ((base + e.iat_rva as usize) as *mut u64).write_unaligned(addr as u64) };
         }
         if dll.delay && dll.module_handle_rva != 0 {
@@ -177,12 +199,10 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let adj = |va: u64| (va as i64 + delta) as usize;
         let template = adj(t.start_raw);
         let template_len = t.template_len() as usize;
-        let index_ptr = adj(t.address_of_index) as *mut u32;
+        let index_ptr = if t.address_of_index == 0 { std::ptr::null_mut() } else { adj(t.address_of_index) as *mut u32 };
         unsafe {
-            if let Err(e) = tls_install(&module, template, template_len, t.total_len(), index_ptr) {
-                reject_mapped(&module, &e);
-                return Err(e);
-            }
+            // game DLLs loaded while its imports were resolved may point into it: its memory stays
+            tls_install(&module, template, template_len, t.total_len(), index_ptr).inspect_err(|_| modules::unregister_mapped(base))?;
             if t.address_of_callbacks != 0 {
                 let mut cb = adj(t.address_of_callbacks) as *const u64;
                 let mut list = module.tls_callbacks.lock().unwrap();
@@ -222,34 +242,7 @@ fn map_image_ex(path: &Path, is_main: bool) -> Result<Arc<MappedModule>, String>
         let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
     }
-    if is_main {
-        bind_xmem_hooks(&module, &pe.sections);
-    }
     Ok(module)
-}
-
-fn bind_xmem_hooks(module: &MappedModule, sections: &[pe::Section]) {
-    let Some(export) = module.exports.by_name.get("__XMemAllocationHooks__") else { return };
-    let in_section = |offset: usize, len: usize, flag: u32| {
-        offset.checked_add(len).is_some_and(|end| {
-            end <= module.size && sections.iter().any(|s| {
-                s.characteristics & flag != 0 && offset >= s.va as usize && end - s.va as usize <= s.mapped_size() as usize
-            })
-        })
-    };
-    if let ExportTarget::Rva(rva) = *export {
-        let offset = rva as usize;
-        if in_section(offset, std::mem::size_of::<[usize; 2]>(), pe::SCN_MEM_READ) {
-            let [alloc, free] = unsafe { ((module.base + offset) as *const [usize; 2]).read_unaligned() };
-            let executable = |addr: usize| addr.checked_sub(module.base).is_some_and(|rva| in_section(rva, 1, pe::SCN_MEM_EXECUTE));
-            if executable(alloc) && executable(free) {
-                unsafe { crate::hle::kernelx::XMemSetAllocationHooks(alloc, free) };
-                crate::xlog_info!("{}: bound exported XMem allocation hooks", module.name);
-                return;
-            }
-        }
-    }
-    crate::xlog_warn!("{}: ignoring invalid XMem allocation hooks export", module.name);
 }
 
 unsafe fn tls_install(m: &MappedModule, template: usize, len: usize, total: u64, index_ptr: *mut u32) -> Result<(), String> {
@@ -273,12 +266,21 @@ unsafe fn run_tls_callbacks(m: &MappedModule, reason: u32) {
 
 /// Run TLS callbacks (PROCESS_ATTACH) and DllMain of a freshly mapped DLL.
 pub fn init_dll(m: &Arc<MappedModule>) -> Result<(), String> {
+    init_dll_from(m, LoadOrigin::Runtime)
+}
+
+fn init_dll_from(m: &MappedModule, origin: LoadOrigin) -> Result<(), String> {
     unsafe {
         run_tls_callbacks(m, 1);
         if m.entry_rva != 0 {
             let f: DllMain = std::mem::transmute(m.base + m.entry_rva as usize);
             crate::xlog_info!("DllMain({}, PROCESS_ATTACH)", m.name);
-            if f(m.base as *mut c_void, 1, std::ptr::null_mut()) == 0 {
+            let mut startup = 0usize;
+            let reserved = match origin {
+                LoadOrigin::Startup => std::ptr::from_mut(&mut startup).cast(),
+                LoadOrigin::Runtime => std::ptr::null_mut(),
+            };
+            if f(m.base as *mut c_void, 1, reserved) == 0 {
                 return Err(format!("DllMain({}) returned FALSE", m.name));
             }
         }
@@ -311,34 +313,33 @@ impl Drop for LoadGuard {
 
 /// Map + initialise a DLL that ships with the game (idempotent).
 pub fn load_game_dll(path: &Path) -> Result<Arc<MappedModule>, String> {
+    load_game_dll_from(path, LoadOrigin::Runtime)
+}
+
+pub(crate) fn load_game_dll_from(path: &Path, origin: LoadOrigin) -> Result<Arc<MappedModule>, String> {
     let key = crate::util::dll_key(&path.to_string_lossy());
     let (_g, _lock) = LoadGuard::enter();
     if let Some(m) = modules::find_mapped_by_name(&key) {
         return Ok(m);
     }
-    if let Some(error) = FAILED_ATTACH.lock().unwrap().as_ref().and_then(|failed| failed.get(&key)).cloned() {
-        return Err(error);
-    }
-    let m = map_image_ex(path, false)?;
+    let m = map_image_ex(path, false, origin)?;
     if !m.is_dll {
         crate::xlog_warn!("{key} is not a DLL but is being loaded as a library");
     }
-    if let Err(e) = init_dll(&m) {
-        reject_mapped(&m, &e);
+    if let Err(e) = init_dll_from(&m, origin) {
+        // as Windows' loader: a DLL whose DllMain fails is not loaded, a later load maps it and
+        // runs DllMain again (here its memory stays: what DllMain ran may have left threads or
+        // callbacks in it)
+        modules::unregister_mapped(m.base);
         return Err(e);
     }
     Ok(m)
 }
 
-fn reject_mapped(m: &Arc<MappedModule>, error: &str) {
-    modules::unregister_mapped(m);
-    FAILED_ATTACH.lock().unwrap().get_or_insert_with(HashMap::new).insert(m.name.clone(), error.to_owned());
-}
-
 /// Map the title's main executable.
 pub fn load_main(path: &Path) -> Result<Arc<MappedModule>, String> {
     let (_g, _lock) = LoadGuard::enter();
-    map_image_ex(path, true)
+    map_image_ex(path, true, LoadOrigin::Startup)
 }
 
 #[inline(always)]
@@ -368,9 +369,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     };
     unsafe {
         // PEB.ImageBaseAddress → GetModuleHandle(NULL), resources with NULL module, …
-        use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleA, GetProcAddress};
-        let wine = GetProcAddress(GetModuleHandleA(c"ntdll.dll".as_ptr() as *const u8), c"wine_get_version".as_ptr() as *const u8).is_some();
-        if wine {
+        if crate::util::under_wine() {
             crate::xlog_info!("Wine: PEB.ImageBaseAddress left alone (its loader needs the real main image there)");
         } else {
             *(peb().add(0x10) as *mut usize) = m.base;
@@ -452,28 +451,112 @@ pub fn on_tls_event(reason: u32) {
 mod tests {
     use super::*;
 
+    /// A PE32+ DLL of one section (.text at RVA 0x1000) holding `code`, its entry point at the
+    /// start of it, preferred at `image_base` and relocatable (one empty block at RVA 0x1100);
+    /// `import_dir`: (RVA, size) of the import directory, if any.
+    fn tiny_dll(image_base: u64, code: &[u8], import_dir: Option<(u32, u32)>) -> Vec<u8> {
+        let mut f = vec![0u8; 0x400];
+        let put16 = |f: &mut Vec<u8>, at: usize, v: u16| f[at..at + 2].copy_from_slice(&v.to_le_bytes());
+        let put32 = |f: &mut Vec<u8>, at: usize, v: u32| f[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        f[0..2].copy_from_slice(b"MZ");
+        put32(&mut f, 0x3C, 0x40);
+        f[0x40..0x44].copy_from_slice(b"PE\0\0");
+        // COFF: x64, 1 section, optional header 0xF0, executable | large address aware | DLL
+        put16(&mut f, 0x44, 0x8664);
+        put16(&mut f, 0x46, 1);
+        put16(&mut f, 0x54, 0xF0);
+        put16(&mut f, 0x56, 0x2022);
+        let o = 0x58;
+        put16(&mut f, o, 0x20B);
+        put32(&mut f, o + 0x10, 0x1000); // entry point
+        put32(&mut f, o + 0x14, 0x1000); // base of code
+        f[o + 0x18..o + 0x20].copy_from_slice(&image_base.to_le_bytes());
+        put32(&mut f, o + 0x20, 0x1000); // section alignment
+        put32(&mut f, o + 0x24, 0x200); // file alignment
+        put16(&mut f, o + 0x28, 6);
+        put16(&mut f, o + 0x30, 6);
+        put32(&mut f, o + 0x38, 0x2000); // size of image
+        put32(&mut f, o + 0x3C, 0x200); // size of headers
+        put16(&mut f, o + 0x44, 3); // console subsystem
+        f[o + 0x48..o + 0x50].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        f[o + 0x50..o + 0x58].copy_from_slice(&0x1000u64.to_le_bytes());
+        f[o + 0x58..o + 0x60].copy_from_slice(&0x10_0000u64.to_le_bytes());
+        f[o + 0x60..o + 0x68].copy_from_slice(&0x1000u64.to_le_bytes());
+        put32(&mut f, o + 0x6C, 16); // data directories
+        if let Some((rva, size)) = import_dir {
+            put32(&mut f, o + 0x70 + 8, rva);
+            put32(&mut f, o + 0x70 + 12, size);
+        }
+        // base relocations: one block (page 0x1000, 8 bytes: no entries) at RVA 0x1100
+        put32(&mut f, o + 0x70 + 5 * 8, 0x1100);
+        put32(&mut f, o + 0x70 + 5 * 8 + 4, 8);
+        put32(&mut f, 0x300, 0x1000);
+        put32(&mut f, 0x304, 8);
+        // section .text: RVA 0x1000, 0x200 bytes at file offset 0x200, code | execute | read
+        let s = o + 0xF0;
+        f[s..s + 5].copy_from_slice(b".text");
+        put32(&mut f, s + 8, 0x200);
+        put32(&mut f, s + 12, 0x1000);
+        put32(&mut f, s + 16, 0x200);
+        put32(&mut f, s + 20, 0x200);
+        put32(&mut f, s + 36, 0x6000_0020);
+        f[0x200..0x200 + code.len()].copy_from_slice(code);
+        f
+    }
+
+    fn write(name: &str, bytes: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("xcl-loader-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// DllMain returning FALSE: the load fails, the DLL is not left registered as loaded, and a
+    /// second load runs DllMain again (before: the second load returned the uninitialised module).
     #[test]
-    fn provisional_dll_is_visible_to_its_loader_until_rejected() {
-        let m = Arc::new(MappedModule {
-            name: "provisional_loader_test.dll".into(),
-            path: PathBuf::from("provisional_loader_test.dll"),
-            base: 0x7fff_ffff_0000,
-            size: 4096,
-            entry_rva: 0,
-            is_dll: true,
-            exports: OwnedExports::default(),
-            tls_callbacks: Mutex::new(Vec::new()),
-            no_thread_calls: AtomicBool::new(false),
-            initialized: AtomicBool::new(false),
-            stack_reserve: 0,
-        });
-        let (_g, _lock) = LoadGuard::enter();
-        modules::register_mapped(m.clone());
-        assert!(Arc::ptr_eq(&load_game_dll(&m.path).unwrap(), &m));
-        assert!(std::thread::spawn(|| modules::find_mapped_by_name("provisional_loader_test.dll").is_none()).join().unwrap());
-        reject_mapped(&m, "test attach failed");
-        assert!(modules::find_mapped_by_name(&m.name).is_none());
-        assert!(modules::image_base_for_addr(m.base).is_none());
-        assert_eq!(load_game_dll(&m.path).err().as_deref(), Some("test attach failed"));
+    fn a_dll_whose_dllmain_fails_is_not_loaded() {
+        // xor eax, eax; ret
+        let p = write("xcl_dllmain_false.dll", &tiny_dll(0x7E51_0000_0000, &[0x31, 0xC0, 0xC3], None));
+        let key = crate::util::dll_key("xcl_dllmain_false.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(r.as_ref().is_err_and(|e| e.contains("returned FALSE")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
+        // the same code returning TRUE loads, once
+        let p = write("xcl_dllmain_true.dll", &tiny_dll(0x7E52_0000_0000, &[0xB8, 1, 0, 0, 0, 0xC3], None));
+        let m = load_game_dll(&p).unwrap();
+        assert!(m.initialized.load(Ordering::Acquire));
+        assert_eq!(load_game_dll(&p).unwrap().base, m.base);
+    }
+
+    #[test]
+    fn dllmain_distinguishes_startup_and_runtime_loads() {
+        let code = [0x31, 0xc0, 0x4d, 0x85, 0xc0, 0x0f, 0x95, 0xc0, 0xc3];
+        let runtime = write("xcl_runtime_attach.dll", &tiny_dll(0x7E54_0000_0000, &code, None));
+        let startup = write("xcl_startup_attach.dll", &tiny_dll(0x7E55_0000_0000, &code, None));
+        assert!(load_game_dll(&runtime).is_err_and(|e| e.contains("returned FALSE")));
+        assert!(load_game_dll_from(&startup, LoadOrigin::Startup).unwrap().initialized.load(Ordering::Acquire));
+    }
+
+    /// An import table that does not parse: the load fails and the module – whose memory is
+    /// freed – is not found afterwards (before: still registered over freed memory, and a second
+    /// load returned it).
+    #[test]
+    fn a_dll_with_a_broken_import_table_is_not_left_registered() {
+        // a descriptor at RVA 0x1010 whose name RVA lies outside the image
+        let mut code = vec![0xB8, 1, 0, 0, 0, 0xC3];
+        code.resize(0x10, 0xCC);
+        for v in [0x1000u32, 0, 0, 0x7FFF_0000, 0x1000] {
+            code.extend_from_slice(&v.to_le_bytes());
+        }
+        let p = write("xcl_bad_imports.dll", &tiny_dll(0x7E53_0000_0000, &code, Some((0x1010, 40))));
+        let key = crate::util::dll_key("xcl_bad_imports.dll");
+        for attempt in 0..2 {
+            let r = load_game_dll(&p);
+            assert!(r.as_ref().is_err_and(|e| e.contains("import table")), "attempt {attempt}: {:?}", r.map(|m| m.base));
+            assert!(modules::find_mapped_by_name(&key).is_none(), "attempt {attempt}: still registered");
+        }
     }
 }

@@ -259,14 +259,12 @@ pub fn image_d3d12(t: &Image) -> Option<(D3D12_RESOURCE_DESC, D3D12_SHADER_RESOU
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
             v.Anonymous.Texture3D = D3D12_TEX3D_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
         }
-        ImageType::Cube if depth > 6 => {
+        // always a cube array (of one cube, too): translated shaders declare TextureCubeArray,
+        // as a cube T# says nothing at compile time about how many cubes it has
+        ImageType::Cube => {
             v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
             v.Anonymous.TextureCubeArray =
                 D3D12_TEXCUBE_ARRAY_SRV { MostDetailedMip: t.base_level, MipLevels: levels, First2DArrayFace: t.base_array, NumCubes: slices / 6, ResourceMinLODClamp: lod };
-        }
-        ImageType::Cube => {
-            v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
-            v.Anonymous.TextureCube = D3D12_TEXCUBE_SRV { MostDetailedMip: t.base_level, MipLevels: levels, ResourceMinLODClamp: lod };
         }
         ImageType::D2Msaa => v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS,
         ImageType::D2MsaaArray => {
@@ -366,6 +364,16 @@ pub fn buffer(w: &[u32; 4]) -> Buffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cbv_is_float4_rows() {
+        let v = buffer(&cbv_words(0x4_4E10_DC00, 0x600));
+        assert_eq!((v.address, v.stride, v.num_records, v.format), (0x4_4E10_DC00, 16, 0x60, 77));
+        // an idxen load of row n reads base + 16 n; the scalar-load limit stays the view's size
+        assert_eq!(v.num_records * v.stride, 0x600);
+        // a size that is not a whole number of rows still covers its last bytes
+        assert_eq!(buffer(&cbv_words(0x1000, 0x608)).num_records, 0x61);
+    }
 
     /// T# of a 2D BGRA-swizzled RGBA8 texture, 256×128, 8 mips, view of mips 1..3.
     fn tsharp() -> [u32; 8] {
@@ -655,6 +663,16 @@ pub fn format_bytes(f: u32) -> u32 {
         75..=77 => 16,
         _ => 4,
     }
+}
+
+/// A V# for a constant buffer view: 16-byte elements (one float4 row each), num_records in
+/// rows, as the console writes it (a title that writes this descriptor itself writes stride 16
+/// and size / 16). Console shaders index constant-buffer arrays with `buffer_load_* … idxen`
+/// and the row as the index, which a stride of 0 ignores (every row would read row 0). Loads by
+/// byte offset read the same addresses as with a raw V#, and scalar loads keep their byte limit
+/// (num_records × stride).
+pub fn cbv_words(address: u64, size: u32) -> [u32; 4] {
+    buffer_words(address, 16, size.div_ceil(16), 77)
 }
 
 /// A V# for a buffer view: `stride` 0 = raw (num_records in bytes), else structured / typed

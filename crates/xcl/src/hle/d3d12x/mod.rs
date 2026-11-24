@@ -10,22 +10,33 @@
 #![allow(non_snake_case)]
 
 pub mod bind;
+mod indirect;
+mod markers;
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;
 pub mod dxgi_device;
+mod cpu_writes;
+mod fence_x;
 pub mod frame;
 pub mod guard;
 pub mod layout;
 pub mod list_x;
 pub mod null;
+pub mod page_mappings;
 pub mod present;
 pub mod pso_async;
+pub mod pso_manifest;
 pub mod real;
+pub mod residency;
+mod single;
+mod residency_list;
 pub mod sparse;
+mod external_buffers;
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;
+mod wait_trace;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

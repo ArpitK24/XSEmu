@@ -22,10 +22,11 @@ use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::Graphics::Dxgi::*;
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateEventW;
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -37,6 +38,7 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
 static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
 static PRESENTS: AtomicU64 = AtomicU64::new(0);
+static LAST_FRAME_DUMP: Mutex<Option<FrameDumpSample>> = Mutex::new(None);
 static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
 static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
 static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
@@ -83,19 +85,31 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("D3D12.X: PresentX now with {plane_count} plane(s): {words:x?}");
         }
     }
-    let count = (planes.add(8) as *const u32).read_unaligned();
-    let list = (planes.add(0x10) as *const usize).read_unaligned();
-    if count == 0 || !crate::gpu::shader::readable(list, 8) || !enabled() {
+    if !enabled() {
         return;
     }
-    let res = (list as *const usize).read_unaligned();
-    if res == 0 {
-        return;
-    }
+    // each plane's first resource, bottom (the game's) to top (a UI plane over it)
+    let shown: Vec<usize> = (0..plane_count as usize)
+        .filter_map(|k| {
+            let plane = planes.add(PLANE_BYTES * k);
+            if !crate::gpu::shader::readable(plane as usize, 0x18) {
+                return None;
+            }
+            let count = (plane.add(8) as *const u32).read_unaligned();
+            let list = (plane.add(0x10) as *const usize).read_unaligned();
+            if count == 0 || !crate::gpu::shader::readable(list, 8) {
+                return None;
+            }
+            Some((list as *const usize).read_unaligned()).filter(|&r| r != 0)
+        })
+        .collect();
+    let Some(&res) = shown.first() else { return };
     {
         let mut p = PRESENTED.lock().unwrap();
-        if !p.contains(&res) {
-            p.push(res);
+        for &r in &shown {
+            if !p.contains(&r) {
+                p.push(r);
+            }
         }
     }
     if trace_frame() {
@@ -123,8 +137,13 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, res)));
+    present_now(Duration::ZERO, Some((queue as usize, &shown)));
 }
+
+/// `D3D12XBOX_PRESENT_PLANE_PARAMETERS`: token @0, resource count @8, resources @0x10, source
+/// rects @0x18, destination placement @0x20, colour space / filter / flags after them (a
+/// retail game's two planes are 0x48 bytes apart)
+const PLANE_BYTES: usize = 0x48;
 
 thread_local! {
     static IN_PRESENT: Cell<bool> = const { Cell::new(false) };
@@ -211,6 +230,45 @@ pub fn note_rt0(list: usize, handle: usize) {
         return;
     }
     LISTS.lock().unwrap().get_or_insert_with(HashMap::new).insert(list, handle);
+    watch_list(list, handle);
+}
+
+/// `XCL_TRACE_LIST=<presents>`: past that many presents, every console method call on a list
+/// that binds a presented resource – or one that could be presented (`backbuffer_like`) – as
+/// render target 0 is logged until the list closes (the first 4 such lists, 600 calls each;
+/// `guard::make_list_tracer`)
+pub fn list_trace_after() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("XCL_TRACE_LIST").ok().map(|v| v.parse().unwrap_or(300)))
+}
+
+/// lists being traced, with the calls logged on each
+static WATCHED: Mutex<Vec<(usize, u32)>> = Mutex::new(Vec::new());
+static WATCHES: AtomicU64 = AtomicU64::new(0);
+
+fn watch_list(list: usize, handle: usize) {
+    let Some(after) = list_trace_after() else { return };
+    let Some(res) = rtv_resource(handle).filter(|&r| is_presented(r) || unsafe { backbuffer_like(r) }.is_some()) else { return };
+    if activity().0 < after {
+        return;
+    }
+    let mut w = WATCHED.lock().unwrap();
+    if w.iter().any(|e| e.0 == list) || WATCHES.fetch_add(1, Ordering::Relaxed) >= 4 {
+        return;
+    }
+    crate::xlog_info!("list trace: list {list:#x} binds presented {res:#x} as render target 0 (handle {handle:#x})");
+    w.push((list, 0));
+}
+
+/// Whether a call of `slot` on `list` is logged (a close ends the trace of that list).
+pub fn list_watched(list: usize, slot: usize) -> bool {
+    let mut w = WATCHED.lock().unwrap();
+    let Some(i) = w.iter().position(|e| e.0 == list) else { return false };
+    w[i].1 += 1;
+    if slot == 9 || w[i].1 >= 600 {
+        w.swap_remove(i);
+    }
+    true
 }
 
 /// Format the swap chain uses for a back buffer of `f` (None = not presentable).
@@ -342,14 +400,64 @@ fn window_name() -> String {
 /// the XCL window's timer for `show_compiling`
 const COMPILE_TIMER: usize = 0x5C0;
 
-/// While XCL compiles shaders (DXC, programs the disk cache did not have – the title draws
-/// nothing with those pipelines meanwhile: after an XCL update the screen stays black while
-/// thousands recompile), the window's title says so:
-/// "XCL – <game> | compiling shaders: N running, M done[, Q pipelines queued][, F failed]".
-/// It stays 2 s after the last compile (compiles in the title's own calls come one by one),
-/// then the plain title comes back.
+struct FrameRate {
+    sampled_at: Instant,
+    presented: u64,
+    fps: f64,
+}
+
+impl FrameRate {
+    fn new(now: Instant, presented: u64) -> Self {
+        Self {
+            sampled_at: now,
+            presented,
+            fps: 0.0,
+        }
+    }
+
+    fn sample(&mut self, now: Instant, presented: u64) -> f64 {
+        let elapsed = now.duration_since(self.sampled_at);
+        if elapsed >= Duration::from_secs(1) {
+            self.fps = presented.saturating_sub(self.presented) as f64 / elapsed.as_secs_f64();
+            self.sampled_at = now;
+            self.presented = presented;
+        }
+        self.fps
+    }
+}
+
+/// While XCL builds shaders (the title draws nothing with those pipelines meanwhile: after an
+/// XCL update the screen stays black while thousands recompile), the window's title says how
+/// far it got (`progress::Status::title`):
+/// "xcl: building shaders 1234/2600 (47%), 3 large in flight | XCL – <game> | N FPS".
+/// With `XCL_PROGRESS=0`: "XCL – <game> | N FPS | compiling shaders: N running, M done[, Q
+/// pipelines queued][, F failed]", kept 2 s after the last compile (compiles in the title's own
+/// calls come one by one). Otherwise only the game name and presented frame rate remain.
 unsafe fn show_compiling(hwnd: HWND) {
     static SHOWN: Mutex<Option<String>> = Mutex::new(None);
+    static FRAME_RATE: Mutex<Option<FrameRate>> = Mutex::new(None);
+    let now = Instant::now();
+    let presented = PRESENTS.load(Ordering::Relaxed);
+    let fps = FRAME_RATE
+        .lock()
+        .unwrap()
+        .get_or_insert_with(|| FrameRate::new(now, presented))
+        .sample(now, presented);
+    let title = format!("XCL – {} | {fps:.1} FPS", window_name());
+    let text = if crate::progress::enabled() {
+        crate::progress::current().map_or(title.clone(), |s| format!("{} | {title}", s.title()))
+    } else {
+        compiling_title(title)
+    };
+    let mut shown = SHOWN.lock().unwrap();
+    if shown.as_deref() != Some(text.as_str()) {
+        let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
+        *shown = Some(text);
+    }
+}
+
+/// `title` with the DXC compiles running and done (`XCL_PROGRESS=0`).
+fn compiling_title(title: String) -> String {
     static LAST_ACTIVE: Mutex<Option<Instant>> = Mutex::new(None);
     let (_, failed, queued) = super::pso_async::counts();
     let (running, done) = crate::gpu::recomp::dxc::compile_counts();
@@ -361,19 +469,12 @@ unsafe fn show_compiling(hwnd: HWND) {
         }
         last.is_some_and(|t| t.elapsed() < Duration::from_secs(2))
     };
-    let title = window_name();
-    let text = if recent {
-        let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
-        let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
-        format!("XCL – {title} | compiling shaders: {running} running, {done} done{queued}{failed}")
-    } else {
-        format!("XCL – {title}")
-    };
-    let mut shown = SHOWN.lock().unwrap();
-    if shown.as_deref() != Some(text.as_str()) {
-        let _ = SetWindowTextW(hwnd, &HSTRING::from(text.as_str()));
-        *shown = Some(text);
+    if !recent {
+        return title;
     }
+    let queued = if queued > 0 { format!(", {queued} pipelines queued") } else { String::new() };
+    let failed = if failed > 0 { format!(", {failed} failed") } else { String::new() };
+    format!("{title} | compiling shaders: {running} running, {done} done{queued}{failed}")
 }
 
 fn window_thread() {
@@ -392,15 +493,17 @@ fn window_thread() {
         let title = window_name();
         let mut rc = RECT { left: 0, top: 0, right: cfg.window_width as i32, bottom: cfg.window_height as i32 };
         let _ = AdjustWindowRect(&mut rc, WS_OVERLAPPEDWINDOW, false);
+        let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+        let (x, y) = window_position(&cfg.window_pos, w, h);
         let hwnd = CreateWindowExW(
             WINDOW_EX_STYLE(0),
             class,
             &HSTRING::from(format!("XCL – {title}")),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
-            rc.right - rc.left,
-            rc.bottom - rc.top,
+            x,
+            y,
+            w,
+            h,
             None,
             None,
             Some(inst.into()),
@@ -414,12 +517,92 @@ fn window_thread() {
         crate::xlog_info!("XCL window created ({}x{})", cfg.window_width, cfg.window_height);
         crate::hle::kbm::attach(hwnd.0);
         SetTimer(Some(hwnd), COMPILE_TIMER, 500, None);
+        let raw = hwnd.0 as isize;
+        let _ = std::thread::Builder::new().name("xcl-window-watch".into()).spawn(move || watch_window(raw));
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+            let t0 = Instant::now();
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
+            let us = t0.elapsed().as_micros() as u64;
+            if us > WORST_HANDLER.fetch_max(us, Ordering::Relaxed) {
+                WORST_MESSAGE.store(msg.message, Ordering::Relaxed);
+            }
         }
     }
+}
+
+/// The longest the window thread spent on one message since `watch_window` last looked, and
+/// which message that was.
+static WORST_HANDLER: AtomicU64 = AtomicU64::new(0);
+static WORST_MESSAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Whether the XCL window answers: every second a WM_NULL is sent to it and the round trip
+/// timed (Windows calls a window that has not taken a message for 5 s "not responding"). A
+/// round trip of a second or more is a warning; with `XCL_ACTIVITY` the worst round trip and
+/// the worst message handler are logged every 10 s.
+fn watch_window(hwnd: isize) {
+    let activity = std::env::var_os("XCL_ACTIVITY").is_some();
+    let mut worst_trip = Duration::ZERO;
+    for tick in 1u64.. {
+        std::thread::sleep(Duration::from_secs(1));
+        let t0 = Instant::now();
+        let mut result = 0usize;
+        let answered = unsafe { SendMessageTimeoutW(HWND(hwnd as *mut c_void), WM_NULL, WPARAM(0), LPARAM(0), SMTO_NORMAL, 10_000, Some(&mut result as *mut usize)) }.0 != 0;
+        let trip = t0.elapsed();
+        worst_trip = worst_trip.max(trip);
+        if !answered || trip >= Duration::from_secs(1) {
+            crate::xlog_warn!("window: took {} ms to answer a message{}", trip.as_millis(), if answered { "" } else { " (no answer in 10 s)" });
+        }
+        if activity && tick % 10 == 0 {
+            crate::xlog_info!(
+                "window (10 s): worst answer {} ms, worst message handler {} ms (message {:#x})",
+                worst_trip.as_millis(),
+                WORST_HANDLER.swap(0, Ordering::Relaxed) / 1000,
+                WORST_MESSAGE.load(Ordering::Relaxed)
+            );
+            worst_trip = Duration::ZERO;
+        }
+    }
+}
+
+/// The XCL window's top-left from `window_pos` (`XCL_WINDOW_POS` overrides): "auto" keeps
+/// CW_USEDEFAULT (Windows may pick any monitor), "center" centers on the primary monitor's
+/// work area, "x,y" is clamped into the nearest monitor's work area — a multi-monitor desktop
+/// otherwise gets the window on whichever monitor Windows' cascade picks.
+unsafe fn window_position(setting: &str, w: i32, h: i32) -> (i32, i32) {
+    let env = std::env::var("XCL_WINDOW_POS").ok();
+    let mode = env.as_deref().unwrap_or(setting).trim();
+    if mode.is_empty() || mode.eq_ignore_ascii_case("auto") {
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    }
+    let work = |pt: POINT, flags: u32| -> Option<RECT> {
+        let mon = MonitorFromPoint(pt, MONITOR_FROM_FLAGS(flags));
+        if mon.is_invalid() {
+            return None;
+        }
+        let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+        GetMonitorInfoW(mon, &mut mi).as_bool().then_some(mi.rcWork)
+    };
+    if mode.eq_ignore_ascii_case("center") {
+        let Some(r) = work(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY.0) else {
+            return (CW_USEDEFAULT, CW_USEDEFAULT);
+        };
+        return (r.left + ((r.right - r.left) - w).max(0) / 2, r.top + ((r.bottom - r.top) - h).max(0) / 2);
+    }
+    let Some((xs, ys)) = mode.split_once(',') else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    let (Ok(x), Ok(y)) = (xs.trim().parse::<i32>(), ys.trim().parse::<i32>()) else {
+        crate::xlog_warn!("window_pos: expected \"auto\", \"center\" or \"x,y\", got {mode:?} – using auto");
+        return (CW_USEDEFAULT, CW_USEDEFAULT);
+    };
+    // clamp into the work area of the monitor nearest the requested top-left
+    let Some(r) = work(POINT { x, y }, MONITOR_DEFAULTTONEAREST.0) else {
+        return (x, y);
+    };
+    (x.clamp(r.left, (r.right - w).max(r.left)), y.clamp(r.top, (r.bottom - h).max(r.top)))
 }
 
 fn ensure_window() -> Option<HWND> {
@@ -457,6 +640,138 @@ struct Presenter {
     value: u64,
     event: HANDLE,
     last: Instant,
+    composer: Option<Composer>,
+    /// the back buffer's view for the progress bar (`progress_bar`)
+    bar_rtv: Option<ID3D12DescriptorHeap>,
+}
+
+/// What composes a PresentX of several planes into the swap chain's buffer (`compose`), for
+/// one back-buffer format.
+struct Composer {
+    fmt: DXGI_FORMAT,
+    rs: ID3D12RootSignature,
+    /// the bottom plane, as it is
+    under: ID3D12PipelineState,
+    /// a plane over it, blended with its premultiplied alpha
+    over: ID3D12PipelineState,
+    srvs: ID3D12DescriptorHeap,
+    rtv: ID3D12DescriptorHeap,
+}
+
+/// planes composed at most (the console's display has four)
+const COMPOSED_PLANES: usize = 4;
+
+unsafe fn new_composer(dev: &ID3D12Device, fmt: DXGI_FORMAT) -> Option<Composer> {
+    const VS: &str = "struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };\nO main(uint id : SV_VertexID) { O o; o.uv = float2((id << 1) & 2, id & 2); o.p = float4(o.uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n";
+    const PS: &str = "Texture2D t : register(t0);\nSamplerState s : register(s0);\nfloat4 main(float4 p : SV_Position, float2 uv : TEXCOORD0) : SV_Target { return t.SampleLevel(s, uv, 0); }\n";
+    let (vs, ps) = (super::real::compile(VS, "vs_5_0"), super::real::compile(PS, "ps_5_0"));
+    if vs.is_empty() || ps.is_empty() {
+        crate::xlog_error!("present: the plane composer's shaders did not compile");
+        return None;
+    }
+    let range = D3D12_DESCRIPTOR_RANGE { RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_SRV, NumDescriptors: 1, ..Default::default() };
+    let param = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 { DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE { NumDescriptorRanges: 1, pDescriptorRanges: &range } },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+    };
+    let sampler = D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_MIP_LINEAR,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        MaxLOD: f32::MAX,
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_PIXEL,
+        ..Default::default()
+    };
+    let desc = D3D12_ROOT_SIGNATURE_DESC { NumParameters: 1, pParameters: &param, NumStaticSamplers: 1, pStaticSamplers: &sampler, Flags: D3D12_ROOT_SIGNATURE_FLAG_NONE };
+    let mut blob = None;
+    D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None).ok()?;
+    let blob = blob?;
+    let rs: ID3D12RootSignature = dev.CreateRootSignature(0, std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize())).ok()?;
+    let pso = |blend: bool| -> Option<ID3D12PipelineState> {
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&rs),
+            VS: D3D12_SHADER_BYTECODE { pShaderBytecode: vs.as_ptr() as _, BytecodeLength: vs.len() },
+            PS: D3D12_SHADER_BYTECODE { pShaderBytecode: ps.as_ptr() as _, BytecodeLength: ps.len() },
+            SampleMask: u32::MAX,
+            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+            NumRenderTargets: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            ..Default::default()
+        };
+        d.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        d.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        d.RasterizerState.DepthClipEnable = true.into();
+        d.RTVFormats[0] = fmt;
+        d.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
+            BlendEnable: blend.into(),
+            SrcBlend: D3D12_BLEND_ONE,
+            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOp: D3D12_BLEND_OP_ADD,
+            SrcBlendAlpha: D3D12_BLEND_ONE,
+            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+            BlendOpAlpha: D3D12_BLEND_OP_ADD,
+            LogicOp: D3D12_LOGIC_OP_NOOP,
+            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
+            ..Default::default()
+        };
+        dev.CreateGraphicsPipelineState(&d).map_err(|e| crate::xlog_error!("present: plane composer pipeline: {e}")).ok()
+    };
+    let (under, over) = (pso(false)?, pso(true)?);
+    let srvs = dev
+        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            NumDescriptors: COMPOSED_PLANES as u32,
+            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
+            NodeMask: 0,
+        })
+        .ok()?;
+    let rtv = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).ok()?;
+    Some(Composer { fmt, rs, under, over, srvs, rtv })
+}
+
+/// The console's display composes a PresentX's planes: the first (the game's) as it is, each
+/// one after it (a UI plane, often at another size) over it with its alpha, every plane
+/// stretched over the whole output. Recorded on the presenter's list; the back buffer ends in
+/// COPY_SOURCE. False: no composer (the caller copies the bottom plane as before).
+/// shortcut: the planes' source rects and destination placement are not read.
+unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[ID3D12Resource]) -> bool {
+    if p.composer.as_ref().map_or(true, |c| c.fmt != p.fmt) {
+        p.composer = new_composer(&p.dev, p.fmt);
+    }
+    let Some(c) = p.composer.as_ref() else { return false };
+    let step = p.dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize;
+    let (cpu, gpu) = (c.srvs.GetCPUDescriptorHandleForHeapStart(), c.srvs.GetGPUDescriptorHandleForHeapStart());
+    let planes = &planes[..planes.len().min(COMPOSED_PLANES)];
+    for (k, r) in planes.iter().enumerate() {
+        let d = r.GetDesc();
+        let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: swap_format(d.Format).unwrap_or(d.Format),
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+        };
+        p.dev.CreateShaderResourceView(r, Some(&view), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu.ptr + k * step });
+    }
+    let rtv = c.rtv.GetCPUDescriptorHandleForHeapStart();
+    p.dev.CreateRenderTargetView(bb, None, rtv);
+    // (the RTV hook keeps a reference to what a handle names: none on the swap chain's buffer)
+    note_rtv(rtv.ptr, std::ptr::null_mut());
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+    p.list.OMSetRenderTargets(1, Some(&rtv), false, None);
+    p.list.RSSetViewports(&[D3D12_VIEWPORT { TopLeftX: 0.0, TopLeftY: 0.0, Width: p.w as f32, Height: p.h as f32, MinDepth: 0.0, MaxDepth: 1.0 }]);
+    p.list.RSSetScissorRects(&[RECT { left: 0, top: 0, right: p.w as i32, bottom: p.h as i32 }]);
+    p.list.SetGraphicsRootSignature(&c.rs);
+    p.list.SetDescriptorHeaps(&[Some(c.srvs.clone())]);
+    p.list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    for k in 0..planes.len() {
+        p.list.SetPipelineState(if k == 0 { &c.under } else { &c.over });
+        p.list.SetGraphicsRootDescriptorTable(0, D3D12_GPU_DESCRIPTOR_HANDLE { ptr: gpu.ptr + (k * step) as u64 });
+        p.list.DrawInstanced(3, 1, 0, 0);
+    }
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    true
 }
 
 struct FrameDump {
@@ -497,7 +812,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
         copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
-        last: Instant::now() - Duration::from_secs(1),
+        last: Instant::now() - Duration::from_secs(1), composer: None, bar_rtv: None,
     })
 }
 
@@ -513,6 +828,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
             crate::xlog_info!("present: swap chain {w}x{h} {:?}", fmt);
             return true;
         }
+        p.fmt = DXGI_FORMAT_UNKNOWN;
         return false;
     }
     let Ok(factory) = CreateDXGIFactory2::<IDXGIFactory2>(DXGI_CREATE_FACTORY_FLAGS(0)) else { return false };
@@ -547,7 +863,7 @@ unsafe fn ensure_swapchain(p: &mut Presenter, hwnd: HWND, w: u32, h: u32, fmt: D
     }
 }
 
-unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) {
     if IN_PRESENT.with(|c| c.replace(true)) {
         return;
     }
@@ -558,8 +874,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         }
     }
     let _reset = Reset;
-    let (queue, src, mut guard) = if let Some((queue, res)) = frame {
-        let raw = res as *mut c_void;
+    let (queue, src, mut guard) = if let Some((queue, planes)) = frame {
+        let raw = planes[0] as *mut c_void;
         let Some(src) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
         (queue, src.clone(), PRESENTER.lock().unwrap())
     } else {
@@ -575,10 +891,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     };
     // PresentX on another queue than the presenter was made for (the fallback presented once from
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
-    // a new presenter for the title's present queue, after the old one's copy is done
+    // a new presenter for the title's present queue, after the old presentation completes
     if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
         if let Some(old) = guard.as_ref() {
-            let _ = fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000);
+            if !matches!(
+                fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000),
+                Ok(()) | Err(FenceError::Removed(_))
+            ) {
+                return;
+            }
         }
         crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
         *guard = None;
@@ -596,7 +917,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.queue != queue {
         return; // swap chain is bound to the first queue we presented from
     }
-    // wait for the previous copy so the allocator can be reused
+    // wait for the previous copy and present before reusing the allocator or resizing the swap chain
     if let Err(e) = fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 100) {
         p.disabled = matches!(&e, FenceError::Removed(_));
         if !matches!(&e, FenceError::Timeout(_)) {
@@ -614,14 +935,22 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
         return;
     }
-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
-    p.list.ResourceBarrier(&b1);
-    p.list.CopyResource(&bb, &src);
+    // the planes over the first (a UI plane): composed as the console's display does
+    let mut planes = vec![src.clone()];
+    planes.extend(frame.map_or(&[][..], |f| &f.1[1..]).iter().filter_map(|&r| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).cloned()));
+    let composed = planes.len() > 1 && compose(p, &bb, &planes);
+    if !composed {
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        p.list.CopyResource(&bb, &src);
+        p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+    }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
     if due {
-        if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
+        // the back buffer the window shows, after the copy or the composition
+        let (shown, d) = (bb.clone(), bb.GetDesc());
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &shown, &d) {
+            dumps.push(FrameDump { _source: shown, buffer, footprint, format: d.Format, tag: "frame".into() });
         }
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
@@ -647,8 +976,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
         }
     }
-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
-    p.list.ResourceBarrier(&b2);
+    // the bar comes after the frame dumps: they hold the title's frame as it is
+    match crate::progress::current() {
+        Some(s) => progress_bar(p, &bb, s.fraction()),
+        None => p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]),
+    }
     if p.list.Close().is_err() {
         return;
     }
@@ -658,7 +990,9 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     q.ExecuteCommandLists(&[Some(cl)]);
     p.copy_source = Some(src);
     p.dumps = dumps;
+    let present_result = sc.Present(0, DXGI_PRESENT(0)).ok();
     p.value += 1;
+    super::markers::queue_fence(queue as usize, "the latest present copy (signal)", &p.fence, p.value);
     if let Err(e) = q.Signal(&p.fence, p.value) {
         // The copy is already submitted. Without its signal, keep its resources and allocator.
         p.disabled = true;
@@ -666,7 +1000,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
         crate::xlog_error!("present: submit copy: {e}");
         return;
     }
-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+    if let Err(e) = present_result {
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
@@ -695,11 +1029,69 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
     }
 }
 
-/// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder
+/// The progress bar (`progress::bar`) along the bottom edge of the back buffer, which comes in
+/// COPY_SOURCE and leaves in PRESENT; the rest of the frame stays as it is.
+unsafe fn progress_bar(p: &mut Presenter, bb: &ID3D12Resource, fraction: f32) {
+    if p.bar_rtv.is_none() {
+        p.bar_rtv = p.dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC { Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV, NumDescriptors: 1, ..Default::default() }).ok();
+    }
+    let Some(heap) = &p.bar_rtv else {
+        p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT)]);
+        return;
+    };
+    let rtv = heap.GetCPUDescriptorHandleForHeapStart();
+    p.dev.CreateRenderTargetView(bb, None, rtv);
+    // (the RTV hook keeps a reference to what a handle names: none on the swap chain's buffer)
+    note_rtv(rtv.ptr, std::ptr::null_mut());
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET)]);
+    for ([left, top, right, bottom], colour) in crate::progress::bar(p.w, p.h, fraction) {
+        if left < right && top < bottom {
+            p.list.ClearRenderTargetView(rtv, &colour, Some(&[RECT { left, top, right, bottom }]));
+        }
+    }
+    p.list.ResourceBarrier(&[transition(bb, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT)]);
+}
+
+/// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
+/// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("XCL_FRAME_DUMP").is_some()) && PRESENTS.load(Ordering::Relaxed) % 120 == 20
+    if LOOK.swap(false, Ordering::Relaxed) {
+        return true;
+    }
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
+        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+        Err(_) => 0,
+    });
+    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+}
+
+/// The next shown frame is dumped whatever `XCL_FRAME_DUMP` says (a live look, `XCL_INPUT_FILE`).
+pub static LOOK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Frames shown so far.
+pub fn presents() -> u64 {
+    PRESENTS.load(Ordering::Relaxed)
+}
+
+/// Content sampled by an existing `XCL_FRAME_DUMP` readback, not proof of gameplay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FrameDumpSample {
+    /// Zero-based presentation index, as in `frame_<n>.bmp`.
+    pub frame: u64,
+    pub width: u32,
+    pub height: u32,
+    pub format: i32,
+    /// One texel every `sample_step` pixels in each direction (normally 4).
+    pub sample_step: u32,
+    pub sampled_pixels: u64,
+    /// Samples whose decoded 8-bit R+G+B exceeds 30; None for an undecoded format.
+    pub non_dark_samples: Option<u64>,
+}
+
+pub fn last_frame_dump() -> Option<FrameDumpSample> {
+    LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
@@ -820,8 +1212,8 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         return;
     }
     let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
-    // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
-    let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { 4 };
+    // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail), =2: every 2nd
+    let step = std::env::var("XCL_FRAME_DUMP_FULL").map_or(4, |v| v.trim().parse::<usize>().unwrap_or(1).clamp(1, 4));
     let (ow, oh) = ((w / step).max(1), (h / step).max(1));
     let row = (ow * 3).div_ceil(4) * 4;
     let mut bmp = Vec::with_capacity(54 + row * oh);
@@ -855,6 +1247,24 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     rb.Unmap(0, None);
     let n = PRESENTS.load(Ordering::Relaxed);
+    // `XCL_TRACE_FRAME` also dumps intermediate targets; only the presented image belongs here.
+    if tag == "frame" {
+        static BOOTED: std::sync::Once = std::sync::Once::new();
+        if decoded && lit * 100 > ow * oh {
+            BOOTED.call_once(|| crate::xlog_info!("boot: first frame with content at {:.1} s (frame {n}); {}", crate::log::uptime(), crate::gpu::recomp::dxc::stage_summary()));
+        }
+        if let Ok(mut last) = LAST_FRAME_DUMP.lock() {
+            *last = Some(FrameDumpSample {
+                frame: n,
+                width: w as u32,
+                height: h as u32,
+                format: format.0,
+                sample_step: step as u32,
+                sampled_pixels: (ow * oh) as u64,
+                non_dark_samples: decoded.then_some(lit as u64),
+            });
+        }
+    }
     let Some(boot) = crate::state::boot() else { return };
     let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
     let _ = std::fs::write(&path, &bmp);
@@ -874,6 +1284,162 @@ impl Drop for Presenter {
     fn drop(&mut self) {
         unsafe {
             let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_rate_uses_frame_and_time_deltas() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 1_000);
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(1_500), 1_030),
+            20.0
+        );
+        assert_eq!(
+            rate.sample(start + Duration::from_millis(2_750), 1_080),
+            40.0
+        );
+    }
+
+    #[test]
+    fn frame_rate_waits_for_a_full_sample() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start, 0), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(500), 15), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 30), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_millis(1_500), 35), 30.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 40), 10.0);
+    }
+
+    #[test]
+    fn frame_rate_reports_stalls_and_recovery() {
+        let start = Instant::now();
+        let mut rate = FrameRate::new(start, 0);
+        assert_eq!(rate.sample(start + Duration::from_secs(1), 60), 60.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(2), 60), 0.0);
+        assert_eq!(rate.sample(start + Duration::from_secs(4), 70), 5.0);
+    }
+
+    // XCL_WINDOW_POS is process-global; one test covers all modes in sequence.
+    #[test]
+    fn window_position_modes() {
+        unsafe {
+            std::env::remove_var("XCL_WINDOW_POS");
+            assert_eq!(window_position("auto", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("nonsense", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+            assert_eq!(window_position("12,abc", 1280, 720), (CW_USEDEFAULT, CW_USEDEFAULT));
+
+            let (cx, cy) = window_position("center", 1280, 720);
+            if cx != CW_USEDEFAULT {
+                // centered on the primary work area: inside it, and not off its left/top
+                let mi = {
+                    let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+                    let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..Default::default() };
+                    assert!(GetMonitorInfoW(mon, &mut mi).as_bool());
+                    mi
+                };
+                assert!(cx >= mi.rcWork.left && cy >= mi.rcWork.top);
+                assert!(cx + 1280 <= mi.rcWork.right || mi.rcWork.right - mi.rcWork.left < 1280);
+            }
+
+            // a position far outside every monitor clamps into the nearest work area
+            let (x, y) = window_position("100000,100000", 1280, 720);
+            let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
+            assert!(!mon.is_invalid());
+
+            // the env override wins over the setting
+            std::env::set_var("XCL_WINDOW_POS", "center");
+            assert_eq!(window_position("auto", 1280, 720), window_position("center", 1280, 720));
+            std::env::remove_var("XCL_WINDOW_POS");
+        }
+    }
+}
+
+#[cfg(test)]
+mod frame_dump_tests {
+    use super::*;
+    use super::super::real::D3d12Stats;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+
+    #[test]
+    fn reports_without_frame_dumps_remain_readable() {
+        let stats = D3d12Stats { presents: 100, ..Default::default() };
+        let mut json = serde_json::to_value(&stats).unwrap();
+        assert!(json["last_frame_dump"].is_null(), "presents alone do not establish content");
+        json.as_object_mut().unwrap().remove("last_frame_dump");
+        let old: D3d12Stats = serde_json::from_value(json).unwrap();
+        assert_eq!(old.presents, 100);
+        assert_eq!(old.last_frame_dump, None);
+    }
+
+    #[test]
+    fn mapped_frame_dump_distinguishes_dark_bright_and_undecoded_content() {
+        unsafe {
+            // WARP needs no physical GPU. Fill a CPU-visible buffer with the same padded
+            // footprint used by a readback, so this exercises write_frame's actual decoder.
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let adapter: IDXGIAdapter = factory.EnumWarpAdapter().unwrap();
+            let mut dev: Option<ID3D12Device> = None;
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, &mut dev).unwrap();
+            let dev = dev.unwrap();
+            let desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 512 + 256 * 8,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut buffer: Option<ID3D12Resource> = None;
+            dev.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut buffer,
+            ).unwrap();
+            let buffer = buffer.unwrap();
+            let fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                Offset: 512,
+                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM, Width: 8, Height: 8, Depth: 1, RowPitch: 256,
+                },
+            };
+            let fill = |red: u8| {
+                let mut p: *mut c_void = std::ptr::null_mut();
+                buffer.Map(0, None, Some(&mut p)).unwrap();
+                let bytes = std::slice::from_raw_parts_mut(p as *mut u8, desc.Width as usize);
+                bytes.fill(255); // padding must not be counted as bright pixels
+                for y in 0..8 {
+                    for x in 0..8 {
+                        let start = 512 + y * 256 + x * 4;
+                        bytes[start..start + 4].copy_from_slice(&[red, 0, 0, 255]);
+                    }
+                }
+                buffer.Unmap(0, None);
+            };
+            fill(30);
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            let dark = last_frame_dump().unwrap();
+            assert_eq!((dark.width, dark.height, dark.format), (8, 8, 28));
+            assert_eq!(dark.sampled_pixels, (8 / dark.sample_step).pow(2) as u64);
+            assert_eq!(dark.non_dark_samples, Some(0));
+
+            fill(31);
+            write_frame(&buffer, &fp, fp.Footprint.Format, "rt");
+            assert_eq!(last_frame_dump(), Some(dark), "intermediate targets must not replace frame content");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            let bright = last_frame_dump().unwrap();
+            assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
+            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
+            assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }
     }
 }

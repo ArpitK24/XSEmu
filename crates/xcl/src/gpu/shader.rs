@@ -212,6 +212,16 @@ pub fn readable(p: usize, len: usize) -> bool {
         Some(e) => e,
         None => return false,
     };
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
+        return true;
+    }
+    // (what XCL committed for the title, without a system call: `memmap`)
+    if let Some(a) = crate::memmap::access(p, len) {
+        return a != crate::memmap::Access::None;
+    }
+    if resident_and_readable(p, end) {
+        return true;
+    }
     let mut cur = p;
     while cur < end {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -222,6 +232,38 @@ pub fn readable(p: usize, len: usize) -> bool {
         cur = mbi.BaseAddress as usize + mbi.RegionSize;
     }
     true
+}
+
+/// Whether each page of `[p, end)` (up to 16 pages) is in the working set with a readable
+/// protection, asked of the kernel for all the pages in one call that touches none of them.
+/// `readable` asks this first because `VirtualQuery` sizes the whole region around an address by
+/// walking it: in a title's 2 GB block of committed memory that took 20–25 ms a call, and a retail game's
+/// streaming thread, which has the page arrays of its DirectStorage requests checked, spent most
+/// of the world load there. `false` for a page that is not resident (never touched, paged out,
+/// guard, reserved, no access): the `VirtualQuery` walk answers for those.
+fn resident_and_readable(p: usize, end: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{PAGE_GUARD, PAGE_NOACCESS};
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    const MAX_PAGES: usize = 16;
+    let first = p >> 12;
+    let pages = ((end - 1) >> 12) - first + 1;
+    if pages > MAX_PAGES {
+        return false;
+    }
+    let mut ws: [PSAPI_WORKING_SET_EX_INFORMATION; MAX_PAGES] = unsafe { std::mem::zeroed() };
+    for (k, e) in ws[..pages].iter_mut().enumerate() {
+        e.VirtualAddress = ((first + k) << 12) as *mut std::ffi::c_void;
+    }
+    let size = (pages * std::mem::size_of::<PSAPI_WORKING_SET_EX_INFORMATION>()) as u32;
+    if unsafe { K32QueryWorkingSetEx(windows_sys::Win32::System::Threading::GetCurrentProcess(), ws.as_mut_ptr() as *mut std::ffi::c_void, size) } == 0 {
+        return false;
+    }
+    // PSAPI_WORKING_SET_EX_BLOCK: bit 0 Valid, bits 4-14 Win32Protection
+    ws[..pages].iter().all(|e| {
+        let flags = unsafe { e.VirtualAttributes.Flags };
+        let protect = ((flags >> 4) & 0x7FF) as u32;
+        flags & 1 != 0 && protect != 0 && protect & (PAGE_NOACCESS | PAGE_GUARD) == 0
+    })
 }
 
 /// Record a shader blob submitted by the title. Safe on garbage pointers.
@@ -252,6 +294,14 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
+    if !dumps_enabled() {
+        let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
+        crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
+        if kind == Kind::XboxNative {
+            account_xbox(&blob, h);
+        }
+        return;
+    }
     let dir = dump_dir();
     let _ = std::fs::create_dir_all(&dir);
     let base = dir.join(format!("{h:016x}_{stage}"));
@@ -266,6 +316,34 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
             let _ = std::fs::write(base.with_extension("rdna2.txt"), listing);
             crate::xlog_info!("[SHADER] {h:016x}: RDNA2 code found – disassembly in {}", base.with_extension("rdna2.txt").display());
         }
+    }
+}
+
+/// `XCL_DUMP_SHADERS=1`: every shader the title submits is written to the title's `shaders`
+/// folder – the blob, a console program's FSSMs, its disassembly and its HLSL (translated once
+/// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
+/// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
+/// program at every start.
+fn dumps_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+}
+
+/// Console container without dumps: its FSSM variants and instructions accounted.
+fn account_xbox(blob: &[u8], h: u64) {
+    let Some(sh) = xbox::parse(blob) else { return };
+    let mut insts = xbox::InstStats::default();
+    insts.add_shader(&sh);
+    let failed = !sh.notes.is_empty() || sh.fssm.iter().any(|f| f.error.is_some() || f.programs.is_empty());
+    if let Some(st) = STATE.lock().unwrap().as_mut() {
+        for f in &sh.fssm {
+            *st.stats.xbox_hw_stages.entry(f.stage_label()).or_default() += 1;
+        }
+        st.stats.xbox_errors += failed as usize;
+        st.insts.merge(&insts);
+    }
+    if failed {
+        crate::xlog_info!("[SHADER] {h:016x}: console container {} – WARNING: incomplete parse (xcl disasm)", sh.stage);
     }
 }
 
@@ -318,7 +396,7 @@ fn recompile(blob: &[u8], sh: &xbox::XboxShader, base: &std::path::Path) {
         };
         for (j, p) in f.programs.iter().enumerate() {
             let code = &f.data[p.offset..p.offset + p.len];
-            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), ..Default::default() };
+            let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), ..Default::default() };
             let Ok(t) = recomp::translate(code, &opt) else { continue };
             let _ = std::fs::write(base.with_extension(format!("fssm{i}.p{j}.hlsl")), &t.hlsl);
             let built = if dxc && t.complete() { Some(recomp::dxc::compile_cached(&t.hlsl, "main", profile)) } else { None };
@@ -413,5 +491,46 @@ mod tests {
         assert!(!readable(0x10, 10));
         let v = vec![1u8; 100];
         assert!(readable(v.as_ptr() as usize, 100));
+    }
+
+    #[test]
+    fn readable_answers_from_the_working_set_without_touching_pages() {
+        use windows_sys::Win32::System::Memory::*;
+        unsafe {
+            // 0, 1 written; 2 no access; 3 guard; 4 reserved; 5, 6 committed and never touched
+            let base = VirtualAlloc(std::ptr::null(), 7 << 12, MEM_RESERVE, PAGE_NOACCESS) as usize;
+            assert_ne!(base, 0);
+            let page = |k: usize| base + (k << 12);
+            for (k, protect) in [(0, PAGE_READWRITE), (1, PAGE_READWRITE), (2, PAGE_NOACCESS), (3, PAGE_READWRITE | PAGE_GUARD), (5, PAGE_READWRITE), (6, PAGE_READONLY)] {
+                assert!(!VirtualAlloc(page(k) as *const _, 1 << 12, MEM_COMMIT, protect).is_null());
+            }
+            std::ptr::write_volatile(page(0) as *mut u8, 1);
+            std::ptr::write_volatile(page(1) as *mut u8, 1);
+            // written pages: answered from the working set
+            assert!(resident_and_readable(page(0), page(2)));
+            assert!(readable(page(0), 2 << 12));
+            assert!(readable(page(0) + 100, 8));
+            // untouched pages: the region walk answers, and they stay untouched
+            assert!(!resident_and_readable(page(5), page(5) + 8));
+            assert!(readable(page(5), 8));
+            assert!(readable(page(6), 1 << 12));
+            assert!(!resident_and_readable(page(5), page(7)));
+            assert!(!readable(page(2), 8));
+            assert!(!readable(page(3), 8));
+            assert!(!readable(page(4), 8));
+            // asking about a guard page leaves it a guard page
+            let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+            assert_ne!(VirtualQuery(page(3) as *const _, &mut mbi, std::mem::size_of_val(&mbi)), 0);
+            assert_ne!(mbi.Protect & PAGE_GUARD, 0);
+            // a range is readable only when each of its pages is
+            assert!(!readable(page(1) + 0xFF0, 0x20));
+            assert!(!readable(page(4) + 0xFF0, 0x20));
+            assert!(!readable(page(0), 20 << 12));
+            VirtualFree(base as *mut _, 0, MEM_RELEASE);
+        }
+        // more pages than one working-set query takes: the region walk
+        let v = vec![1u8; 32 << 12];
+        assert!(!resident_and_readable(v.as_ptr() as usize, v.as_ptr() as usize + v.len()));
+        assert!(readable(v.as_ptr() as usize, v.len()));
     }
 }

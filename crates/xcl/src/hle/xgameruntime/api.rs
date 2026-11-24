@@ -11,9 +11,10 @@
 //! dropped), the XGameUi dialogs that do not take a user –, refuses XStore, app broadcast and
 //! app capture (the thunk then returns its "API not available" error), and passes everything
 //! else to the PC's own XGameRuntime (`System32\xgameruntime.dll`: the same classes under the
-//! same GUIDs) – XTaskQueue / XAsync, XThread, XNetworking, XGameInvite… Once the PC runtime is
-//! in use, the queues and async blocks are its own, so XCL's async APIs run on its XAsync
-//! (`xasync::use_pc`). Nothing that takes an XCL user handle goes to the PC runtime: it does not
+//! same GUIDs) – XTaskQueue / XAsync, XThread, XGameInvite… (XNetworking is always XCL's). Once
+//! the PC runtime is in use, the queues and async blocks are its own, so XCL's async APIs run on
+//! its XAsync (`xasync::use_pc`); without `System32\xgameruntime.dll`, XAsync / XTaskQueue /
+//! XThread fall back to XCL's own. Nothing that takes an XCL user handle goes to the PC runtime: it does not
 //! validate foreign handles.
 //!
 //! Layout: `gdk_table` (extracted from the public PC GDK's thunk library) gives every
@@ -84,6 +85,7 @@ const XSYSTEM_V3_IID: Guid = g(0x6fd71f09_7513_49f0_89bc_bfaf5df6f852);
 const XANALYTICS: Guid = g(0xb884675d_b738_4a9c_815d_9a9a1e0c6c9b);
 const XFEATURE: Guid = g(0x8836fe87_edb9_4fe3_8dad_05f0d2cd5b40);
 const XDISPLAY: Guid = g(0x1b339674_328d_4283_a200_3171f18d3639);
+const XDISPLAY_HDR: Guid = g(0x03f0fe74_fdd9_4e5c_b630_f9339c47acc5);
 const XGAMEEVENT: Guid = g(0xbbfbdcc7_bfe7_409b_a5ca_edf054960b4d);
 pub const XNETWORKING: Guid = g(0x37e56907_2f10_41e8_b72f_36edb185331a);
 pub const XERROR: Guid = g(0x8ca467f7_22e8_4096_8456_bb8aa13f79d8);
@@ -138,7 +140,7 @@ fn pc() -> Option<&'static Pc> {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
         let h = LoadLibraryExW(crate::util::wide("xgameruntime.dll").as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32);
         if h.is_null() {
-            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XTaskQueue/XAsync and the other APIs XCL does not implement are unavailable");
+            crate::xlog_warn!("XGameRuntime: no System32\\xgameruntime.dll (Gaming Services) – XCL's own XTaskQueue/XAsync are used; dialogs, text entry, game invites, game streaming and the other APIs XCL does not implement are unavailable");
             return None;
         }
         let f = |n: &str| GetProcAddress(h, format!("{n}\0").as_ptr()).map(|p| p as usize);
@@ -267,7 +269,7 @@ pub unsafe extern "system" fn QueryApiImpl(clsid: *const Guid, iid: *const Guid,
     }
     *out = std::ptr::null_mut();
     let (c, i) = (*clsid, *iid);
-    if let Some((_, name)) = REFUSED.iter().find(|r| r.0 == c) {
+    if let Some((_, name)) = REFUSED.iter().find(|r| r.0 == c && !(r.0 == XSTORE && super::store::offline_error())) {
         note(c, i, format!("{name}: unavailable (offline)"));
         return REGDB_E_CLASSNOTREG;
     }
@@ -372,6 +374,8 @@ unsafe extern "system" fn query_interface(this: *const Obj, iid: *const Guid, ou
         return S_OK;
     }
     *out = std::ptr::null_mut();
+    // a title asserting on this (a newer interface version of the class?) ends without a trace otherwise
+    crate::xlog_warn!("XGameRuntime: {} QueryInterface({}) refused (E_NOINTERFACE) – an interface version XCL's GDK table does not know?", f.name, *iid);
     E_NOINTERFACE
 }
 
@@ -419,7 +423,32 @@ unsafe fn forward(this: *const Obj, slot: usize, a: [usize; 9]) -> usize {
 /// Slot `slot` of an XCL object: its API function with the caller's arguments after `this`.
 unsafe fn call_target(this: *const Obj, slot: usize, a: [usize; 9]) -> usize {
     let f: unsafe extern "system" fn(usize, usize, usize, usize, usize, usize, usize, usize, usize) -> usize = std::mem::transmute((*this).targets[slot]);
-    f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8])
+    let ret = f(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8]);
+    if trace_calls() {
+        trace_call(&(*this).iface, slot, ret);
+    }
+    ret
+}
+
+/// `XCL_TRACE_RUNTIME=1`: the first 8 calls of each XGameRuntime function XCL answers, then every
+/// 1000th, with the raw return value.
+fn trace_calls() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_TRACE_RUNTIME").is_ok_and(|v| v != "0"))
+}
+
+fn trace_call(f: &Iface, slot: usize, ret: usize) {
+    static CALLS: Mutex<BTreeMap<(&'static str, usize), u64>> = Mutex::new(BTreeMap::new());
+    let n = {
+        let mut calls = CALLS.lock().unwrap();
+        let n = calls.entry((f.name, slot)).or_insert(0);
+        *n += 1;
+        *n
+    };
+    if n <= 8 || n % 1000 == 0 {
+        let name = f.names.get(slot).copied().flatten().unwrap_or(f.name);
+        crate::xlog_info!("XGameRuntime call #{n}: {name} (slot {slot}) → {ret:#x}");
+    }
 }
 
 macro_rules! per_slot {
@@ -508,7 +537,7 @@ fn layout(c: Class) -> Vec<Iface> {
 }
 
 fn classes() -> Vec<Class> {
-    vec![
+    let mut v = vec![
             Class { name: "XUser", clsid: XUSER, impls: xuser(), forward: &[] },
             Class { name: "XUser (devices)", clsid: XUSER_DEVICE, impls: xuser_devices(), forward: &[] },
             Class { name: "XGameSave", clsid: XGAMESAVE, impls: xgamesave(), forward: &[] },
@@ -524,6 +553,7 @@ fn classes() -> Vec<Class> {
                 impls: vec![("XLaunchUri", launch_uri as usize), ("XDisplayAcquireTimeoutDeferral", display_deferral as usize), ("XDisplayCloseTimeoutDeferralHandle", nothing as usize)],
                 forward: &[],
             },
+            Class { name: "XDisplay (HDR)", clsid: XDISPLAY_HDR, impls: vec![("XDisplayTryEnableHdrMode", hdr_mode as usize)], forward: &[] },
             // telemetry: offline, accepted and dropped
             Class { name: "XGameEvent", clsid: XGAMEEVENT, impls: vec![("XGameEventWrite", ok as usize)], forward: &[] },
             Class { name: "XNetworking", clsid: XNETWORKING, impls: xnetworking(), forward: &[] },
@@ -551,7 +581,11 @@ fn classes() -> Vec<Class> {
                     "XGameUiSetNotificationPositionHint",
                 ],
             },
-    ]
+    ];
+    if super::store::offline_error() {
+        v.push(Class { name: "XStore", clsid: XSTORE, impls: super::store::functions(), forward: &[] });
+    }
+    v
 }
 
 /// Build an explicit legacy console interface vtable from `(slot, function_name)` rows.
@@ -990,6 +1024,15 @@ unsafe extern "system" fn display_deferral(out: *mut usize) -> HRESULT {
     }
     *out = 1;
     S_OK
+}
+
+/// XDisplayTryEnableHdrMode(preference, info*) → XDisplayHdrModeResult: Disabled (2), as XCL
+/// presents SDR, so the title renders SDR.
+unsafe extern "system" fn hdr_mode(_preference: u32, info: *mut [f32; 3]) -> u32 {
+    if !info.is_null() {
+        *info = [0.0; 3];
+    }
+    2
 }
 
 static PICTURE_ID: u8 = 0;
@@ -1665,28 +1708,49 @@ mod tests {
         let max_slot = table().map(|r| r.3).max().unwrap_or(0);
         assert!(max_slot < SLOTS, "SLOTS={SLOTS} truncates slot {max_slot}");
 
+        // A slot is compared with the function the main vtable binds to the same name, not with
+        // `f as usize`: a function has no single address (`std::ptr::fn_addr_eq`), and the
+        // windows-gnu build has two copies of `register_token4`, one in each codegen unit.
+        let bound = |o: &Obj, slot: usize, name: &str| {
+            assert_eq!(o.iface.names[slot], Some(name), "{} slot {slot}", o.iface.name);
+            assert_ne!(o.targets[slot], 0, "{} slot {slot} ({name}) has no function", o.iface.name);
+            o.targets[slot]
+        };
+        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
+        let main_fn = |name: &str| bound(pm, slot_in_table(name).2, name);
+
         // XPackage v1 (be3f3e9f): XPackageEnumeratePackages is at slot 28.
         let p1 = own(&XPACKAGE, &XPACKAGE_V1_IID).expect("XPackage v1");
         assert!(!p1.iface.main);
-        assert_eq!(p1.targets[28], enumerate_packages as usize);
+        assert_eq!(bound(p1, 28, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
 
         // XPackage v2 (f92d8712): EnumeratePackages @ 35, RegisterPackageInstalled @ 36.
         let p2 = own(&XPACKAGE, &XPACKAGE_V2_IID).expect("XPackage v2");
         assert!(!p2.iface.main);
-        assert_eq!(p2.targets[35], enumerate_packages as usize);
-        assert_eq!(p2.targets[36], register_token4 as usize);
+        assert_eq!(bound(p2, 35, "XPackageEnumeratePackages"), main_fn("XPackageEnumeratePackages"));
+        assert_eq!(bound(p2, 36, "XPackageRegisterPackageInstalled"), main_fn("XPackageRegisterPackageInstalled"));
+
+        // ... and through the vtable, as a title calls it: v2's slot 36 hands out a new token
+        // each time (register_token4); v1 has nothing at slot 36.
+        let register = |o: &Obj, token: *mut u64| unsafe {
+            slot::<Fwd>(o as *const Obj as *mut c_void, 36)(o, 0, 0, 0, token as usize, 0, 0, 0, 0, 0) as u32 as HRESULT
+        };
+        let (mut t1, mut t2) = (0u64, 0u64);
+        assert_eq!(register(p2, &mut t1), S_OK);
+        assert_eq!(register(p2, &mut t2), S_OK);
+        assert!(t1 != 0 && t2 > t1, "tokens {t1}, {t2}");
+        assert_eq!(register(p2, std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(register(p1, &mut t1), E_NOTIMPL);
 
         // XPackage main: XPackageGetIdentifier at slot 27.
-        let pm = own(&XPACKAGE, &XPACKAGE).expect("XPackage main");
-        assert_eq!(pm.targets[27], XPackageGetIdentifier as usize);
+        bound(pm, 27, "XPackageGetIdentifier");
 
         // XSystem v3 (6fd71f09): XSystemGetAppSpecificDeviceId is at slot 4 (not SandboxId).
         let s3 = own(&XSYSTEM, &XSYSTEM_V3_IID).expect("XSystem v3");
         assert!(!s3.iface.main);
-        assert_eq!(s3.targets[4], XSystemGetAppSpecificDeviceId as usize);
         let sm = own(&XSYSTEM, &XSYSTEM).expect("XSystem main");
-        assert_eq!(sm.targets[4], XSystemGetXboxLiveSandboxId as usize);
-        assert_eq!(sm.targets[5], XSystemGetAppSpecificDeviceId as usize);
+        bound(sm, 4, "XSystemGetXboxLiveSandboxId");
+        assert_eq!(bound(s3, 4, "XSystemGetAppSpecificDeviceId"), bound(sm, 5, "XSystemGetAppSpecificDeviceId"));
 
         // Compatible alias IIDs resolve cleanly to their main vtables.
         assert!(own(&XUSER, &XUSER_V2_IID).unwrap().iface.iids.contains(&XUSER_V2_IID));
@@ -1747,6 +1811,59 @@ mod tests {
             assert_ne!(super::XUserGetTokenAndSignatureResultSize(&mut bt, &mut n), S_OK);
             XUserCloseHandle(user);
         }
+    }
+
+    /// With `XCL_NETWORK=0` the title hears one story through the interfaces it queries: the
+    /// network is initialized with no connectivity, the local user is still signed in, and a
+    /// token request fails at once with E_GAMEUSER_FAILED_TO_GET_TOKEN (even with
+    /// `xbox_live_tokens`) and has no result.
+    #[test]
+    fn without_a_network_hint_user_and_tokens_agree() {
+        let _g = crate::hle::xgameruntime::xasync::ASYNC_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::hle::netoff::OFFLINE_HERE.with(|o| o.set(Some(true)));
+        super::TOKENS_HERE.with(|t| t.set(Some(true)));
+        unsafe {
+            let (hr, net) = query(XNETWORKING, XNETWORKING);
+            assert_eq!(hr, S_OK);
+            let get_hint: unsafe extern "system" fn(*mut c_void, *mut networking::XNetworkingConnectivityHint) -> HRESULT = slot(net, 15);
+            let mut hint: networking::XNetworkingConnectivityHint = std::mem::zeroed();
+            assert_eq!(get_hint(net, &mut hint), S_OK);
+            assert_eq!(hint, networking::OFFLINE_HINT);
+
+            let (hr, u) = query(XUSER, XUSER);
+            assert_eq!(hr, S_OK);
+            let mut b: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(XUserAddAsync(1, &mut b), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut b, true), S_OK);
+            let mut user = std::ptr::null_mut();
+            assert_eq!(XUserAddResult(&mut b, &mut user), S_OK);
+            let get_state: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut u32) -> HRESULT = slot(u, 14);
+            let mut state = u32::MAX;
+            assert_eq!(get_state(u, user, &mut state), S_OK);
+            assert_eq!(state, 0, "XUserState::SignedIn");
+
+            let tok_async: unsafe extern "system" fn(
+                *mut c_void, *mut c_void, u32, *const u8, *const u8, usize, *const c_void, usize, *const c_void, *mut XAsyncBlock,
+            ) -> HRESULT = slot(u, 23);
+            let tok_size: unsafe extern "system" fn(*mut c_void, *mut XAsyncBlock, *mut usize) -> HRESULT = slot(u, 24);
+            let tok16_async: unsafe extern "system" fn(
+                *mut c_void, *mut c_void, u32, *const u16, *const u16, usize, *const c_void, usize, *const c_void, *mut XAsyncBlock,
+            ) -> HRESULT = slot(u, 26);
+            let url = b"https://auth.example.invalid/ticket\0";
+            let mut bt: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(tok_async(u, user, 0, b"POST\0".as_ptr(), url.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null(), &mut bt), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut bt, true), super::E_GAMEUSER_FAILED_TO_GET_TOKEN);
+            let mut n = 0usize;
+            assert_ne!(tok_size(u, &mut bt, &mut n), S_OK);
+
+            let (method16, url16) = (crate::util::wide("POST"), crate::util::wide("https://auth.example.invalid/ticket"));
+            let mut bt16: XAsyncBlock = std::mem::zeroed();
+            assert_eq!(tok16_async(u, user, 0, method16.as_ptr(), url16.as_ptr(), 0, std::ptr::null(), 0, std::ptr::null(), &mut bt16), S_OK);
+            assert_eq!(XAsyncGetStatus(&mut bt16, true), super::E_GAMEUSER_FAILED_TO_GET_TOKEN);
+            XUserCloseHandle(user);
+        }
+        super::TOKENS_HERE.with(|t| t.set(None));
+        crate::hle::netoff::OFFLINE_HERE.with(|o| o.set(None));
     }
 
     #[test]

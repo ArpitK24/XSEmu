@@ -1,9 +1,12 @@
 //! In-process HLSL → DXIL compilation with DXC.
 //!
 //! `dxcompiler.dll` is not part of Windows, so it is loaded at run time from
-//! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the newest Windows SDK
+//! `%XCL_DXC_DIR%`, the folder of xcl.exe, or the Windows SDK with the newest DXC
 //! (`Windows Kits\10\bin\<ver>\x64`). `dxil.dll` from the same folder is loaded first so
 //! the compiler can sign the DXIL (unsigned DXIL is rejected by D3D12).
+//!
+//! Which DXC it is matters ([`Toolchain::outdated`]), so the one that was loaded is logged and
+//! kept for `report.json` ([`toolchain`]).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -17,6 +20,59 @@ use windows::Win32::Graphics::Direct3D::Dxc::{DxcBuffer, IDxcBlob, IDxcCompiler3
 
 type CreateInstance = unsafe extern "system" fn(*const GUID, *const GUID, *mut *mut c_void) -> HRESULT;
 
+/// A dotted version, `10.0.26100.0` or `1.9.2602.17`, as four numbers (missing ones are 0).
+fn parse_version(s: &str) -> Option<[u32; 4]> {
+    let mut v = [0u32; 4];
+    let mut parts = s.split('.');
+    for x in v.iter_mut() {
+        match parts.next() {
+            Some(p) => *x = p.parse().ok()?,
+            None => break,
+        }
+    }
+    parts.next().is_none().then_some(v)
+}
+
+/// The version resource of a file.
+fn file_version(path: &Path) -> Option<[u32; 4]> {
+    use windows_sys::Win32::Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO};
+    let name = crate::util::wide(&path.to_string_lossy());
+    unsafe {
+        let n = GetFileVersionInfoSizeW(name.as_ptr(), std::ptr::null_mut());
+        if n == 0 {
+            return None;
+        }
+        let mut data = vec![0u8; n as usize];
+        if GetFileVersionInfoW(name.as_ptr(), 0, n, data.as_mut_ptr() as *mut c_void) == 0 {
+            return None;
+        }
+        let (mut p, mut len) = (std::ptr::null_mut::<c_void>(), 0u32);
+        if VerQueryValueW(data.as_ptr() as *const c_void, crate::util::wide("\\").as_ptr(), &mut p, &mut len) == 0 || (len as usize) < std::mem::size_of::<VS_FIXEDFILEINFO>() {
+            return None;
+        }
+        let f = std::ptr::read_unaligned(p as *const VS_FIXEDFILEINFO);
+        Some([f.dwFileVersionMS >> 16, f.dwFileVersionMS & 0xFFFF, f.dwFileVersionLS >> 16, f.dwFileVersionLS & 0xFFFF])
+    }
+}
+
+/// The DXC release a `dxcompiler.dll` with this version resource is, for comparing folders:
+/// `1.7.2308.16` is itself; the old SDKs' compilers carry the number of their Windows build
+/// (`10.0.19041.x`, DXC 1.5 and before), so those, and files that say nothing, come last.
+fn dxc_release(file: Option<[u32; 4]>) -> [u32; 4] {
+    match file {
+        Some(v) if v[0] < 10 => v,
+        _ => [0; 4],
+    }
+}
+
+/// Windows SDK folders (name, version resource of the `dxcompiler.dll` in its `x64`), the one
+/// to try first in front: the newest DXC, and between equal ones the newest SDK. The names are
+/// compared as versions (`10.0.100000.0` is newer than `10.0.26100.0`), other names last.
+fn order_sdk_folders(mut v: Vec<(String, Option<[u32; 4]>)>) -> Vec<String> {
+    v.sort_by(|a, b| (dxc_release(b.1), parse_version(&b.0), &b.0).cmp(&(dxc_release(a.1), parse_version(&a.0), &a.0)));
+    v.into_iter().map(|(name, _)| name).collect()
+}
+
 fn candidates() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Some(d) = std::env::var_os("XCL_DXC_DIR") {
@@ -27,17 +83,208 @@ fn candidates() -> Vec<PathBuf> {
     }
     for root in [r"C:\Program Files (x86)\Windows Kits\10\bin", r"C:\Program Files\Windows Kits\10\bin"] {
         if let Ok(rd) = std::fs::read_dir(root) {
-            let mut vers: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect();
-            vers.sort();
-            for ver in vers.into_iter().rev() {
-                v.push(ver.join("x64"));
+            let vers = rd.flatten().map(|e| e.path()).filter(|p| p.is_dir());
+            let vers = vers.map(|p| (p.file_name().unwrap_or_default().to_string_lossy().into_owned(), file_version(&p.join("x64").join("dxcompiler.dll"))));
+            for ver in order_sdk_folders(vers.collect()) {
+                v.push(Path::new(root).join(ver).join("x64"));
             }
         }
     }
     v
 }
 
+/// One of DXC's two libraries, as it identifies itself.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Library {
+    /// the file's version resource: `1.9.2602.17` is the GitHub release 1.9.2602. The Windows
+    /// SDK's `dxil.dll` says `101.7.2308.24`, and SDKs before 10.0.22000 the number of their
+    /// Windows build
+    pub file_version: String,
+    /// `IDxcVersionInfo::GetVersion`: the newest DXIL the library knows, which is not always
+    /// its release (1.8.2505 says 1.9). 0 and 0: the library did not say
+    pub major: u32,
+    pub minor: u32,
+    /// `IDxcVersionInfo2::GetCommitInfo`: the commit DXC was built from
+    pub commit: String,
+}
+
+impl Library {
+    /// The file's version when it is a DXC release number.
+    fn release(&self) -> Option<[u32; 4]> {
+        parse_version(&self.file_version).filter(|v| (1..10).contains(&v[0]))
+    }
+
+    /// The release, (1, 9) for 1.9.2602: from the file, else what the library said.
+    pub fn version(&self) -> Option<(u32, u32)> {
+        match self.release() {
+            Some(v) => Some((v[0], v[1])),
+            None => ((self.major, self.minor) != (0, 0)).then_some((self.major, self.minor)),
+        }
+    }
+}
+
+impl std::fmt::Display for Library {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.release(), self.version(), self.file_version.is_empty()) {
+            (Some(_), ..) => write!(f, "{}", self.file_version)?,
+            (None, Some((major, minor)), true) => write!(f, "{major}.{minor}")?,
+            (None, Some((major, minor)), false) => write!(f, "{major}.{minor} (file {})", self.file_version)?,
+            (None, None, false) => write!(f, "(file {})", self.file_version)?,
+            (None, None, true) => write!(f, "of unknown version")?,
+        }
+        if !self.commit.is_empty() {
+            write!(f, " ({})", self.commit)?;
+        }
+        Ok(())
+    }
+}
+
+/// The DXC this process compiles with (`dxc` in `report.json`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct Toolchain {
+    /// the folder the libraries came from; empty while DXC is not loaded
+    pub dir: String,
+    pub dxcompiler: Library,
+    /// the signer from the same folder; empty when the folder has none
+    pub dxil: Library,
+}
+
+/// The oldest DXC release XCL recommends (see [`Toolchain::outdated`]).
+pub const RECOMMENDED: (u32, u32) = (1, 8);
+
+impl Toolchain {
+    /// Whether the compiler is older than [`RECOMMENDED`]. Measured with 1.7.2308 (what Windows
+    /// SDK 10.0.26100.4654 installs; other revisions of that SDK have 1.8.2502) against
+    /// 1.9.2602 on an RTX 5070 Ti, synthetic translated compute programs (issue #156): DXIL
+    /// 2.1–2.7 times the size, pipeline creation in the driver 1.4–2.2 times as long. 1.7 also
+    /// rejects `[WaveSize]` on the entries of a library, which 1.8 accepts; the sizes of 1.8's
+    /// DXIL were not measured.
+    pub fn outdated(&self) -> bool {
+        self.dxcompiler.version().is_some_and(|v| v < RECOMMENDED)
+    }
+}
+
+/// Why an outdated DXC is worth replacing, and how.
+pub const OUTDATED_COST: &str = "DXC 1.7 made DXIL 2–2.7 times the size of DXC 1.9's from translated compute programs, and an NVIDIA driver took 1.4–2.2 times as long to build pipelines from it";
+pub const OUTDATED_FIX: &str = r"download DXC 1.8 or newer from github.com/microsoft/DirectXShaderCompiler/releases and set XCL_DXC_DIR to its bin\x64 folder";
+
+/// Ask a DXC library for its version. Nothing here fails the load: what the library does not
+/// answer stays empty.
+unsafe fn library(create: CreateInstance, class: &GUID, file: &Path) -> Library {
+    use windows::Win32::Graphics::Direct3D::Dxc::{IDxcVersionInfo, IDxcVersionInfo2};
+    let mut lib = Library { file_version: file_version(file).map(|v| format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])).unwrap_or_default(), ..Default::default() };
+    let mut p = std::ptr::null_mut();
+    if create(class, &IDxcVersionInfo::IID, &mut p).is_err() || p.is_null() {
+        return lib;
+    }
+    let info = IDxcVersionInfo::from_raw(p);
+    let _ = info.GetVersion(&mut lib.major, &mut lib.minor);
+    if let Ok(info2) = info.cast::<IDxcVersionInfo2>() {
+        let (mut count, mut hash) = (0u32, std::ptr::null_mut::<i8>());
+        if info2.GetCommitInfo(&mut count, &mut hash).is_ok() && !hash.is_null() {
+            lib.commit = std::ffi::CStr::from_ptr(hash).to_string_lossy().into_owned();
+            windows::Win32::System::Com::CoTaskMemFree(Some(hash as *const c_void));
+        }
+    }
+    lib
+}
+
 static LIB: OnceLock<Result<(PathBuf, usize), String>> = OnceLock::new();
+static TOOLCHAIN: OnceLock<Toolchain> = OnceLock::new();
+
+/// The DXC in use; empty while none is loaded (asking does not load it).
+pub fn toolchain() -> Toolchain {
+    TOOLCHAIN.get().cloned().unwrap_or_default()
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    #[test]
+    fn versions_parse_and_compare_as_numbers() {
+        assert_eq!(parse_version("10.0.26100.0"), Some([10, 0, 26100, 0]));
+        assert_eq!(parse_version("1.9.2602.17"), Some([1, 9, 2602, 17]));
+        assert_eq!(parse_version("1.8"), Some([1, 8, 0, 0]));
+        for bad in ["", "x64", "1.8.", "1.x", "1.2.3.4.5", "-1.0"] {
+            assert_eq!(parse_version(bad), None, "{bad:?}");
+        }
+        assert!(parse_version("10.0.100000.0") > parse_version("10.0.26100.0"));
+        assert!(parse_version("1.10") > parse_version("1.9.2602.17"));
+    }
+
+    #[test]
+    fn the_sdk_with_the_newest_dxc_is_tried_first() {
+        let sdk = |name: &str, dxc: Option<[u32; 4]>| (name.to_string(), dxc);
+        let order = order_sdk_folders(vec![
+            sdk("arm64", None),
+            sdk("10.0.19041.0", Some([10, 0, 19041, 5609])), // DXC 1.5 under Windows' own number
+            sdk("10.0.22621.0", Some([1, 6, 2112, 16])),
+            sdk("10.0.26100.0", Some([1, 7, 2308, 16])),
+            sdk("10.0.100000.0", Some([1, 7, 2308, 16])), // sorts below 10.0.2… as a name
+            sdk("10.0.22000.0", Some([1, 8, 2505, 32])), // a newer DXC copied into an older SDK
+            sdk("10.0.17134.0", None),
+            sdk("x64", None),
+        ]);
+        assert_eq!(order, ["10.0.22000.0", "10.0.100000.0", "10.0.26100.0", "10.0.22621.0", "10.0.19041.0", "10.0.17134.0", "x64", "arm64"]);
+    }
+
+    #[test]
+    fn dxc_below_1_8_is_outdated() {
+        let lib = |major, minor, file: &str| Library { major, minor, file_version: file.into(), commit: String::new() };
+        let outdated = |l: Library| Toolchain { dir: r"C:\dxc".into(), dxcompiler: l, dxil: Library::default() }.outdated();
+        // the four compilers of the note in the pull request, as they answer
+        assert!(outdated(lib(1, 7, "1.7.2308.16")));
+        assert!(outdated(lib(1, 5, "10.0.19041.5609")));
+        assert!(!outdated(lib(1, 9, "1.8.2505.32")), "the release counts, not the DXIL version it knows");
+        assert!(!outdated(lib(1, 9, "1.9.2602.17")));
+        assert!(outdated(lib(1, 9, "1.7.2308.16")));
+        // a file that says nothing of the release: what the library says; neither: no verdict
+        assert!(outdated(lib(1, 6, "")));
+        assert!(!outdated(lib(1, 10, "")));
+        assert!(!outdated(lib(2, 0, "101.0.1.2")));
+        assert!(outdated(lib(0, 0, "1.6.2112.16")));
+        assert!(!outdated(lib(0, 0, "10.0.19041.5609")));
+        assert!(!outdated(lib(0, 0, "")));
+        assert!(!Toolchain::default().outdated());
+
+        assert_eq!(lib(1, 9, "1.8.2505.32").to_string(), "1.8.2505.32");
+        assert_eq!(lib(1, 5, "10.0.19041.5609").to_string(), "1.5 (file 10.0.19041.5609)");
+        assert_eq!(lib(1, 7, "101.7.2308.24").to_string(), "1.7 (file 101.7.2308.24)");
+        assert_eq!(Library { commit: "21d28f72".into(), ..lib(1, 9, "1.9.2602.17") }.to_string(), "1.9.2602.17 (21d28f72)");
+        assert_eq!(lib(1, 9, "").to_string(), "1.9");
+        assert_eq!(lib(0, 0, "10.0.1.2").to_string(), "(file 10.0.1.2)");
+    }
+
+    /// The DXC of this PC, when it has one: what `report.json` says of it.
+    #[test]
+    fn the_loaded_dxc_is_identified() {
+        let Ok(dir) = location() else {
+            crate::gpu::recomp::runner::skip_test("no DXC");
+            return;
+        };
+        let t = toolchain();
+        assert_eq!(Path::new(&t.dir), dir);
+        let major = t.dxcompiler.major;
+        assert!(major >= 1, "IDxcVersionInfo of dxcompiler.dll: {t:?}");
+        assert!(!t.dxcompiler.file_version.is_empty(), "{t:?}");
+        assert_eq!(Some(t.outdated()), t.dxcompiler.version().map(|v| v < RECOMMENDED));
+        if dir.join("dxil.dll").is_file() {
+            assert!(t.dxil.version().is_some(), "{t:?}");
+        }
+        // as the `dxc` of a report, and a report from before the field reads as "not loaded"
+        let report = crate::report::Report { dxc: t.clone(), ..Default::default() };
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["dxc"]["dir"], t.dir);
+        assert_eq!(json["dxc"]["dxcompiler"]["major"], major);
+        let mut old = json.clone();
+        old.as_object_mut().unwrap().remove("dxc");
+        assert_eq!(serde_json::from_value::<crate::report::Report>(old).unwrap().dxc, Toolchain::default());
+        println!("DXC: dxcompiler {}, dxil {}, from {}", t.dxcompiler, t.dxil, t.dir);
+    }
+}
 
 /// Folder with dxcompiler.dll (+ dxil.dll) that will be used.
 pub fn location() -> Result<&'static Path, String> {
@@ -45,7 +292,7 @@ pub fn location() -> Result<&'static Path, String> {
 }
 
 fn load() -> Result<&'static (PathBuf, usize), String> {
-    LIB.get_or_init(|| {
+    LIB.get_or_init(|| crate::vfs_hooks::with_host_io(|| {
         use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
         for dir in candidates() {
             let dxc = dir.join("dxcompiler.dll");
@@ -54,20 +301,29 @@ fn load() -> Result<&'static (PathBuf, usize), String> {
             }
             unsafe {
                 let dxil = dir.join("dxil.dll");
-                if dxil.is_file() {
-                    LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr());
-                }
+                let signer = if dxil.is_file() { LoadLibraryW(crate::util::wide(&dxil.to_string_lossy()).as_ptr()) } else { std::ptr::null_mut() };
                 let h = LoadLibraryW(crate::util::wide(&dxc.to_string_lossy()).as_ptr());
                 if h.is_null() {
                     continue;
                 }
                 if let Some(f) = GetProcAddress(h, b"DxcCreateInstance\0".as_ptr()) {
+                    let mut t = Toolchain { dir: dir.display().to_string(), ..Default::default() };
+                    t.dxcompiler = library(std::mem::transmute::<usize, CreateInstance>(f as usize), &CLSID_DxcCompiler, &dxc);
+                    if let Some(g) = if signer.is_null() { None } else { GetProcAddress(signer, b"DxcCreateInstance\0".as_ptr()) } {
+                        t.dxil = library(std::mem::transmute::<usize, CreateInstance>(g as usize), &windows::Win32::Graphics::Direct3D::Dxc::CLSID_DxcValidator, &dxil);
+                    }
+                    let signer = if signer.is_null() { "no dxil.dll".to_string() } else { format!("dxil {}", t.dxil) };
+                    crate::xlog_info!("DXC: dxcompiler {}, {signer}, from {}", t.dxcompiler, t.dir);
+                    if t.outdated() {
+                        crate::xlog_warn!("DXC {} is older than {}.{}: {OUTDATED_COST}; {OUTDATED_FIX}", t.dxcompiler, RECOMMENDED.0, RECOMMENDED.1);
+                    }
+                    let _ = TOOLCHAIN.set(t);
                     return Ok((dir, f as usize));
                 }
             }
         }
         Err("dxcompiler.dll not found (set XCL_DXC_DIR or install the Windows SDK)".into())
-    })
+    }))
     .as_ref()
     .map_err(|e| e.clone())
 }
@@ -113,21 +369,91 @@ struct Job {
     entry: String,
     profile: String,
     extra: Vec<String>,
+    /// what the caller calls the program (`for_program`), for the log
+    program: Option<String>,
+    /// DXC whatever the backend is (`compile_dxc_only`)
+    dxc_only: bool,
     reply: std::sync::mpsc::Sender<Result<Vec<u8>, String>>,
 }
 
-/// Compile threads (DXC workers, and the PSO workers of `pso_async` that feed them): every core
-/// but one, `XCL_DXC_THREADS` to choose. Memory is what `wait_for_memory` watches: a retail
-/// pack's biggest translations take ~0.7 GB in DXC (a typical one 0.1–0.3 GB). The cap used
-/// to be 6, which left most of a 16-thread CPU idle while a title with ~24 000 shaders
-/// compiled for half an hour. (Normal priority: a title thread can wait for a pipeline –
-/// `resolve_wait`, a compute pipeline's first bind – and must not wait behind its own threads.)
+thread_local! {
+    static PROGRAM: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with `label` (a console program's hash) naming every shader this thread has compiled
+/// in it: the direct backend's fallback lines carry it, so a log says which program DXC got.
+pub fn for_program<R>(label: &str, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            PROGRAM.with(|p| *p.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(PROGRAM.with(|p| p.replace(Some(label.to_string()))));
+    f()
+}
+
 pub fn compile_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(cores.saturating_sub(1)).clamp(1, 64)
+        let requested = std::env::var("XCL_DXC_THREADS").ok().and_then(|v| v.parse().ok());
+        let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        let available = (unsafe { GlobalMemoryStatusEx(&mut m) } != 0).then_some((m.ullAvailPhys, m.ullAvailPageFile));
+        compile_thread_limit(cores, requested, available, RESERVE_GB.load(std::sync::atomic::Ordering::Relaxed))
     })
+}
+
+fn compile_thread_limit(cores: usize, requested: Option<usize>, available: Option<(u64, u64)>, reserve_gb: u64) -> usize {
+    if let Some(n) = requested {
+        return n.clamp(1, 64);
+    }
+    let memory_limit = available.map_or(1, |(physical, commit)| {
+        (physical.min(commit).saturating_sub(reserve_gb.saturating_mul(1 << 30)) >> 30).clamp(1, 64) as usize
+    });
+    cores.saturating_sub(1).clamp(1, 64).min(memory_limit)
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::compile_thread_limit;
+
+    #[test]
+    fn default_workers_fit_physical_memory_and_commit() {
+        for (physical, commit, want) in [(20, 40, 14), (12, 40, 6), (8, 40, 2), (40, 8, 2), (6, 40, 1), (0, 0, 1)] {
+            assert_eq!(compile_thread_limit(32, None, Some((physical << 30, commit << 30)), 6), want);
+        }
+        assert_eq!(compile_thread_limit(32, None, Some(((8 << 30) - 1, 40 << 30)), 6), 1);
+        assert_eq!(compile_thread_limit(32, None, Some((20 << 30, 40 << 30)), 2), 18);
+    }
+
+    #[test]
+    fn default_workers_leave_a_cpu_free_and_handle_missing_memory() {
+        let plenty = Some((128 << 30, 128 << 30));
+        assert_eq!(compile_thread_limit(16, None, plenty, 6), 15);
+        assert_eq!(compile_thread_limit(1, None, plenty, 6), 1);
+        assert_eq!(compile_thread_limit(128, None, plenty, 6), 64);
+        assert_eq!(compile_thread_limit(32, None, None, 6), 1);
+    }
+
+    #[test]
+    fn explicit_workers_keep_the_existing_override_and_bounds() {
+        for (requested, want) in [(0, 1), (4, 4), (64, 64), (128, 64)] {
+            assert_eq!(compile_thread_limit(1, Some(requested), Some((0, 0)), 6), want);
+            assert_eq!(compile_thread_limit(1, Some(requested), None, 6), want);
+        }
+    }
+}
+
+/// GB of commit `wait_for_memory` keeps free besides the compiles: 6 for a running title (its
+/// own allocations), less without one (`set_memory_reserve`: `xcl shaders --precompile`).
+static RESERVE_GB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(6);
+
+/// The commit `wait_for_memory` keeps free besides the compiles (no title running: less).
+pub fn set_memory_reserve(gb: u64) {
+    RESERVE_GB.store(gb, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Compiles running on the DXC workers (`wait_for_memory` lets them in).
@@ -154,13 +480,19 @@ pub fn wait_for_memory() -> MemorySlot {
     loop {
         let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        let need = (6u64 << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
+        let need = (RESERVE_GB.load(Ordering::Relaxed) << 30) + ((WORKING.load(Ordering::Acquire) as u64) << 30);
         let plenty = unsafe { GlobalMemoryStatusEx(&mut m) } == 0 || m.ullAvailPageFile >= need;
         if plenty || start.elapsed().as_secs() >= 60 {
+            if start.elapsed().as_secs() >= 2 {
+                crate::xlog_info!("DXC: a compile waited {:.1} s for memory ({} MB of page file left)", start.elapsed().as_secs_f32(), m.ullAvailPageFile >> 20);
+            }
             WORKING.fetch_add(1, Ordering::AcqRel);
             return MemorySlot;
         }
         if WORKING.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            if start.elapsed().as_secs() >= 2 {
+                crate::xlog_info!("DXC: a compile waited {:.1} s for memory, then ran alone ({} MB of page file left)", start.elapsed().as_secs_f32(), m.ullAvailPageFile >> 20);
+            }
             return MemorySlot;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -169,47 +501,230 @@ pub fn wait_for_memory() -> MemorySlot {
 
 /// DXC workers (`compile_threads`, each with its own compiler and a `DXC_STACK` stack), started
 /// on first use; callers wait for their job.
-fn pool() -> &'static std::sync::Mutex<std::sync::mpsc::Sender<Job>> {
-    static POOL: OnceLock<std::sync::Mutex<std::sync::mpsc::Sender<Job>>> = OnceLock::new();
-    POOL.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::channel::<Job>();
-        let rx = std::sync::Arc::new(std::sync::Mutex::new(rx));
+/// The compile threads' work: a title thread's compile (it waits in its own call, a pipeline it
+/// creates now) goes before the background preparation of pipelines for later
+/// (`pso_async::preparing`) – in one queue, thousands of those held the title's few behind them
+/// and its loading stood still while a cold cache recompiled.
+struct Queue {
+    title: std::collections::VecDeque<Job>,
+    background: std::collections::VecDeque<Job>,
+}
+
+static QUEUE: std::sync::Mutex<Queue> = std::sync::Mutex::new(Queue { title: std::collections::VecDeque::new(), background: std::collections::VecDeque::new() });
+static QUEUED: std::sync::Condvar = std::sync::Condvar::new();
+
+fn next_job() -> Job {
+    let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    loop {
+        if let Some(j) = q.title.pop_front().or_else(|| q.background.pop_front()) {
+            return j;
+        }
+        q = QUEUED.wait(q).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+fn pool() -> bool {
+    static POOL: OnceLock<bool> = OnceLock::new();
+    *POOL.get_or_init(|| {
+        let mut started = false;
         for k in 0..compile_threads() {
-            let rx = rx.clone();
-            let _ = std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
-                let job = match rx.lock().unwrap().recv() {
-                    Ok(j) => j,
-                    Err(_) => return,
-                };
+            started |= std::thread::Builder::new().name(format!("xcl-dxc-{k}")).stack_size(DXC_STACK).spawn(move || loop {
+                let job = next_job();
                 let _slot = wait_for_memory();
                 let extra: Vec<&str> = job.extra.iter().map(|s| s.as_str()).collect();
-                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra)))
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| compile_here(&job.src, &job.entry, &job.profile, &extra, job.program.as_deref(), job.dxc_only)))
                     .unwrap_or_else(|_| Err("DXC: panic in the compile thread".into()));
                 let _ = job.reply.send(r);
-            });
+            }).is_ok();
         }
-        std::sync::Mutex::new(tx)
+        started
     })
 }
 
 /// Compile HLSL to signed DXIL. `profile` e.g. "cs_6_6"; `extra` are dxc arguments.
 pub fn compile(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+    submit(src, entry, profile, extra, false)
+}
+
+static DXC_RETRIES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Compile with DXC whatever `XCL_SHADER_BACKEND` says, and put the result in the DXIL cache in
+/// place of the direct backend's container: for a program whose container the driver refused,
+/// so the retry and every later run get DXC's. Logged and counted (`stage_summary`). Caches
+/// that keep DXIL elsewhere (in memory, by program) are the caller's to refresh.
+pub fn compile_dxc_only(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>, String> {
+    let n = DXC_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+    let program = PROGRAM.with(|p| p.borrow().clone()).map_or(String::new(), |p| format!(" of {p}"));
+    crate::xlog_warn!("[SHADER] DXC recompiles a {profile} program{program} in place of the direct DXIL backend's container ({} B HLSL; {n} so far)", src.len());
+    let dxil = submit(src, entry, profile, &[], true)?;
+    let dir = normalized_cache_dir(&cache_dir());
+    let file = dir.join(format!("{:016x}.dxil", cache_key(src, entry, profile)));
+    let _process_guard = process_cache_lock(&file)?;
+    if std::fs::create_dir_all(&dir).is_ok() {
+        let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+        // rename does not replace an existing file on Windows
+        let _ = std::fs::remove_file(&file);
+        if std::fs::write(&tmp, &dxil).is_ok() && std::fs::rename(&tmp, &file).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+    Ok(dxil)
+}
+
+fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool) -> Result<Vec<u8>, String> {
     let (reply, rx) = std::sync::mpsc::channel();
-    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), reply };
-    pool().lock().unwrap().send(job).map_err(|_| "DXC: no compile threads".to_string())?;
+    let program = PROGRAM.with(|p| p.borrow().clone());
+    let job = Job { src: src.into(), entry: entry.into(), profile: profile.into(), extra: extra.iter().map(|s| s.to_string()).collect(), program, dxc_only, reply };
+    if !pool() {
+        return Err("DXC: no compile threads".to_string());
+    }
+    {
+        let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::hle::d3d12x::pso_async::preparing() {
+            q.background.push_back(job);
+        } else {
+            q.title.push_back(job);
+        }
+    }
+    QUEUED.notify_one();
     rx.recv().map_err(|_| "DXC: the compile thread exited".to_string())?
 }
 
-fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
+/// `XCL_DXC_OPT=0|1|2|3`: the level of every compile that names none.
+fn opt_override() -> Option<&'static str> {
+    static O: OnceLock<Option<&'static str>> = OnceLock::new();
+    *O.get_or_init(|| match std::env::var("XCL_DXC_OPT").ok()?.trim() {
+        "0" => Some("-O0"),
+        "1" => Some("-O1"),
+        "2" => Some("-O2"),
+        "3" => Some("-O3"),
+        other => {
+            crate::xlog_warn!("XCL_DXC_OPT={other:?} is not 0, 1, 2 or 3: ignored");
+            None
+        }
+    })
+}
+
+/// The level DXC compiles at when the caller names none: `XCL_DXC_OPT`, else -O1 whatever the
+/// size (a retail game's 12.8 MB FSR program: 6.5 MB of DXIL at -O1 in 8 min and 2.2 GB; -O0
+/// makes about twice the DXIL, more than the driver can compile within memory).
+/// DXC's optimiser was superlinear on translated programs full of short-circuit `?:` / `&&` /
+/// `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3); with
+/// branch-free emission (select / and / or) it is fast: that shader 0.3 s, a 15 720-instruction
+/// one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not compile).
+/// -O1 against -O3 on 40 of a retail game's programs across their sizes: DXC 115.7 s
+/// against 116.5 s, the same DXIL (5416 KB against 5402 KB); -O0 70.6 s, but twice the DXIL.
+fn opt_level() -> &'static str {
+    opt_override().unwrap_or("-O1")
+}
+
+/// What chooses the level (`XCL_DXC_OPT`, or the default), for caches that keep DXIL by
+/// something other than its HLSL (`pso::translated`).
+pub fn opt_policy() -> &'static str {
+    opt_override().unwrap_or("default")
+}
+
+/// IEEE strictness: without it every float op in the DXIL is `fast`, and DXC reassociates the
+/// console's separately rounded adds and subs (`(b + c) - a` as `(b - a) + c`) wherever it
+/// can prove two lane selects share a condition. No measurable cost in DXC time.
+const STRICT: &str = "-Gis";
+
+/// No source locations in the IR: only DXC's late diagnostics use them, the DXIL's code is the
+/// same (its disassembly differs only in the shader hash), and DXC is 5 – 13% faster on big
+/// translated programs.
+const NO_LOC: &str = "-fdisable-loc-tracking";
+
+/// Which compiler turns translated HLSL into DXIL: `XCL_SHADER_BACKEND=hlsl` (the default) is DXC;
+/// `dxil` is the direct backend (`xcl_dxil`: linear time, no DXC), with DXC compiling what that
+/// backend does not support or fails on; `dxil-only` (tests) has no fallback, so a run shows
+/// what the direct backend alone does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    Dxc,
+    Direct,
+    DirectOnly,
+}
+
+fn backend() -> Backend {
+    static B: OnceLock<Backend> = OnceLock::new();
+    *B.get_or_init(|| match std::env::var("XCL_SHADER_BACKEND").unwrap_or_default().trim() {
+        "dxil" => Backend::Direct,
+        "dxil-only" => Backend::DirectOnly,
+        "" | "hlsl" => Backend::Dxc,
+        other => {
+            crate::xlog_warn!("XCL_SHADER_BACKEND={other:?} is not hlsl or dxil: using hlsl");
+            Backend::Dxc
+        }
+    })
+}
+
+static DIRECT: [std::sync::atomic::AtomicUsize; 3] = [const { std::sync::atomic::AtomicUsize::new(0) }; 3];
+
+/// Programs the direct DXIL backend compiled, left to DXC as unsupported, and left to DXC after
+/// an error or a panic, in this process.
+pub fn direct_counts() -> (usize, usize, usize) {
+    let n = |k: usize| DIRECT[k].load(Ordering::Relaxed);
+    (n(0), n(1), n(2))
+}
+
+/// The direct backend on one program: its container, or why DXC has to compile it (a panic in
+/// the backend is an error like any other). `XCL_DXIL_BACKEND_LOG=<file>`: one line per program
+/// (FNV-1a 64 of the source, profile, outcome, seconds, source bytes).
+fn compile_direct(src: &str, entry: &str, profile: &str) -> Result<Vec<u8>, String> {
+    let t0 = std::time::Instant::now();
+    let r = std::panic::catch_unwind(|| xcl_dxil::compile(src, entry, profile));
+    let secs = t0.elapsed().as_secs_f64();
+    let (slot, outcome) = match &r {
+        Ok(Ok(_)) => (0, "direct".to_string()),
+        Ok(Err(xcl_dxil::Error::Unsupported(what))) => (1, format!("unsupported: {what}")),
+        Ok(Err(e)) => (2, format!("error: {e}")),
+        Err(_) => (2, "error: panic in the backend".to_string()),
+    };
+    DIRECT[slot].fetch_add(1, Ordering::Relaxed);
+    if slot == 0 && std::env::var_os("XCL_DXIL_BACKEND_LOG").is_none() {
+        return r.ok().and_then(Result::ok).ok_or(outcome);
+    }
+    // what names the program here is its HLSL: the hash the fallback warning and the log carry
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for b in src.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    if let Some(log) = std::env::var_os("XCL_DXIL_BACKEND_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = f.write_all(format!("{h:016x}\t{profile}\t{}\t{secs:.4}\t{}\n", outcome.replace(['\n', '\t'], " "), src.len()).as_bytes());
+        }
+    }
+    match r {
+        Ok(Ok(dxil)) => Ok(dxil),
+        _ => Err(format!("{outcome} (HLSL {h:016x}, {} bytes)", src.len())),
+    }
+}
+
+fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str], program: Option<&str>, dxc_only: bool) -> Result<Vec<u8>, String> {
+    // DXC arguments (an optimisation level, a define) ask for DXC itself
+    if backend() != Backend::Dxc && extra.is_empty() && !dxc_only {
+        match compile_direct(src, entry, profile) {
+            Ok(dxil) => return Ok(dxil),
+            Err(why) if backend() == Backend::DirectOnly => return Err(format!("xcl-dxil: {why}")),
+            Err(why) => {
+                let (direct, unsupported, failed) = direct_counts();
+                let n = unsupported + failed;
+                // every fallback is logged: a warm-up's log is the proof of what the backend covers
+                let program = program.map_or(String::new(), |p| format!(" of {p}"));
+                crate::xlog_warn!("[SHADER] direct DXIL backend: {why}; DXC compiles this {profile} program{program} (fallback {n}: {unsupported} unsupported, {failed} failed; {direct} direct)");
+            }
+        }
+    }
+    compile_with_dxc(src, entry, profile, extra)
+}
+
+fn compile_with_dxc(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result<Vec<u8>, String> {
     let c = compiler()?;
-    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021"].iter().map(|a| crate::util::wide(a)).collect();
-    // DXC's optimiser was superlinear on translated programs full of short-circuit `?:` /
-    // `&&` / `if` per instruction (a 1589-instruction console CS: ~6 min and > 30 GB at -O3).
-    // With branch-free emission (select / and / or) it is fast: that shader 0.3 s, a
-    // 15 720-instruction one 6 s (585 KB DXIL vs 1.6 MB at -O0, which the driver could not
-    // compile). -O0 only as a safety net for enormous sources.
-    if src.len() > 8 * 1024 * 1024 && !extra.iter().any(|a| a.starts_with("-O")) {
-        args.push(crate::util::wide("-O0"));
+    let mut args: Vec<Vec<u16>> = ["-E", entry, "-T", profile, "-HV", "2021", STRICT, NO_LOC].iter().map(|a| crate::util::wide(a)).collect();
+    if !extra.iter().any(|a| a.starts_with("-O")) {
+        args.push(crate::util::wide(opt_level()));
     }
     args.extend(extra.iter().map(|a| crate::util::wide(a)));
     let ptrs: Vec<PCWSTR> = args.iter().map(|a| PCWSTR(a.as_ptr())).collect();
@@ -233,19 +748,26 @@ fn compile_here(src: &str, entry: &str, profile: &str, extra: &[&str]) -> Result
     }
 }
 
-fn toolchain_identity() -> &'static str {
+pub(super) fn toolchain_identity() -> &'static str {
     static IDENTITY: OnceLock<String> = OnceLock::new();
     IDENTITY.get_or_init(|| {
+        // DXIL of the direct backend and of DXC never share a cache entry, nor do two builds of
+        // the direct backend (its id is a hash of its sources)
+        let direct = if backend() == Backend::Dxc { String::new() } else { format!("xcl-dxil {}", xcl_dxil::BUILD_ID) };
         let Ok(dir) = location() else {
-            return "unavailable".into();
+            return format!("unavailable{direct}");
         };
         let mut h = 0xcbf2_9ce4_8422_2325u64;
+        for byte in direct.bytes() {
+            h ^= byte as u64;
+            h = h.wrapping_mul(0x100_0000_01b3);
+        }
         for name in ["dxcompiler.dll", "dxil.dll"] {
             for byte in name.bytes().chain([0]) {
                 h ^= byte as u64;
                 h = h.wrapping_mul(0x100_0000_01b3);
             }
-            let Ok(metadata) = std::fs::metadata(dir.join(name)) else {
+            let Ok(metadata) = crate::vfs_hooks::with_host_io(|| std::fs::metadata(dir.join(name))) else {
                 h ^= 0xff;
                 h = h.wrapping_mul(0x100_0000_01b3);
                 continue;
@@ -265,9 +787,9 @@ fn toolchain_identity() -> &'static str {
 }
 
 /// FNV-1a 64 of the inputs that determine the DXIL.
-fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &str) -> u64 {
+fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, opt: &str, toolchain: &str) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, src] {
+    for part in [env!("CARGO_PKG_VERSION"), toolchain, profile, entry, opt, STRICT, NO_LOC, src] {
         for b in part.bytes().chain([0u8]) {
             h ^= b as u64;
             h = h.wrapping_mul(0x100_0000_01b3);
@@ -277,7 +799,7 @@ fn cache_key_for_toolchain(src: &str, entry: &str, profile: &str, toolchain: &st
 }
 
 fn cache_key(src: &str, entry: &str, profile: &str) -> u64 {
-    cache_key_for_toolchain(src, entry, profile, toolchain_identity())
+    cache_key_for_toolchain(src, entry, profile, opt_level(), toolchain_identity())
 }
 
 /// Folder of the DXIL cache: `XCL_DXIL_CACHE`, else `%LOCALAPPDATA%\xcl\dxil`.
@@ -355,6 +877,46 @@ pub(super) fn note_memory_hit() {
     cache_counters().hits.fetch_add(1, Ordering::Relaxed);
 }
 
+/// What boot spent per stage: translations taken from disk and made, DXC compile time
+/// (summed over threads), pipelines the driver built and its time on them.
+static TRANSLATED_HITS: AtomicU64 = AtomicU64::new(0);
+static TRANSLATIONS: AtomicU64 = AtomicU64::new(0);
+static DXC_US: AtomicU64 = AtomicU64::new(0);
+static DRIVER_BUILDS: AtomicU64 = AtomicU64::new(0);
+static DRIVER_US: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn note_translation(from_disk: bool) {
+    (if from_disk { &TRANSLATED_HITS } else { &TRANSLATIONS }).fetch_add(1, Ordering::Relaxed);
+}
+
+/// A pipeline the driver built (or refused) in `t`.
+pub fn note_driver(t: std::time::Duration) {
+    DRIVER_BUILDS.fetch_add(1, Ordering::Relaxed);
+    DRIVER_US.fetch_add(t.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// One line: each stage's cache hits and misses and the time its misses took.
+pub fn stage_summary() -> String {
+    let c = cache_counters();
+    let s = |us: &AtomicU64| us.load(Ordering::Relaxed) as f64 / 1e6;
+    let direct = match (backend(), direct_counts()) {
+        (Backend::Dxc, _) => String::new(),
+        (_, (direct, unsupported, failed)) => {
+            format!("; direct DXIL backend {direct} compiled, {unsupported} unsupported and {failed} failed left to DXC, {} recompiled by DXC after the driver refused them", DXC_RETRIES.load(Ordering::Relaxed))
+        }
+    };
+    format!(
+        "translation {} from disk, {} made; DXC {} hits, {} compiled in {:.0} thread-s; driver {} pipelines in {:.0} thread-s{direct}",
+        TRANSLATED_HITS.load(Ordering::Relaxed),
+        TRANSLATIONS.load(Ordering::Relaxed),
+        c.hits.load(Ordering::Relaxed),
+        c.compilations.load(Ordering::Relaxed),
+        s(&DXC_US),
+        DRIVER_BUILDS.load(Ordering::Relaxed),
+        s(&DRIVER_US)
+    )
+}
+
 /// `compile` through a disk cache in `dir` (big translated programs take seconds in DXC;
 /// the same console shader comes back every run). Returns (DXIL, from cache).
 pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
@@ -401,7 +963,7 @@ fn cache_mutex_name(file: &Path) -> String {
     format!(r"Local\XclDxilCache-{h:016x}")
 }
 
-fn normalized_cache_dir(dir: &Path) -> PathBuf {
+pub(crate) fn normalized_cache_dir(dir: &Path) -> PathBuf {
     if let Ok(canonical) = std::fs::canonicalize(dir) {
         return canonical;
     }
@@ -486,7 +1048,7 @@ fn compile_cached_in_with<F>(dir: &Path, src: &str, entry: &str, profile: &str, 
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    compile_cached_in_observed(dir, src, entry, profile, cache_counters(), compile_one)
+    compile_cached_in_observed(dir, src, entry, profile, None, cache_counters(), compile_one)
 }
 
 fn compile_cached_in_observed<F>(
@@ -494,13 +1056,15 @@ fn compile_cached_in_observed<F>(
     src: &str,
     entry: &str,
     profile: &str,
+    opt: Option<&str>,
     counters: &CacheCounters,
     compile_one: F,
 ) -> Result<(Vec<u8>, bool), String>
 where
     F: FnOnce() -> Result<Vec<u8>, String>,
 {
-    let key = cache_key(src, entry, profile);
+    let opt = opt.unwrap_or_else(|| opt_level());
+    let key = cache_key_for_toolchain(src, entry, profile, opt, toolchain_identity());
     let dir = normalized_cache_dir(dir);
     let file = dir.join(format!("{key:016x}.dxil"));
     if let Some(b) = cached_file(&file) {
@@ -531,7 +1095,14 @@ where
     counters.compilations.fetch_add(1, Ordering::Relaxed);
     let b = {
         let _active = Compiling::start();
-        compile_one()
+        let t0 = std::time::Instant::now();
+        let b = compile_one();
+        DXC_US.fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
+        if t0.elapsed().as_secs() >= 5 {
+            let t = std::thread::current();
+            crate::xlog_info!("DXC: {profile} {opt} {key:016x} ({} B HLSL) took {:.1} s, asked by thread {}", src.len(), t0.elapsed().as_secs_f32(), t.name().map_or_else(|| format!("{:?}", t.id()), str::to_string));
+        }
+        b
     }
     .and_then(|b| {
         if valid_dxil_container(&b) {
@@ -598,6 +1169,21 @@ pub fn cached_only<R>(f: impl FnOnce() -> R) -> (R, bool) {
     (r, MISSED.with(|m| m.replace(false)))
 }
 
+/// Inside `cached_only`: what is being made is deferred as if its DXIL were missing (the
+/// driver's compile of a big program is the slow part then). False outside `cached_only`.
+pub fn defer() -> bool {
+    let inside = CACHED_ONLY.with(|c| c.get());
+    if inside {
+        MISSED.with(|m| m.set(true));
+    }
+    inside
+}
+
+/// Inside `cached_only`: something was missing so far (what `cached_only` will return).
+pub fn missed() -> bool {
+    MISSED.with(|m| m.get())
+}
+
 /// Inside `cached_only`.
 pub fn in_cached_only() -> bool {
     CACHED_ONLY.with(|c| c.get())
@@ -634,7 +1220,7 @@ mod cache_tests {
         let counters = CacheCounters::default();
         let src = "cache diagnostics";
         let request = |compile_one: fn() -> Result<Vec<u8>, String>| {
-            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", &counters, compile_one)
+            compile_cached_in_observed(&dir, src, "shade", "ps_6_6", None, &counters, compile_one)
         };
 
         let (r, missed) = cached_only(|| request(|| panic!("a cached-only miss must not compile")));
@@ -723,10 +1309,23 @@ mod cache_tests {
 
     #[test]
     fn cache_key_tracks_the_dxc_toolchain() {
-        let a = cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a");
-        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-b/signer-a"));
-        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "compiler-a/signer-b"));
+        let a = cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", "compiler-a/signer-a");
+        assert_eq!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", "compiler-a/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", "compiler-b/signer-a"));
+        assert_ne!(a, cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", "compiler-a/signer-b"));
+    }
+
+    /// DXIL made at one optimisation level is not what a compile at another finds.
+    #[test]
+    fn cache_key_tracks_the_optimisation_level() {
+        let key = |opt| cache_key_for_toolchain("source", "main", "cs_6_6", opt, "compiler/signer");
+        assert_ne!(key("-O1"), key("-O3"));
+        assert_ne!(key("-O1"), key("-O0"));
+        assert_eq!(key("-O1"), key("-O1"));
+        if opt_override().is_none() {
+            assert_eq!(opt_level(), "-O1");
+            assert_eq!(cache_key("source", "main", "cs_6_6"), cache_key_for_toolchain("source", "main", "cs_6_6", "-O1", toolchain_identity()));
+        }
     }
 
     #[test]
@@ -814,7 +1413,7 @@ mod cache_tests {
             let mut threads = Vec::new();
             for _ in 0..8 {
                 threads.push(s.spawn(|| {
-                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", &counters, || {
+                    let (dxil, hit) = compile_cached_in_observed(&dir, "same source", "main", "cs_6_6", None, &counters, || {
                         calls.fetch_add(1, Ordering::SeqCst);
                         std::thread::sleep(Duration::from_millis(25));
                         Ok(synthetic_dxil(4))

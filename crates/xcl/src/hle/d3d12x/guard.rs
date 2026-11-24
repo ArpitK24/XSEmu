@@ -10,9 +10,9 @@
 //! jump to the original function with all argument registers untouched.
 //!
 //! ```text
-//! push rcx/rdx/r8/r9 ; sub rsp,0x68 ; save xmm0-3
+//! sub rsp,0x88 ; save rcx/rdx/r8/r9 and xmm0-3
 //! rcx = [rsp+0x88] (return address), rdx = StubInfo*, call classify
-//! restore xmm0-3 ; add rsp,0x68 ; pop r9/r8/rdx/rcx
+//! restore arguments ; add rsp,0x88
 //! test rax,rax ; jnz stub ; mov rax, original ; jmp rax
 //! stub: xor eax,eax ; ret
 //! ```
@@ -75,6 +75,18 @@ pub fn make_layout_split(t: LayoutTargets) -> usize {
     thunk(Tail::JumpToResult, Box::leak(Box::new(t)) as *const LayoutTargets as u64, pick_layout as usize)
 }
 
+type LayoutSwitch = ([usize; 2], &'static std::sync::atomic::AtomicBool);
+
+unsafe extern "system" fn pick_layout_switch(_: usize, t: *const LayoutSwitch) -> usize {
+    let (targets, newer_layout) = &*t;
+    targets[newer_layout.load(std::sync::atomic::Ordering::Acquire) as usize]
+}
+
+pub(super) fn make_layout_switch(older: usize, newer: usize, newer_layout: &'static std::sync::atomic::AtomicBool) -> usize {
+    let targets = Box::leak(Box::new(([older, newer], newer_layout)));
+    thunk(Tail::JumpToResult, targets as *const LayoutSwitch as u64, pick_layout_switch as usize)
+}
+
 enum Tail {
     /// decide ≠ 0 → `xor eax, eax; ret`, 0 → jump to the original
     GuardOr(usize),
@@ -82,37 +94,201 @@ enum Tail {
     JumpToResult,
 }
 
-unsafe extern "system" fn trace(caller: usize, name: *const String) -> usize {
+/// A pointer argument: what it points at – a string when it reads like one (a path, an event
+/// name), otherwise the first words (a descriptor, the hidden return slot of a struct-returning
+/// method, …).
+unsafe fn describe_ptr(p: u64) -> String {
+    if p <= 0x10000 || !crate::gpu::shader::readable(p as usize, 32) {
+        return String::new();
+    }
+    let b = std::slice::from_raw_parts(p as *const u8, 32);
+    let printable = |c: u8| (0x20..0x7f).contains(&c);
+    // how far a string may be scanned without leaving readable memory
+    let span = if crate::gpu::shader::readable(p as usize, 128) { 128 } else { 32 };
+    if b[..8].chunks(2).all(|c| printable(c[0]) && c[1] == 0) {
+        let n = (0..span / 2).take_while(|&k| *(p as *const u16).add(k) != 0).count();
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(p as *const u16, n));
+        return format!(" -> L\"{s}\"");
+    }
+    if b[..4].iter().all(|&c| printable(c)) {
+        let n = (0..span).take_while(|&k| *(p as *const u8).add(k) != 0).count();
+        let s = String::from_utf8_lossy(std::slice::from_raw_parts(p as *const u8, n));
+        return format!(" -> \"{s}\"");
+    }
+    let w: Vec<String> = (0..4).map(|k| format!("{:#x}", *(p as *const u64).add(k))).collect();
+    format!(" -> [{}]", w.join(", "))
+}
+
+/// `frame`: the thunk's stack at the call – the saved r9, r8, rdx, rcx at +0x68.., the return
+/// address at +0x88 and the caller's stack arguments from +0x90 + 0x20 (the shadow space).
+unsafe extern "system" fn trace(caller: usize, name: *const String, frame: *const u64) -> usize {
     if crate::modules::image_base_for_addr(caller).is_some() {
-        crate::xlog_info!("D3D12 trace: {} ← {}", *name, crate::modules::describe_address(caller));
+        let at = |off: usize| *frame.add(off / 8);
+        let (a1, a2, a3) = (at(0x78), at(0x70), at(0x68));
+        let (a4, a5) = (at(0x90 + 0x20), at(0x90 + 0x28));
+        crate::xlog_info!(
+            "D3D12 trace: {} ← {}: ({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x})",
+            *name,
+            crate::modules::describe_address(caller),
+            describe_ptr(a1),
+            describe_ptr(a2),
+            describe_ptr(a3)
+        );
     }
     0
 }
 
+/// `XCL_TRACE_LIST`: calls of `slot` from a game image on a watched list (`present::list_watched`).
+unsafe extern "system" fn trace_list(caller: usize, slot: usize, frame: *const u64) -> usize {
+    let at = |off: usize| *frame.add(off / 8);
+    let this = at(0x80) as usize;
+    if crate::modules::image_base_for_addr(caller).is_some() && super::present::list_watched(this, slot) {
+        let (a2, a3, a4) = (at(0x78), at(0x70), at(0x68));
+        let (a5, a6, a7) = (at(0x90 + 0x20), at(0x90 + 0x28), at(0x90 + 0x30));
+        crate::xlog_info!(
+            "list trace: {this:#x} #{slot} ← {}: ({a2:#x}{}, {a3:#x}{}, {a4:#x}, {a5:#x}, {a6:#x}, {a7:#x})",
+            crate::modules::describe_address(caller),
+            describe_ptr(a2),
+            describe_ptr(a3)
+        );
+    }
+    0
+}
+
+pub fn make_list_tracer(original: usize, slot: usize) -> usize {
+    thunk(Tail::GuardOr(original), slot as u64, trace_list as usize)
+}
+
+unsafe extern "system" fn note_opaque_list(_: usize, _: usize, frame: *const u64) -> usize {
+    super::residency::note_list_untracked(*frame.add(0x80 / 8) as usize);
+    0
+}
+
+pub(super) fn make_opaque_list_guard(original: usize) -> usize {
+    thunk(Tail::GuardOr(original), 0, note_opaque_list as usize)
+}
+
 /// Like a guard, but always forwards: calls from a game image are logged (`XCL_D3D12_TRACE`).
+/// The original sees the caller's return address (the slot splits classify by it), so the
+/// result is not seen here; `make_call_tracer` logs it but hides the caller from the callee.
 pub fn make_tracer(original: usize, name: String) -> usize {
     thunk(Tail::GuardOr(original), Box::leak(Box::new(name)) as *const String as u64, trace as usize)
 }
 
+/// The call-through tracer's frame (see `make_call_tracer`).
+const CALL_FRAME: usize = 0xA8;
+/// How many of the caller's stack arguments the call-through tracer forwards.
+const CALL_STACK_ARGS: usize = 8;
+
+/// `frame`: the call-through tracer's frame after the original returned – the copied stack
+/// arguments at +0x20.., the entry rcx, rdx, r8, r9 at +0x60.., rax at +0x80, the caller's
+/// return address at +0xA8.
+unsafe extern "system" fn trace_ret(caller: usize, name: *const String, frame: *const u64) {
+    let at = |off: usize| *frame.add(off / 8);
+    let (a1, a2, a3, a4) = (at(0x60), at(0x68), at(0x70), at(0x78));
+    let (a5, a6, ret) = (at(0x20), at(0x28), at(0x80));
+    crate::xlog_info!(
+        "trace: {} ← {}: ({a1:#x}{}, {a2:#x}{}, {a3:#x}{}, {a4:#x}{}, {a5:#x}, {a6:#x}) → {ret:#x}",
+        *name,
+        crate::modules::describe_address(caller),
+        describe_ptr(a1),
+        describe_ptr(a2),
+        describe_ptr(a3),
+        describe_ptr(a4)
+    );
+}
+
+/// A tracer that logs the arguments *and the result* of every call (`XCL_TRACE_IMPORTS`): it
+/// calls the original from a frame of its own (forwarding `CALL_STACK_ARGS` stack arguments –
+/// enough for every console import; a variadic one past that is truncated) and logs when it
+/// returns. The callee sees the thunk as its caller, so this is for plain functions, not for
+/// D3D12.X slots whose guards classify by the return address. The frame carries unwind info
+/// so an exception raised by the original unwinds through it.
+///
+/// ```text
+/// sub rsp, 0xA8 ; save rcx, rdx, r8, r9 at +0x60.. ; copy stack args [+0xD0..] → [+0x20..]
+/// call original ; save rax at +0x80, xmm0 at +0x88
+/// rcx = [rsp+0xA8] (return address), rdx = name, r8 = rsp ; call trace_ret
+/// restore xmm0, rax ; add rsp, 0xA8 ; ret
+/// ```
+pub fn make_call_tracer(original: usize, name: String) -> usize {
+    let name = Box::leak(Box::new(name)) as *const String as u64;
+    let mut c: Vec<u8> = Vec::with_capacity(256);
+    c.extend_from_slice(&[0x48, 0x81, 0xEC]); // sub rsp, imm32
+    c.extend_from_slice(&(CALL_FRAME as u32).to_le_bytes());
+    let prolog = c.len() as u8;
+    c.extend_from_slice(&[0x48, 0x89, 0x4C, 0x24, 0x60]); // mov [rsp+0x60], rcx
+    c.extend_from_slice(&[0x48, 0x89, 0x54, 0x24, 0x68]); // mov [rsp+0x68], rdx
+    c.extend_from_slice(&[0x4C, 0x89, 0x44, 0x24, 0x70]); // mov [rsp+0x70], r8
+    c.extend_from_slice(&[0x4C, 0x89, 0x4C, 0x24, 0x78]); // mov [rsp+0x78], r9
+    for k in 0..CALL_STACK_ARGS {
+        // the caller's k-th stack argument: above our frame, its return address and shadow space
+        let src = (CALL_FRAME + 8 + 0x20 + 8 * k) as u32;
+        c.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24]); // mov rax, [rsp+disp32]
+        c.extend_from_slice(&src.to_le_bytes());
+        c.extend_from_slice(&[0x48, 0x89, 0x84, 0x24]); // mov [rsp+disp32], rax
+        c.extend_from_slice(&((0x20 + 8 * k) as u32).to_le_bytes());
+    }
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    c.extend_from_slice(&(original as u64).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]); // mov [rsp+0x80], rax
+    c.extend_from_slice(&[0xF3, 0x0F, 0x7F, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00]); // movdqu [rsp+0x88], xmm0
+    c.extend_from_slice(&[0x48, 0x8B, 0x8C, 0x24]); // mov rcx, [rsp+CALL_FRAME]
+    c.extend_from_slice(&(CALL_FRAME as u32).to_le_bytes());
+    c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, imm64
+    c.extend_from_slice(&name.to_le_bytes());
+    c.extend_from_slice(&[0x49, 0x89, 0xE0]); // mov r8, rsp
+    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
+    c.extend_from_slice(&(trace_ret as usize as u64).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
+    c.extend_from_slice(&[0xF3, 0x0F, 0x6F, 0x84, 0x24, 0x88, 0x00, 0x00, 0x00]); // movdqu xmm0, [rsp+0x88]
+    c.extend_from_slice(&[0x48, 0x8B, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00]); // mov rax, [rsp+0x80]
+    c.extend_from_slice(&[0x48, 0x81, 0xC4]); // add rsp, imm32
+    c.extend_from_slice(&(CALL_FRAME as u32).to_le_bytes());
+    c.push(0xC3); // ret
+    let end = c.len();
+    stubs::alloc_code_with_stack_unwind(c, end, prolog, CALL_FRAME as u16)
+}
+
+pub(super) fn call_preserving_arguments(body: &[u8], target: usize, tail: &[u8]) -> usize {
+    const FRAME: u16 = 0x88;
+    let mut c = vec![0x48, 0x81, 0xEC];
+    c.extend_from_slice(&u32::from(FRAME).to_le_bytes());
+    let prolog = c.len() as u8;
+    let gpr = [(0x48, 0x8C, 0x80u32), (0x48, 0x94, 0x78), (0x4C, 0x84, 0x70), (0x4C, 0x8C, 0x68)];
+    let xmm = [(0x44, 0x20), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)];
+    for (rex, modrm, off) in gpr {
+        c.extend_from_slice(&[rex, 0x89, modrm, 0x24]);
+        c.extend_from_slice(&off.to_le_bytes());
+    }
+    for (reg, off) in xmm {
+        c.extend_from_slice(&[0xF3, 0x0F, 0x7F, reg, 0x24, off]);
+    }
+    c.extend_from_slice(body);
+    c.extend_from_slice(&[0x48, 0xB8]);
+    c.extend_from_slice(&(target as u64).to_le_bytes());
+    c.extend_from_slice(&[0xFF, 0xD0]);
+    for (reg, off) in xmm {
+        c.extend_from_slice(&[0xF3, 0x0F, 0x6F, reg, 0x24, off]);
+    }
+    for (rex, modrm, off) in gpr {
+        c.extend_from_slice(&[rex, 0x8B, modrm, 0x24]);
+        c.extend_from_slice(&off.to_le_bytes());
+    }
+    c.extend_from_slice(&[0x48, 0x81, 0xC4]);
+    c.extend_from_slice(&u32::from(FRAME).to_le_bytes());
+    let end = c.len();
+    c.extend_from_slice(tail);
+    stubs::alloc_code_with_stack_unwind(c, end, prolog, FRAME)
+}
+
 /// Thunk: `decide(return address, data)` with all argument registers preserved, then `tail`.
 fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
-    let mut c: Vec<u8> = Vec::with_capacity(128);
-    c.extend_from_slice(&[0x51, 0x52, 0x41, 0x50, 0x41, 0x51]); // push rcx, rdx, r8, r9
-    c.extend_from_slice(&[0x48, 0x83, 0xEC, 0x68]); // sub rsp, 0x68
-    for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
-        c.extend_from_slice(&[0xF3, 0x0F, 0x7F, reg, 0x24, off]); // movdqu [rsp+off], xmmN
-    }
-    c.extend_from_slice(&[0x48, 0x8B, 0x8C, 0x24, 0x88, 0x00, 0x00, 0x00]); // mov rcx, [rsp+0x88]
-    c.extend_from_slice(&[0x48, 0xBA]); // mov rdx, imm64
-    c.extend_from_slice(&data.to_le_bytes());
-    c.extend_from_slice(&[0x48, 0xB8]); // mov rax, imm64
-    c.extend_from_slice(&(decide as u64).to_le_bytes());
-    c.extend_from_slice(&[0xFF, 0xD0]); // call rax
-    for (reg, off) in [(0x44u8, 0x20u8), (0x4C, 0x30), (0x54, 0x40), (0x5C, 0x50)] {
-        c.extend_from_slice(&[0xF3, 0x0F, 0x6F, reg, 0x24, off]); // movdqu xmmN, [rsp+off]
-    }
-    c.extend_from_slice(&[0x48, 0x83, 0xC4, 0x68]); // add rsp, 0x68
-    c.extend_from_slice(&[0x41, 0x59, 0x41, 0x58, 0x5A, 0x59]); // pop r9, r8, rdx, rcx
+    let mut args = vec![0x48, 0x8B, 0x8C, 0x24, 0x88, 0x00, 0x00, 0x00, 0x48, 0xBA];
+    args.extend_from_slice(&data.to_le_bytes());
+    args.extend_from_slice(&[0x49, 0x89, 0xE0]);
+    let mut c = Vec::new();
     match tail {
         Tail::GuardOr(original) => {
             c.extend_from_slice(&[0x48, 0x85, 0xC0]); // test rax, rax
@@ -124,16 +300,7 @@ fn thunk(tail: Tail, data: u64, decide: usize) -> usize {
         }
         Tail::JumpToResult => c.extend_from_slice(&[0xFF, 0xE0]), // jmp rax
     }
-    let p = stubs::alloc_code(c.len());
-    unsafe {
-        std::ptr::copy_nonoverlapping(c.as_ptr(), p, c.len());
-        windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache(
-            windows_sys::Win32::System::Threading::GetCurrentProcess(),
-            p as *const _,
-            c.len(),
-        );
-    }
-    p as usize
+    call_preserving_arguments(&args, decide, &c)
 }
 
 #[cfg(test)]
@@ -172,6 +339,22 @@ mod tests {
         // the choice itself
         let t = LayoutTargets { older: 1, newer: 2, pc: 3, newer_layout: &NEWER };
         assert_eq!(unsafe { pick_layout(0, &t) }, 3, "not from a game image");
+    }
+
+    extern "system" fn halves(a: u64, b: u64, c: u64, d: u64, e: u64, f: f64) -> f64 {
+        original(a, b, c, d, e, f) as f64 / 2.0
+    }
+
+    /// Integer, stack and floating-point arguments reach the original and its result (integer
+    /// or floating-point) comes back through the call-through tracer.
+    #[test]
+    fn call_tracer_forwards_arguments_and_results() {
+        let t = make_call_tracer(original as usize, "unit!original".into());
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> u64 = unsafe { std::mem::transmute(t) };
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 654321);
+        let t = make_call_tracer(halves as usize, "unit!halves".into());
+        let f: extern "system" fn(u64, u64, u64, u64, u64, f64) -> f64 = unsafe { std::mem::transmute(t) };
+        assert_eq!(f(1, 2, 3, 4, 5, 6.0), 327160.5);
     }
 
     #[test]

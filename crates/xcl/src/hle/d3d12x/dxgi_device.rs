@@ -5,10 +5,15 @@
 //! Console code only (`real::dev_qi_x`): DXGI asks the device the same and needs the PC answer.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::Mutex;
 
-use windows::core::{Interface, GUID};
-use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::core::{Interface, IUnknown, GUID};
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::Graphics::Direct3D12::{
+    ID3D12CommandQueue, ID3D12CommandQueue_Vtbl, ID3D12Device, ID3D12Device1, ID3D12Fence,
+    D3D12_FENCE_FLAG_NONE, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL,
+};
 use windows::Win32::Graphics::Dxgi::*;
 
 use crate::util::{HRESULT, S_OK};
@@ -199,11 +204,99 @@ unsafe extern "system" fn reclaim_resources(_p: *mut c_void, n: u32, _resources:
     S_OK
 }
 
-/// signalling when the GPU work submitted so far is done needs the title's queues: not done
-unsafe extern "system" fn enqueue_set_event(_p: *mut c_void, _event: *mut c_void) -> HRESULT {
-    static N: AtomicU64 = AtomicU64::new(0);
-    if N.fetch_add(1, Ordering::Relaxed) == 0 {
-        crate::xlog_warn!("D3D12.X: IDXGIDevice2::EnqueueSetEvent – not supported");
+unsafe extern "system" fn enqueue_set_event(p: *mut c_void, event: *mut c_void) -> HRESULT {
+    if event.is_null() {
+        return windows::Win32::Foundation::E_INVALIDARG.0;
     }
-    E_NOTIMPL
+    enqueue(device(p), HANDLE(event)).map_or_else(|e| e.code().0, |_| S_OK)
+}
+
+static QUEUE_FENCES: Mutex<Vec<(usize, ID3D12Fence, u64)>> = Mutex::new(Vec::new());
+
+unsafe fn enqueue(dev: &ID3D12Device, event: HANDLE) -> windows::core::Result<()> {
+    let identity = dev.cast::<IUnknown>()?;
+    let mut fences = Vec::new();
+    let mut values = Vec::new();
+    {
+        let mut g = QUEUE_FENCES.lock().unwrap_or_else(|e| e.into_inner());
+        for q in super::present::known_queues() {
+            let raw = q as *mut c_void;
+            let Some(queue) = ID3D12CommandQueue::from_raw_borrowed(&raw) else { continue };
+            let mut owner: Option<IUnknown> = None;
+            queue.GetDevice(&mut owner)?;
+            if owner.as_ref() != Some(&identity) {
+                continue;
+            }
+            let i = match g.iter().position(|e| e.0 == q) {
+                Some(i) => i,
+                None => {
+                    g.push((q, dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?, 0));
+                    g.len() - 1
+                }
+            };
+            let (_, fence, value) = &mut g[i];
+            let next = *value + 1;
+            if super::real::is_adopted(raw) {
+                let slot = std::mem::offset_of!(ID3D12CommandQueue_Vtbl, Signal) / std::mem::size_of::<usize>();
+                let signal: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> windows::core::HRESULT =
+                    std::mem::transmute(super::real::orig_fn(raw, slot));
+                signal(raw, fence.as_raw(), next).ok()?;
+            } else {
+                queue.Signal(&*fence, next)?;
+            }
+            *value = next;
+            fences.push(Some(fence.clone()));
+            values.push(*value);
+        }
+    }
+    if fences.is_empty() {
+        windows::Win32::System::Threading::SetEvent(event)?;
+        return Ok(());
+    }
+    dev.cast::<ID3D12Device1>()?.SetEventOnMultipleFenceCompletion(fences.as_ptr(), values.as_ptr(), fences.len() as u32, D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL, event)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT};
+
+    #[test]
+    fn enqueue_set_event_waits_for_the_queues() {
+        unsafe {
+            let mut dev: Option<ID3D12Device> = None;
+            if D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory4>() else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+                let Ok(warp) = factory.EnumWarpAdapter::<IDXGIAdapter>() else { return crate::gpu::recomp::runner::skip_test("no D3D12 device") };
+                if D3D12CreateDevice(&warp, D3D_FEATURE_LEVEL_11_0, &mut dev).is_err() {
+                    return crate::gpu::recomp::runner::skip_test("no D3D12 device");
+                }
+            }
+            let dev = dev.unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+            super::super::present::note_execute(queue.as_raw(), &[]);
+            let dxgi = create(dev.as_raw());
+            let enqueue_fn = vtbl()[16];
+            let enqueue_set_event: unsafe extern "system" fn(*mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(enqueue_fn);
+            assert_eq!(enqueue_set_event(dxgi, std::ptr::null_mut()), windows::Win32::Foundation::E_INVALIDARG.0);
+
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let event = CreateEventW(None, false, false, None).unwrap();
+            let queued = enqueue_set_event(dxgi, event.0);
+            let early = WaitForSingleObject(event, 200);
+            gate.Signal(1).unwrap();
+            assert_eq!(queued, S_OK);
+            assert_eq!(early, WAIT_TIMEOUT, "set before the queue got there");
+            assert_eq!(WaitForSingleObject(event, 10_000), WAIT_OBJECT_0, "never set");
+
+            assert_eq!(enqueue_set_event(dxgi, event.0), S_OK);
+            assert_eq!(WaitForSingleObject(event, 10_000), WAIT_OBJECT_0);
+            CloseHandle(event).unwrap();
+            release(dxgi);
+        }
+    }
 }

@@ -8,6 +8,7 @@ pub mod api;
 pub mod gamesave;
 pub mod gdk_table;
 pub mod networking;
+pub mod store;
 pub mod taskqueue;
 pub mod xasync;
 pub mod xsign;
@@ -191,7 +192,7 @@ pub unsafe extern "system" fn XGameRuntimeUninitialize() {
 }
 
 pub unsafe extern "system" fn XGameRuntimeIsFeatureAvailable(feature: u32) -> bool {
-    matches!(feature, 0 | 2..=13 | 15..=21)
+    matches!(feature, 0 | 2..=13 | 15..=21) || (feature == 14 && store::offline_error())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -282,13 +283,25 @@ pub unsafe extern "system" fn XSystemGetAnalyticsInfo() -> XSystemAnalyticsInfo 
 // XPackage
 // ---------------------------------------------------------------------------------------
 
+/// `XPACKAGE_IDENTIFIER_MAX_LENGTH`: titles keep package identifiers in buffers of this size
+/// (terminator included), so a longer one fails with ERROR_INSUFFICIENT_BUFFER and the title
+/// goes on without knowing its own package.
+pub const PACKAGE_IDENTIFIER_MAX_LENGTH: usize = 33;
+
+/// The title's package: the configured identifier, else the title id in hex, else a hash of
+/// the title's name – short enough for `PACKAGE_IDENTIFIER_MAX_LENGTH` either way.
 pub fn package_identifier() -> String {
     let c = crate::state::config();
     if !c.package_identifier.is_empty() {
         return c.package_identifier.clone();
     }
+    let title_id = c.title_id.trim_start_matches("0x").to_ascii_uppercase();
+    if !title_id.is_empty() {
+        return title_id;
+    }
     let title = crate::state::boot().map(|b| b.title.clone()).unwrap_or_else(|| "XCL.Title".into());
-    format!("{title}_1.0.0.0_x64__xcl")
+    let hash = title.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3));
+    format!("{hash:016X}")
 }
 
 fn game_root() -> String {
@@ -387,7 +400,11 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetPathSize(size: *mut usiz
 }
 
 pub unsafe extern "system" fn XPersistentLocalStorageGetPath(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
-    write_cstr_out(&pls_path(), buf, size, used)
+    let path = pls_path();
+    match write_cstr_out(&path, buf, size, used) {
+        E_NOT_SUFFICIENT_BUFFER if size <= path.len() => crate::util::E_FAIL,
+        hr => hr,
+    }
 }
 
 #[repr(C)]
@@ -405,7 +422,7 @@ pub struct XPersistentLocalStorageSpaceInfo {
 /// (`DirEntry::file_type` on Windows reports every name-surrogate reparse point —
 /// symlinks, junctions and mount points — as `is_symlink`, without an extra syscall
 /// and without dereferencing it.)
-fn pls_used_bytes(root: &Path) -> u64 {
+pub(crate) fn pls_used_bytes(root: &Path) -> u64 {
     let mut used = 0u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
@@ -446,11 +463,7 @@ pub unsafe extern "system" fn XPersistentLocalStorageGetSpaceInfo(info: *mut XPe
     let (mut avail, mut total, mut free) = (0u64, 0u64, 0u64);
     let ok = GetDiskFreeSpaceExW(crate::util::wide(&pls).as_ptr(), &mut avail, &mut total, &mut free);
     // the title's quota (MicrosoftGame.Config <PersistentLocalStorage><SizeMB>, else 4 GiB)
-    let quota = match crate::state::config().pls_mb {
-        0 => 4096,
-        mb => mb,
-    }
-    .saturating_mul(1024 * 1024);
+    let quota = crate::state::config().pls_quota_bytes();
     let used = pls_used_bytes(Path::new(&pls));
     if ok == 0 {
         // host figures unavailable – let the remaining quota bound free space alone
@@ -741,20 +754,34 @@ thread_local! {
 /// WININET_E_CANNOT_CONNECT: what a console that cannot reach Xbox Live gets for a token
 const E_CANNOT_CONNECT: HRESULT = 0x8007_2EFD_u32 as i32;
 
+/// E_GAMEUSER_FAILED_TO_GET_TOKEN, "The token request failed." (GDK error codes, Game user:
+/// learn.microsoft.com/gaming/gdk/docs/reference/errorcodes; XUser.h). A console without a
+/// network gets no token: the request fails definitively, not with a connection error a title
+/// would retry (GTA VI retried 0x80072EFD with backoff for minutes).
+pub const E_GAMEUSER_FAILED_TO_GET_TOKEN: HRESULT = 0x8924_5111_u32 as i32;
+
 /// The title asks for an Xbox Live token for a request (first 24 and every 64th logged).
-/// Without `xbox_live_tokens` there is none: XCL has no Xbox Live.
+/// Without a network (`XCL_NETWORK=0`) there is none, whatever `xbox_live_tokens` says;
+/// otherwise only `xbox_live_tokens` gives one: XCL has no Xbox Live.
 fn note_token_request(method: &str, url: &str) -> Result<(), HRESULT> {
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let tokens = TOKENS_HERE.with(|t| t.get()).unwrap_or_else(|| crate::state::config().xbox_live_tokens);
-    if n < 24 || n % 64 == 0 {
-        crate::xlog_info!("XUser: token #{n} for {method} {url} – {}", if tokens { "XCL's local placeholder" } else { "none: no Xbox Live (0x80072EFD)" });
-    }
-    if tokens {
+    let answer = if crate::hle::netoff::enabled() {
+        Err(E_GAMEUSER_FAILED_TO_GET_TOKEN)
+    } else if TOKENS_HERE.with(|t| t.get()).unwrap_or_else(|| crate::state::config().xbox_live_tokens) {
         Ok(())
     } else {
         Err(E_CANNOT_CONNECT)
+    };
+    if n < 24 || n % 64 == 0 {
+        let what = match answer {
+            Ok(()) => "XCL's local placeholder",
+            Err(E_GAMEUSER_FAILED_TO_GET_TOKEN) => "none: no network (E_GAMEUSER_FAILED_TO_GET_TOKEN)",
+            Err(_) => "none: no Xbox Live (0x80072EFD)",
+        };
+        crate::xlog_info!("XUser: token #{n} for {method} {url} – {what}");
     }
+    answer
 }
 
 pub unsafe extern "system" fn XUserGetTokenAndSignatureAsync(
@@ -969,6 +996,11 @@ mod tests {
     use super::*;
 
     #[test]
+    fn package_identifier_fits_the_titles_buffer() {
+        assert!(package_identifier().len() < PACKAGE_IDENTIFIER_MAX_LENGTH, "{}", package_identifier());
+    }
+
+    #[test]
     fn feature_availability_covers_the_public_feature_enum() {
         let features = [
             (0, "XAccessibility"),
@@ -1082,6 +1114,21 @@ mod tests {
 
     fn pls_test_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("xcl_pls_test_{}_{}", std::process::id(), name))
+    }
+
+    #[test]
+    fn pls_get_path_requires_room_for_the_terminator() {
+        unsafe {
+            let (mut size, mut used) = (0, 0);
+            assert_eq!(XPersistentLocalStorageGetPathSize(&mut size), S_OK);
+            assert!(size > 1);
+            let mut path = vec![0xCC; size];
+            assert_eq!(XPersistentLocalStorageGetPath(size - 1, path.as_mut_ptr(), &mut used), crate::util::E_FAIL);
+            assert!(path.iter().all(|&byte| byte == 0xCC));
+            assert_eq!(XPersistentLocalStorageGetPath(size, path.as_mut_ptr(), &mut used), S_OK);
+            assert_eq!(used, size);
+            assert_eq!(path[size - 1], 0);
+        }
     }
 
     #[test]

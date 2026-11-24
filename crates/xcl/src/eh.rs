@@ -10,8 +10,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Diagnostics::Debug::{
-    RtlAddFunctionTable, SetUnhandledExceptionFilter, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY,
+    RtlAddFunctionTable, SetUnhandledExceptionFilter, EXCEPTION_POINTERS, IMAGE_RUNTIME_FUNCTION_ENTRY, MINIDUMP_EXCEPTION_INFORMATION,
 };
 
 use crate::hooks;
@@ -74,7 +75,10 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x})", rec.ExceptionInformation[1]);
+            extra = format!(" ({op} at address {:#x}; {})", rec.ExceptionInformation[1], crate::hle::kernelx::lazy::describe(rec.ExceptionInformation[1] as usize));
+        }
+        if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+            extra = format!(" (code bytes: {})", code_at(addr));
         }
         let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
@@ -91,7 +95,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 let d = modules::describe_address(vt);
                 if d.contains('+') { format!(" (vtable {d})") } else { String::new() }
             };
-            let regs = [("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8), ("r9", c.R9), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp)];
+            let regs = [
+                ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx),
+                ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+                ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12),
+                ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
+            ];
             let callers = stack_callers(c.Rsp as usize);
             regs.iter().map(|(n, v)| format!(" {n}={v:#x}{}", obj(*v))).collect::<String>() + &if callers.is_empty() { String::new() } else { format!("; on the stack: {callers}") }
         };
@@ -121,6 +130,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
     if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
         let probe = 0usize;
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
+        crate::hle::d3d12x::bind::log_trips();
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
             dump_threads();
@@ -216,19 +226,280 @@ unsafe extern "system" fn gs_failure(cookie: usize, ret: usize) {
 /// First-chance C++ exceptions (0xE06D7363), the first 16: type, what() and where they were
 /// thrown. One nobody catches ends the process through std::terminate → abort → __fastfail
 /// (0xC0000409), which leaves no other trace (a static initializer in a title DLL's DllMain).
+/// The C string at `p`, at most `max` bytes, read only as far as the memory is readable (a
+/// vectored handler faulting on an unmapped byte after a title's string would turn the
+/// exception it looks at into a fatal one).
+unsafe fn bounded_cstr(p: usize, max: usize) -> String {
+    let mut bytes = Vec::new();
+    let mut a = p;
+    while bytes.len() < max {
+        // readability is checked page by page: at the start and at every page crossed
+        if (a == p || a & 0xFFF == 0) && !crate::gpu::shader::readable(a, 1) {
+            break;
+        }
+        let b = *(a as *const u8);
+        if b == 0 {
+            break;
+        }
+        bytes.push(b);
+        a += 1;
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn is_writable(va: usize, bytes: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_GUARD,
+        PAGE_READWRITE, PAGE_WRITECOPY,
+    };
+    // a committed window of unified memory is read-write as a whole and is not asked about, as in
+    // `gpu::shader::readable`: `VirtualQuery` walks a region to its end to size it, and a title's
+    // memset there asked at every emulated CLZERO loop
+    if bytes > 0 && crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(va, bytes)) {
+        return true;
+    }
+    let Some(end) = va.checked_add(bytes) else { return false };
+    crate::hle::kernelx::lazy::ensure(va, bytes);
+    let mut at = va;
+    while at < end {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const std::ffi::c_void, &mut m, std::mem::size_of_val(&m)) } == 0
+            || m.State != MEM_COMMIT
+            || m.Protect & PAGE_GUARD != 0
+            || !matches!(m.Protect & 0xff, PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)
+        {
+            return false;
+        }
+        let Some(next) = (m.BaseAddress as usize).checked_add(m.RegionSize) else { return false };
+        if next <= at {
+            return false;
+        }
+        at = next;
+    }
+    true
+}
+
+const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+
+/// The first 16 code bytes at `rip`, as hex (as far as they are readable).
+unsafe fn code_at(rip: usize) -> String {
+    let n = (1..=16).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(0);
+    crate::insn::hex(std::slice::from_raw_parts(rip as *const u8, n))
+}
+
+/// Update the x86-64 arithmetic flags (CF, PF, AF, ZF, SF, OF) for `cmp lhs, rhs`, keeping all
+/// other EFLAGS bits intact.
+fn cmp_eflags(eflags: u32, lhs: u64, rhs: u64) -> u32 {
+    const ARITH: u32 = 0x001 | 0x004 | 0x010 | 0x040 | 0x080 | 0x800;
+    let (res, cf) = lhs.overflowing_sub(rhs);
+    let (_, of) = (lhs as i64).overflowing_sub(rhs as i64);
+    let mut f = eflags & !ARITH;
+    if cf {
+        f |= 0x001;
+    }
+    if (res as u8).count_ones() % 2 == 0 {
+        f |= 0x004;
+    }
+    if (lhs & 0xF) < (rhs & 0xF) {
+        f |= 0x010;
+    }
+    if res == 0 {
+        f |= 0x040;
+    }
+    if (res as i64) < 0 {
+        f |= 0x080;
+    }
+    if of {
+        f |= 0x800;
+    }
+    f
+}
+
+/// How many of the `most` code bytes at `rip`, where an instruction just raised an exception,
+/// are there to read. The page `rip` is on is – the instruction was fetched from it – so only
+/// bytes on the next page are asked about. `readable` asks `VirtualQuery`, which walks a region
+/// to its end to size it: for a title's code section at every emulated instruction, twice.
+unsafe fn code_bytes_at(rip: usize, most: usize) -> usize {
+    let in_page = 0x1000 - (rip & 0xFFF);
+    if in_page >= most {
+        return most;
+    }
+    (in_page + 1..=most).rev().find(|&n| crate::gpu::shader::readable(rip, n)).unwrap_or(in_page)
+}
+
+/// A title's STATUS_ILLEGAL_INSTRUCTION: an instruction the console's Zen 2 has and this CPU
+/// lacks (`insn`) is emulated and stepped over (EXCEPTION_CONTINUE_EXECUTION); anything else is
+/// logged with its code bytes and goes on to the title's handlers.
+unsafe fn emulate_console_only(ctx: &mut windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> i32 {
+    use crate::insn::ConsoleOnly;
+    let rip = ctx.Rip as usize;
+    if modules::image_base_for_addr(rip).is_none() {
+        return 0;
+    }
+    let n = code_bytes_at(rip, 16);
+    let code = std::slice::from_raw_parts(rip as *const u8, n);
+    let Some((what, len)) = crate::insn::decode(code) else {
+        crate::xlog_error!("illegal instruction in {}: code bytes {}", modules::describe_address(rip), crate::insn::hex(code));
+        return 0;
+    };
+    static SEEN: std::sync::Mutex<Vec<std::mem::Discriminant<ConsoleOnly>>> = std::sync::Mutex::new(Vec::new());
+    if let Ok(mut seen) = SEEN.lock() {
+        if !seen.contains(&std::mem::discriminant(&what)) {
+            seen.push(std::mem::discriminant(&what));
+            if what == ConsoleOnly::Ud2 {
+                crate::xlog_error!("ud2 in {} – the title's own trap; on the stack: {}", modules::describe_address(rip), stack_callers(ctx.Rsp as usize));
+            } else {
+                crate::xlog_warn!("{what:?} in {} – a console CPU instruction this CPU lacks: emulated (logged once)", modules::describe_address(rip));
+            }
+        }
+    }
+    let mut step = len;
+    match what {
+        ConsoleOnly::Ud2 => return 0,
+        ConsoleOnly::Clwb => {
+            use windows_sys::Win32::System::Memory::{VirtualProtect, PAGE_EXECUTE_READWRITE};
+            let mut old = 0u32;
+            if ctx.EFlags & 0x100 == 0 && unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, PAGE_EXECUTE_READWRITE, &mut old) } != 0 {
+                let code = unsafe { std::slice::from_raw_parts_mut(rip as *mut u8, len) };
+                code.fill(0x90);
+                unsafe { VirtualProtect(rip as *const std::ffi::c_void, len, old, &mut old) };
+            }
+        }
+        ConsoleOnly::Monitorx => {}
+        ConsoleOnly::Mwaitx => {
+            std::hint::spin_loop();
+        }
+        ConsoleOnly::Clzero => {
+            // with an address-size prefix (0x67, among the prefixes before 0F 01 FC) the line
+            // is at EAX, zero-extended – as a Zen 5 runs it
+            let a32 = code[..len - 3].contains(&0x67);
+            let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
+            if is_writable(line, 64) {
+                std::ptr::write_bytes(line as *mut u8, 0, 64);
+            } else {
+                return 0; // the real instruction faults there too
+            }
+        }
+        ConsoleOnly::ClzeroLoop { end_reg } => {
+            let regs: [&u64; 16] = [
+                &ctx.Rax, &ctx.Rcx, &ctx.Rdx, &ctx.Rbx, &ctx.Rsp, &ctx.Rbp, &ctx.Rsi, &ctx.Rdi,
+                &ctx.R8, &ctx.R9, &ctx.R10, &ctx.R11, &ctx.R12, &ctx.R13, &ctx.R14, &ctx.R15,
+            ];
+            let end = *regs[end_reg as usize & 15];
+            let start = ctx.Rax;
+            let line = (start as usize) & !63;
+            let fast = end.checked_sub(start)
+                .and_then(|span| span.div_ceil(64).checked_mul(64))
+                .filter(|&bytes| bytes > 0 && bytes < 2 * 1024 * 1024 * 1024 && ctx.EFlags & 0x100 == 0)
+                .and_then(|bytes| {
+                    let write_end = line.checked_add(bytes as usize)?;
+                    (write_end <= rip || line >= rip.checked_add(len)?)
+                        .then_some((bytes as usize, start.checked_add(bytes)?))
+                });
+            match fast {
+                Some((bytes, final_rax)) if is_writable(line, bytes) => {
+                    std::ptr::write_bytes(line as *mut u8, 0, bytes);
+                    ctx.Rax = final_rax;
+                    ctx.EFlags = cmp_eflags(ctx.EFlags, final_rax, end);
+                }
+                _ if is_writable(line, 64) => {
+                    // Fall back to stepping the single `clzero` (len - 9) so the title's own
+                    // `add / cmp / jb` runs natively for end <= start, huge/wrapping, or partial ranges.
+                    std::ptr::write_bytes(line as *mut u8, 0, 64);
+                    step = len - 9;
+                }
+                _ => return 0,
+            }
+        }
+        ConsoleOnly::Rdpru => {
+            let mut v = 0i64;
+            windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut v);
+            let v = if ctx.Rcx as u32 <= 1 { v as u64 } else { 0 };
+            ctx.Rax = v & 0xFFFF_FFFF;
+            ctx.Rdx = v >> 32;
+        }
+        ConsoleOnly::Rdpid(r) => {
+            let cpu = windows_sys::Win32::System::Threading::GetCurrentProcessorNumber() as u64;
+            let regs: [&mut u64; 16] = [
+                &mut ctx.Rax, &mut ctx.Rcx, &mut ctx.Rdx, &mut ctx.Rbx, &mut ctx.Rsp, &mut ctx.Rbp, &mut ctx.Rsi, &mut ctx.Rdi,
+                &mut ctx.R8, &mut ctx.R9, &mut ctx.R10, &mut ctx.R11, &mut ctx.R12, &mut ctx.R13, &mut ctx.R14, &mut ctx.R15,
+            ];
+            *regs[r as usize & 15] = cpu;
+        }
+        // the low quadword changes; the high one, undefined in AMD's manual, is zeroed – what a
+        // Zen 5 does in all of 32 779 cases compared (Kalmarv on #209)
+        ConsoleOnly::Extrq { dst, src, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let (len, idx) = match src {
+                Some(s) => {
+                    let c = x[s as usize & 15].Low;
+                    (c as u8, (c >> 8) as u8)
+                }
+                None => (len, idx),
+            };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::extrq(d.Low, len, idx);
+            d.High = 0;
+        }
+        ConsoleOnly::Insertq { dst, src, reg, len, idx } => {
+            let x = &mut ctx.Anonymous.FltSave.XmmRegisters;
+            let s = x[src as usize & 15];
+            let (len, idx) = if reg { (s.High as u8, (s.High >> 8) as u8) } else { (len, idx) };
+            let d = &mut x[dst as usize & 15];
+            d.Low = crate::insn::insertq(d.Low, s.Low, len, idx);
+            d.High = 0;
+        }
+    }
+    ctx.Rip += step as u64;
+    -1 // EXCEPTION_CONTINUE_EXECUTION
+}
+
 unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) -> i32 {
     const CPP: i32 = 0xE06D_7363_u32 as i32;
     const THREAD_NAME: i32 = 0x406D_1388;
+    if info.is_null() || (*info).ExceptionRecord.is_null() || (*info).ContextRecord.is_null() {
+        return 0;
+    }
     let rec = &*(*info).ExceptionRecord;
     // the debugger's thread-name exception (THREADNAME_INFO: 0x1000, name, thread id, flags):
     // the name goes to SetThreadDescription, where tools – and XCL's thread dump – see it
     if rec.ExceptionCode == THREAD_NAME && rec.NumberParameters >= 3 && rec.ExceptionInformation[0] == 0x1000 {
         let (name, tid) = (rec.ExceptionInformation[1], rec.ExceptionInformation[2] as u32);
-        if name != 0 && crate::gpu::shader::readable(name, 1) {
-            let n: Vec<u16> = std::ffi::CStr::from_ptr(name as *const std::ffi::c_char).to_string_lossy().encode_utf16().chain([0]).collect();
-            name_thread(tid, &n);
+        if name != 0 {
+            let n: Vec<u16> = bounded_cstr(name, 256).encode_utf16().chain([0]).collect();
+            if n.len() > 1 {
+                name_thread(tid, &n);
+            }
         }
         return 0;
+    }
+    if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
+        return emulate_console_only(&mut *(*info).ContextRecord);
+    }
+    // `XCL_TRACE_FAULTS=1`: access violations as they are raised (the first 32), before the
+    // title's handlers – a title whose own crash filter ends the process leaves no other trace
+    if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicUsize = AtomicUsize::new(0);
+        if *ON.get_or_init(|| std::env::var_os("XCL_TRACE_FAULTS").is_some()) && N.fetch_add(1, Ordering::Relaxed) < 32 {
+            let c = &*(*info).ContextRecord;
+            let op = match rec.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "?",
+            };
+            crate::xlog_warn!(
+                "access violation ({op} at {:#x}) in {}; rax={:#x} rcx={:#x} rdx={:#x} r8={:#x}; on the stack: {}",
+                rec.ExceptionInformation[1],
+                modules::describe_address(rec.ExceptionAddress as usize),
+                c.Rax,
+                c.Rcx,
+                c.Rdx,
+                c.R8,
+                stack_callers(c.Rsp as usize)
+            );
+        }
     }
     if rec.ExceptionCode != CPP || rec.NumberParameters < 4 {
         return 0;
@@ -253,19 +524,20 @@ unsafe extern "system" fn cpp_exception_logger(info: *mut EXCEPTION_POINTERS) ->
                 let td = rd32(base + first as usize + 4);
                 if td > 0 {
                     let p = base + td as usize + 16;
-                    if crate::gpu::shader::readable(p, 64) {
-                        name = std::ffi::CStr::from_ptr(p as *const std::ffi::c_char).to_string_lossy().into_owned();
+                    if crate::gpu::shader::readable(p, 1) {
+                        name = bounded_cstr(p, 256);
                     }
                 }
             }
         }
     }
-    // std::exception { vfptr, const char* what, … }
+    // std::exception { vfptr, const char* what, … } – for other thrown types the second word is
+    // whatever the object holds: read as a string only where it points at readable memory
     let mut what = String::new();
     if object != 0 && crate::gpu::shader::readable(object + 8, 8) {
         let s = (object as *const usize).add(1).read_unaligned();
-        if s != 0 && crate::gpu::shader::readable(s, 1) {
-            what = std::ffi::CStr::from_ptr(s as *const std::ffi::c_char).to_string_lossy().chars().take(200).collect();
+        if s != 0 {
+            what = bounded_cstr(s, 200);
         }
     }
     let ctx = &*(*info).ContextRecord;
@@ -413,16 +685,23 @@ pub fn dump_threads() {
             if te.th32OwnerProcessID == pid && te.th32ThreadID != me {
                 let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, 0, te.th32ThreadID);
                 if !h.is_null() {
-                    if SuspendThread(h) != u32::MAX {
-                        // CONTEXT must be 16-byte aligned
-                        let mut buf = vec![0u8; std::mem::size_of::<CONTEXT>() + 16];
-                        let ctx = ((buf.as_mut_ptr() as usize + 15) & !15) as *mut CONTEXT;
-                        (*ctx).ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
-                        if GetThreadContext(h, ctx) != 0 {
-                            let frames: Vec<String> = unwind(&mut *ctx, 14).into_iter().map(modules::describe_address).collect();
-                            lines.push(format!("thread {} '{}': {}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
-                        }
+                    // CONTEXT must be 16-byte aligned
+                    #[repr(align(16))]
+                    struct Aligned(CONTEXT);
+                    let mut c: Aligned = std::mem::zeroed();
+                    c.0.ContextFlags = CONTEXT_CONTROL_AMD64 | CONTEXT_INTEGER_AMD64;
+                    // only the context is taken while the thread is suspended: the unwinding
+                    // (RtlLookupFunctionEntry), the module lookup (loader lock), the name and the
+                    // formatting (heap) take locks the suspended thread may hold (#106)
+                    let got = SuspendThread(h) != u32::MAX && {
+                        let ok = GetThreadContext(h, &mut c.0) != 0;
                         ResumeThread(h);
+                        ok
+                    };
+                    if got {
+                        let frames: Vec<String> = unwind(&mut c.0, 14).into_iter().map(modules::describe_address).collect();
+                        let wait = crate::wait_handles::describe_wait(te.th32ThreadID).map(|w| format!(" — {w}")).unwrap_or_default();
+                        lines.push(format!("thread {} '{}': {}{wait}", te.th32ThreadID, thread_name(h), frames.join(" < ")));
                     }
                     CloseHandle(h);
                 }
@@ -500,6 +779,10 @@ pub fn watch_writes(addr: usize) {
         while start.elapsed().as_secs() < 60 {
             unsafe {
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 let mut e: THREADENTRY32 = std::mem::zeroed();
                 e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 let mut ok = Thread32First(snap, &mut e) != 0;
@@ -512,14 +795,17 @@ pub fn watch_writes(addr: usize) {
                             struct Aligned(CONTEXT);
                             let mut c: Aligned = std::mem::zeroed();
                             c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
-                            SuspendThread(h);
-                            if GetThreadContext(h, &mut c.0) != 0 {
-                                c.0.Dr0 = addr as u64;
-                                // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
-                                c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
-                                SetThreadContext(h, &c.0);
+                            if SuspendThread(h) != u32::MAX {
+                                if GetThreadContext(h, &mut c.0) != 0 {
+                                    c.0.Dr0 = addr as u64;
+                                    // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
+                                    c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
+                                    SetThreadContext(h, &c.0);
+                                }
+                                ResumeThread(h);
+                            } else {
+                                armed.remove(&e.th32ThreadID);
                             }
-                            ResumeThread(h);
                             windows_sys::Win32::Foundation::CloseHandle(h);
                         }
                     }
@@ -666,6 +952,10 @@ pub fn start_probes() {
         loop {
             unsafe {
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
                 let mut e: THREADENTRY32 = std::mem::zeroed();
                 e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 let mut ok = Thread32First(snap, &mut e) != 0;
@@ -677,12 +967,15 @@ pub fn start_probes() {
                             struct Aligned(CONTEXT);
                             let mut c: Aligned = std::mem::zeroed();
                             c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
-                            SuspendThread(h);
-                            if GetThreadContext(h, &mut c.0) != 0 {
-                                arm_context(&mut c.0);
-                                SetThreadContext(h, &c.0);
+                            if SuspendThread(h) != u32::MAX {
+                                if GetThreadContext(h, &mut c.0) != 0 {
+                                    arm_context(&mut c.0);
+                                    SetThreadContext(h, &c.0);
+                                }
+                                ResumeThread(h);
+                            } else {
+                                armed.remove(&e.th32ThreadID);
                             }
-                            ResumeThread(h);
                             windows_sys::Win32::Foundation::CloseHandle(h);
                         }
                     }
@@ -695,9 +988,193 @@ pub fn start_probes() {
     });
 }
 
+
+type MiniDumpFn = unsafe extern "system" fn(HANDLE, u32, HANDLE, u32, *const MINIDUMP_EXCEPTION_INFORMATION, *const c_void, *const c_void) -> i32;
+
+fn real_minidump_write_dump() -> Option<MiniDumpFn> {
+    let name = crate::pe::ImportName::Name { hint: 0, name: "MiniDumpWriteDump".into() };
+    crate::resolver::system_proc("dbghelp.dll", &name).map(|f| unsafe { std::mem::transmute::<usize, MiniDumpFn>(f) })
+}
+
+/// XCL's own function for a host function a title asks for by `dll` (a `dll_key`) and `name`.
+pub fn host_override(dll: &str, name: &str) -> Option<usize> {
+    match (dll, name) {
+        ("dbghelp.dll" | "dbgcore.dll", "MiniDumpWriteDump") => Some(minidump_write_dump as usize),
+        _ => None,
+    }
+}
+
+/// MiniDumpWriteDump as the title calls it from its crash handler. A dump of this process
+/// written in it suspends every other thread, XCL's and the driver's too, which a title never
+/// has on the console; one of them holding a heap or loader lock that the dump then needs
+/// hangs the process (play-45). A helper xcl process (`xcl minidump`) writes it instead, as
+/// dbghelp advises. Other processes' dumps go to dbghelp as they are.
+unsafe extern "system" fn minidump_write_dump(process: HANDLE, pid: u32, file: HANDLE, ty: u32, exc: *const MINIDUMP_EXCEPTION_INFORMATION, user: *const c_void, callback: *const c_void) -> i32 {
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
+    if pid != GetCurrentProcessId() {
+        return real_minidump_write_dump().map_or(0, |f| f(process, pid, file, ty, exc, user, callback));
+    }
+    let (tid, pointers) = exc.as_ref().map_or((0, 0), |e| (e.ThreadId, e.ExceptionPointers as usize));
+    let me = GetCurrentProcess();
+    let mut inherited: HANDLE = std::ptr::null_mut();
+    if DuplicateHandle(me, file, me, &mut inherited, 0, 1, DUPLICATE_SAME_ACCESS) == 0 {
+        crate::xlog_error!("the title's minidump: cannot pass its file to a helper process");
+        return 0;
+    }
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    let mut cmd = crate::util::wide(&format!("\"{exe}\" minidump {pid} {} {ty} {tid} {pointers}", inherited as usize));
+    let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..std::mem::zeroed() };
+    let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+    let started = CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi) != 0;
+    CloseHandle(inherited);
+    if !started {
+        crate::xlog_error!("the title's minidump: cannot start the helper process ({})", std::io::Error::last_os_error());
+        return 0;
+    }
+    CloseHandle(pi.hThread);
+    let waited = WaitForSingleObject(pi.hProcess, 120_000);
+    let mut code = 1u32;
+    GetExitCodeProcess(pi.hProcess, &mut code);
+    CloseHandle(pi.hProcess);
+    let written = waited == WAIT_OBJECT_0 && code == 0;
+    crate::xlog_info!(
+        "the title's minidump (type {ty:#x}, thread {tid}) written by a helper process: {}{}",
+        if written { "done".to_string() } else if waited == WAIT_OBJECT_0 { format!("failed (exit code {code:#x})") } else { "no end after 120 s".to_string() },
+        if user.is_null() && callback.is_null() { "" } else { "; its user streams and callback left out" }
+    );
+    crate::log::flush();
+    written as i32
+}
+
+/// `xcl minidump <pid> <file handle> <type> <thread> <exception pointers>`: the helper that
+/// writes a title's dump of its own process (`minidump_write_dump`); the file handle is
+/// inherited and the exception pointers are the title process's.
+pub fn write_minidump_of(args: &[String]) -> i32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_ALL_ACCESS};
+    let n: Vec<usize> = args.iter().filter_map(|a| a.parse().ok()).collect();
+    let &[pid, file, ty, tid, pointers] = n.as_slice() else { return 2 };
+    let Some(write) = real_minidump_write_dump() else { return 3 };
+    unsafe {
+        let process = OpenProcess(PROCESS_ALL_ACCESS, 0, pid as u32);
+        if process.is_null() {
+            return 4;
+        }
+        let exc = MINIDUMP_EXCEPTION_INFORMATION { ThreadId: tid as u32, ExceptionPointers: pointers as *mut EXCEPTION_POINTERS, ClientPointers: 1 };
+        let ok = write(process, pid as u32, file as HANDLE, ty as u32, if pointers == 0 { std::ptr::null() } else { &exc }, std::ptr::null(), std::ptr::null());
+        CloseHandle(process);
+        CloseHandle(file as HANDLE);
+        if ok != 0 { 0 } else { 1 }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A title's GetProcAddress of MiniDumpWriteDump on the real dbghelp gets XCL's, which
+    /// writes dumps of this process from a helper process.
+    #[test]
+    fn get_proc_address_of_minidump_write_dump_is_xcls() {
+        let name = crate::pe::ImportName::Name { hint: 0, name: "MiniDumpWriteDump".into() };
+        let h = crate::resolver::system_module("dbghelp.dll").expect("dbghelp");
+        assert_eq!(crate::resolver::get_proc_address(h, &name), Some(super::minidump_write_dump as usize));
+        assert_eq!(super::host_override("dbgcore.dll", "MiniDumpWriteDump"), Some(super::minidump_write_dump as usize));
+        assert_eq!(super::host_override("dbghelp.dll", "SymInitialize"), None);
+    }
+
+    /// The helper (`xcl minidump`) writes another process's dump to the file it is handed.
+    #[test]
+    fn the_minidump_helper_writes_a_dump_of_another_process() {
+        use std::os::windows::io::IntoRawHandle;
+        let mut child = std::process::Command::new("cmd").args(["/c", "ping -n 10 127.0.0.1 >nul"]).spawn().unwrap();
+        let path = std::env::temp_dir().join(format!("xcl-minidump-test-{}.dmp", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap().into_raw_handle() as usize;
+        let code = super::write_minidump_of(&[child.id().to_string(), file.to_string(), "0".into(), "0".into(), "0".into()]);
+        let _ = child.kill();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(code, 0);
+        assert!(size > 0);
+    }
     use super::*;
+
+    #[test]
+    fn clwb_single_step_does_not_rewrite_the_instruction() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(code, 0);
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "clwb_step_test".into(), path: "clwb_step_test".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            let instruction = [0x66u8, 0x0f, 0xae, 0x30];
+            std::ptr::copy_nonoverlapping(instruction.as_ptr(), code as *mut u8, instruction.len());
+            let mut ctx: CONTEXT = std::mem::zeroed();
+            ctx.EFlags = 0x302;
+            for _ in 0..2 {
+                ctx.Rip = code as u64;
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + instruction.len() as u64);
+                assert_eq!(ctx.EFlags, 0x302);
+                assert_eq!(std::slice::from_raw_parts(code as *const u8, instruction.len()), &instruction);
+            }
+            ctx.EFlags = 0x202;
+            ctx.Rip = code as u64;
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + instruction.len() as u64);
+            assert_eq!(std::slice::from_raw_parts(code as *const u8, instruction.len()), &[0x90; 4]);
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    #[test]
+    fn clzero_checks_protection_across_the_write_span() {
+        use windows_sys::Win32::System::Memory::{
+            VirtualAlloc, VirtualFree, VirtualProtect, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_EXECUTE_READWRITE,
+            PAGE_GUARD, PAGE_READWRITE,
+        };
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x3000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            let second = (p + 0x1000) as *const _;
+            assert!(!VirtualAlloc(p as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE).is_null());
+            assert!(!VirtualAlloc(second, 0x1000, MEM_COMMIT, PAGE_EXECUTE_READWRITE).is_null());
+            let spans_regions = is_writable(p + 0xff0, 32);
+            let spans_hole = is_writable(p + 0x1ff0, 32);
+            let mut old = 0;
+            assert_ne!(VirtualProtect(second, 0x1000, PAGE_READWRITE | PAGE_GUARD, &mut old), 0);
+            let spans_guard = is_writable(p + 0xff0, 32);
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+            assert!(spans_regions);
+            assert!(!spans_hole);
+            assert!(!spans_guard);
+            assert!(!is_writable(usize::MAX - 32, 64));
+        }
+    }
+
+    #[test]
+    fn bounded_cstr_stops_at_nul_limit_and_unreadable_memory() {
+        unsafe {
+            let s = b"hello\0tail";
+            assert_eq!(bounded_cstr(s.as_ptr() as usize, 64), "hello");
+            assert_eq!(bounded_cstr(s.as_ptr() as usize, 3), "hel");
+            assert_eq!(bounded_cstr(0, 64), "");
+            // a string running to the end of a page followed by an unmapped one
+            use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+            let p = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(p, 0);
+            assert_ne!(VirtualAlloc(p as *const _, 0x1000, MEM_COMMIT, PAGE_READWRITE) as usize, 0);
+            std::ptr::write_bytes(p as *mut u8, b'x', 0x1000);
+            assert_eq!(bounded_cstr(p + 0x1000 - 4, 64), "xxxx");
+            VirtualFree(p as *mut _, 0, MEM_RELEASE);
+        }
+    }
 
     #[test]
     fn finds_both_cookie_checks() {
@@ -706,5 +1183,156 @@ mod tests {
         let console: Vec<u8> = [0xCC, 0x48, 0x3B, 0x0D, 0x99, 0x7E, 0x54, 0x00, 0xF2, 0x75, 0x12, 0x48, 0xC1, 0xC1, 0x10, 0x66, 0xF7, 0xC1, 0xFF, 0xFF, 0xF2, 0x75, 0x02, 0xF2, 0xC3, 0x48, 0xC1, 0xC9, 0x10, 0xE9, 0x4F, 0x06, 0, 0, 0xCC].to_vec();
         assert_eq!(find_gs_check(&console), Some(29));
         assert_eq!(find_gs_check(&[0x48; 64]), None);
+    }
+
+    /// `67 0F 01 FC`: CLZERO at EAX. rax's upper half set, and memory mapped at both the 64- and
+    /// the 32-bit address: only the 32-bit one's line is zeroed.
+    #[test]
+    fn clzero_with_an_address_size_prefix_zeroes_at_eax() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = |at: usize| unsafe { VirtualAlloc(at as *const _, 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let low = (1..64).map(|n| alloc(n << 26)).find(|&p| p != 0).expect("a buffer below 4 GiB");
+        let high = (1..256).map(|n| alloc(low + (n << 32))).find(|&p| p != 0).expect("a buffer at low + n << 32");
+        let code = alloc(0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_a32.exe".into(), path: "clzero_a32.exe".into(), base: code, size: 0x1_0000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // alone, and as the first of a loop to rdx (add rax, 0x40; cmp rax, rdx; jb back to the 0F)
+        for bytes in [&[0x67u8, 0x0F, 0x01, 0xFC][..], &[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]] {
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), code as *mut u8, bytes.len());
+                std::ptr::write_bytes(low as *mut u8, 0xA5, 0x100);
+                std::ptr::write_bytes(high as *mut u8, 0xA5, 0x100);
+                let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx) = (code as u64, (high + 0x47) as u64, (high + 0x100) as u64);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 4);
+                let (l, h) = (std::slice::from_raw_parts(low as *const u8, 0x100), std::slice::from_raw_parts(high as *const u8, 0x100));
+                assert!(l[0x40..0x80].iter().all(|&b| b == 0) && l[..0x40].iter().chain(&l[0x80..]).all(|&b| b == 0xA5), "the line at EAX");
+                assert!(h.iter().all(|&b| b == 0xA5), "nothing at RAX");
+            }
+        }
+        modules::unregister_mapped(code);
+    }
+
+    #[test]
+    fn cmp_eflags_matches_x86_64_sub_flags() {
+        // equal: ZF=1, PF=1 (0 has even parity), CF=AF=SF=OF=0; IF (0x200) preserved
+        assert_eq!(cmp_eflags(0x202 | 0x891, 0x100, 0x100), 0x202 | 0x040 | 0x004);
+        // 0xD0 - 0xC0 = 0x10 (1 one-bit -> PF=0): all arithmetic flags 0
+        assert_eq!(cmp_eflags(0x202 | 0x8D5, 0xD0, 0xC0), 0x202);
+        // unsigned borrow + AF + SF: 0x00 - 0x01 = -1 (0xFF has 8 one-bits -> PF=1)
+        assert_eq!(cmp_eflags(0x202, 0, 1), 0x202 | 0x001 | 0x004 | 0x010 | 0x080);
+        // signed overflow: i64::MIN - 1 = i64::MAX (0xFF -> PF=1, AF=1, OF=1, CF=0, SF=0)
+        assert_eq!(cmp_eflags(0x202, 0x8000_0000_0000_0000, 1), 0x202 | 0x004 | 0x010 | 0x800);
+    }
+
+    #[test]
+    fn clzero_loop_aligns_updates_flags_and_falls_back_when_end_le_start() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        let alloc = || unsafe { VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize };
+        let (buf, code) = (alloc(), alloc());
+        assert_ne!(buf, 0);
+        assert_ne!(code, 0);
+        modules::register_mapped(Arc::new(modules::MappedModule {
+            name: "clzero_loop_test.exe".into(), path: "clzero_loop_test.exe".into(), base: code, size: 0x1000, entry_rva: 0, is_dll: false,
+            exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+            initialized: AtomicBool::new(true), stack_reserve: 0,
+        }));
+        // clzero; add rax, 0x40; cmp rax, rdx; jb -12
+        let loop_bytes: [u8; 12] = [0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4];
+        unsafe {
+            std::ptr::copy_nonoverlapping(loop_bytes.as_ptr(), code as *mut u8, loop_bytes.len());
+
+            // 1) Aligned exact multiple: [0x40..0x100), Rax -> 0x100, ZF=1, CF=0
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x40) as u64, (buf + 0x100) as u64, 0x202 | 0x001);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rax, (buf + 0x100) as u64);
+            assert_eq!(ctx.EFlags, 0x202 | 0x040 | 0x004);
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+            assert!(s[0x40..0x100].iter().all(|&b| b == 0));
+            assert!(s[0x100..0x140].iter().all(|&b| b == 0xA5));
+
+            // 2) Unaligned start + non-64B-multiple length: start = +0x50, end = +0xC0 -> 2 cache lines [0x40..0xC0), Rax -> +0xD0, ZF=0, CF=0
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+            ctx = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x50) as u64, (buf + 0xC0) as u64, 0x202 | 0x041);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip, code as u64 + 12);
+            assert_eq!(ctx.Rax, (buf + 0xD0) as u64);
+            assert_eq!(ctx.EFlags, 0x202);
+            let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+            assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+            assert!(s[0x40..0xC0].iter().all(|&b| b == 0));
+            assert!(s[0xC0..0x140].iter().all(|&b| b == 0xA5));
+
+            // 3) end <= start: executes the single first clzero line [0x40..0x80) and steps only 3 bytes so add/cmp/jb runs natively
+            for end in [buf + 0x40, buf] {
+                std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x140);
+                ctx = std::mem::zeroed();
+                (ctx.Rip, ctx.Rax, ctx.Rdx, ctx.EFlags) = (code as u64, (buf + 0x53) as u64, end as u64, 0x202);
+                assert_eq!(emulate_console_only(&mut ctx), -1);
+                assert_eq!(ctx.Rip, code as u64 + 3);
+                assert_eq!(ctx.Rax, (buf + 0x53) as u64);
+                let s = std::slice::from_raw_parts(buf as *const u8, 0x140);
+                assert!(s[..0x40].iter().all(|&b| b == 0xA5));
+                assert!(s[0x40..0x80].iter().all(|&b| b == 0));
+                assert!(s[0x80..0x140].iter().all(|&b| b == 0xA5));
+            }
+        }
+        modules::unregister_mapped(code);
+        unsafe {
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The code bytes of an instruction that raised an exception: its own page without asking,
+    /// the next page only as far as it is there – and an instruction that ends its page, with
+    /// nothing mapped after it, is still emulated.
+    #[test]
+    fn code_bytes_on_the_instructions_page_are_not_asked_about() {
+        use std::sync::{atomic::AtomicBool, Arc};
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let code = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            let buf = VirtualAlloc(std::ptr::null(), 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert!(code != 0 && buf != 0);
+            // 16 bytes or more left on the page; fewer, with the next page there
+            assert_eq!(code_bytes_at(code + 0x100, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFF0, 16), 16);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 16);
+            // … and with the next page not there: what is left of this one
+            assert_ne!(VirtualFree((code + 0x1000) as *mut _, 0x1000, MEM_DECOMMIT), 0);
+            assert_eq!(code_bytes_at(code + 0xFFD, 16), 3);
+            assert_eq!(code_bytes_at(code + 0xFFF, 16), 1);
+            assert_eq!(code_bytes_at(code + 0x800, 16), 16);
+
+            // clzero in the last three bytes of the page
+            modules::register_mapped(Arc::new(modules::MappedModule {
+                name: "page_end.exe".into(), path: "page_end.exe".into(), base: code, size: 0x2000, entry_rva: 0, is_dll: false,
+                exports: Default::default(), tls_callbacks: Mutex::new(Vec::new()), no_thread_calls: AtomicBool::new(false),
+                initialized: AtomicBool::new(true), stack_reserve: 0,
+            }));
+            std::ptr::copy_nonoverlapping([0x0Fu8, 0x01, 0xFC].as_ptr(), (code + 0xFFD) as *mut u8, 3);
+            std::ptr::write_bytes(buf as *mut u8, 0xA5, 0x100);
+            let mut ctx: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = std::mem::zeroed();
+            (ctx.Rip, ctx.Rax) = ((code + 0xFFD) as u64, (buf + 0x47) as u64);
+            assert_eq!(emulate_console_only(&mut ctx), -1);
+            assert_eq!(ctx.Rip as usize, code + 0x1000);
+            let b = std::slice::from_raw_parts(buf as *const u8, 0x100);
+            assert!(b[0x40..0x80].iter().all(|&x| x == 0) && b[..0x40].iter().chain(&b[0x80..]).all(|&x| x == 0xA5));
+            modules::unregister_mapped(code);
+            VirtualFree(code as *mut _, 0, MEM_RELEASE);
+            VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
     }
 }

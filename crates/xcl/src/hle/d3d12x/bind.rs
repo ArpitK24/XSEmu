@@ -22,15 +22,23 @@ use super::console_list::{self, Layout, Param};
 struct State {
     layout: Option<Arc<Layout>>,
     args: Vec<u8>,
+    /// the title's compute root signature that `layout` is of
+    rs: usize,
     /// the graphics root signature's layout and arguments
     layout_gfx: Option<Arc<Layout>>,
     args_gfx: Vec<u8>,
+    /// the title's graphics root signature (a PC object), bound before a draw with an
+    /// untranslated pipeline – created with it – since SetGraphicsRootSignature binds nothing
+    rs_gfx: usize,
     pso: usize,
     allocator: usize,
     /// unified memory of this recording (io, argument tables)
     uma: Vec<usize>,
     /// where the next draw's io and argument table go (blocks in `uma`)
     arena: crate::gpu::uma::Arena,
+    /// (`XCL_GPU_MARKERS`) the user SGPRs `bind_abi` last built here: their first 16 words,
+    /// the shader's own register count and the argument bytes passed in registers
+    last_io: (Vec<u32>, Option<u32>, u32),
 }
 
 static STATES: Mutex<Option<HashMap<usize, State>>> = Mutex::new(None);
@@ -76,11 +84,15 @@ pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
         s.pso = initial_pso;
         s.layout = None;
         s.args.clear();
+        s.rs = 0;
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
         (old, std::mem::take(&mut s.uma))
     });
     console_list::hold_until_reset(old, blocks);
+    super::indirect::recording_done(list as usize, old);
+    super::markers::recording_ended(list as usize);
 }
 
 /// `ClearState(pso)`: resets pipeline and root-argument state back to creation defaults
@@ -90,16 +102,67 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
         s.pso = pso;
         s.layout = None;
         s.args.clear();
+        s.rs = 0;
         s.layout_gfx = None;
         s.args_gfx.clear();
+        s.rs_gfx = 0;
     });
+}
+
+/// Carry bound pipeline and root-signature / root-argument state from `from` to `to` across a
+/// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
+/// `from` retains its previously allocated blocks until `allocator` resets).
+pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    let (layout, args, rs, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
+        (s.layout.clone(), s.args.clone(), s.rs, s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
+    });
+    let (old, blocks) = with(to, |s| {
+        let old = std::mem::replace(&mut s.allocator, allocator);
+        s.arena = Default::default();
+        s.layout = layout;
+        s.args = args;
+        s.rs = rs;
+        s.layout_gfx = layout_gfx;
+        s.args_gfx = args_gfx;
+        s.rs_gfx = rs_gfx;
+        s.pso = pso;
+        (old, std::mem::take(&mut s.uma))
+    });
+    console_list::hold_until_reset(old, blocks);
+    super::indirect::recording_done(to as usize, old);
+    super::markers::recording_ended(to as usize);
 }
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
+        super::indirect::recording_done(list as usize, s.allocator);
         console_list::hold_until_reset(s.allocator, s.uma);
     }
+    super::markers::recording_ended(list as usize);
+}
+
+#[cfg(test)]
+pub(crate) fn seed_reset_state_for_test(list: *mut c_void, allocator: usize, pso: usize, uma: Vec<usize>) {
+    with(list, |s| {
+        s.allocator = allocator;
+        s.pso = pso;
+        s.layout = Some(Arc::new(Layout::default()));
+        s.args = vec![1, 2, 3, 4];
+        s.layout_gfx = Some(Arc::new(Layout::default()));
+        s.args_gfx = vec![5, 6, 7, 8];
+        s.uma = uma;
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_state_for_test(list: *mut c_void) -> (usize, usize, Vec<u8>, Vec<u8>, Vec<usize>) {
+    with(list, |s| (s.allocator, s.pso, s.args.clone(), s.args_gfx.clone(), s.uma.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn remove_state_for_test(list: *mut c_void) {
+    STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize)));
 }
 
 /// bytes of parameter `i` at constant `offset` (of the compute or the graphics arguments)
@@ -124,10 +187,16 @@ fn put(list: *mut c_void, i: u32, offset: u32, bytes: &[u8]) {
 
 /// #34 SetGraphicsRootSignature (PC #30)
 pub(super) unsafe extern "system" fn set_graphics_root_signature(this: *mut c_void, rs: *mut c_void) {
+    // the same root signature again keeps the root arguments (D3D12: only a change of root
+    // signature leaves them undefined)
+    if with(this, |s| s.rs_gfx == rs as usize && s.layout_gfx.is_some()) {
+        return;
+    }
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args_gfx = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout_gfx = layout;
+        s.rs_gfx = rs as usize;
     });
 }
 
@@ -185,13 +254,90 @@ pub(super) fn note_root_changing_signature(sig: usize) {
 pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
-    let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+    let title_pso = with(this, |s| s.pso);
+    let kind = super::indirect::note_call(sig);
+    let pso = super::pso_async::resolve_wait(title_pso);
+    note_named_use(title_pso, pso, "indirect call");
+    // a mesh signature needs a mesh pipeline and a mesh pipeline a mesh signature: the PC call
+    // with any other pair is invalid (a PC pipeline or a stand-in is the title's own pair)
+    let mesh_sig = super::indirect::dispatches_mesh(sig);
+    let two_pass = super::real::two_pass_of(pso);
+    if two_pass.as_ref().is_some_and(|tp| tp.kind != "MS") {
+        mesh_skipped(this, pso, "an ExecuteIndirect", GS_TWO_PASS);
+        return;
+    }
+    let mesh_pso = two_pass.is_some() || super::real::is_native_mesh(pso);
+    if mesh_sig != mesh_pso && (mesh_pso || super::real::is_translated_graphics(pso) || super::real::is_translated_compute(pso)) {
+        mesh_skipped(this, pso, "an ExecuteIndirect", if mesh_sig { "its pipeline has no mesh shader" } else { "its signature does not dispatch mesh work and its pipeline is a mesh pipeline" });
+        return;
+    }
+    note_indirect(pso, sig, max, args, args_off, count_buf, count_off);
+    // console addresses of the arguments and count: an indirect call reading what a skipped
+    // dispatch should have written is skipped too
+    let title = |r: usize, off: u64| (r != 0).then(|| super::real::title_address(r).map(|a| a as u64 + off)).flatten();
+    let (args_title, count_title) = (title(args, args_off), title(count_buf, count_off));
+    let dispatches = super::indirect::dispatches(sig);
+    if let Err(why) = super::indirect::check(sig, max, args_title, count_title) {
+        if dispatches {
+            note_skipped_writer(this, pso, title_pso);
+        }
+        count(if dispatches { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 16 {
+            crate::xlog_warn!("D3D12.X: ExecuteIndirect skipped (pipeline {pso:#x}, at most {max} commands): {why}");
+        }
+        return;
+    }
+    let (gfx, compute) = (super::real::is_translated_graphics(pso) || two_pass.is_some(), super::real::is_translated_compute(pso));
     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+    reach(this);
+    let execute = |safe: Option<(usize, u64, u64)>| {
+        super::residency::note_list_resources(this as usize, [args, count_buf]);
+        super::residency::note_list_untracked(this as usize);
+        match safe {
+            Some((scratch, records, n)) => pc(this, sig, max, scratch, records, scratch, n),
+            None => pc(this, sig, max, args, args_off, count_buf, count_off),
+        }
+    };
     if !gfx && !compute {
-        return pc(this, sig, max, args, args_off, count_buf, count_off);
+        // The stand-in computes and draws nothing, and the list may hold XCL's ABI root
+        // signature from a translated call before it – the PC call with that pair is invalid
+        // (debug layer 953, "the currently set Root Signature doesn't match the currently set
+        // Pipeline State Object"; a retail title's world then hung the GPU, 0x887a0006).
+        if let Some(skip) = indirect_skip(dispatches, title_pso) {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let log = N.fetch_add(1, Ordering::Relaxed) < 8;
+            match skip {
+                IndirectSkip::Untranslated => {
+                    note_skipped_writer(this, pso, title_pso);
+                    count(DISPATCHES_SKIPPED);
+                    if log {
+                        let why = super::real::why_untranslated(pso).unwrap_or_else(|| "no reason kept (not made through XCL's compute pipeline path)".into());
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect of dispatches with a pipeline that has no translated console shader ({pso:#x}) skipped: {why}");
+                    }
+                }
+                IndirectSkip::Building => {
+                    count(DRAWS_SKIPPED);
+                    if log {
+                        crate::xlog_warn!("D3D12.X: ExecuteIndirect of draws with a pipeline still being built after the draw backstop (XCL_BIND_BACKSTOP_MS) skipped");
+                    }
+                }
+            }
+            return;
+        }
+        // a PC pipeline: the title's root signature, as for a draw (`graphics_bound`)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let (Some(list), Some(r)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), ID3D12RootSignature::from_raw_borrowed(&rs)) {
+            list.SetGraphicsRootSignature(r);
+        }
+        execute(None);
+        mark(this, kind);
+        return;
     }
     if ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig)) {
+        if compute {
+            note_skipped_writer(this, pso, title_pso);
+        }
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 4 {
             crate::xlog_warn!("D3D12.X: ExecuteIndirect that changes root arguments with a translated pipeline skipped");
@@ -199,13 +345,58 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
         return;
     }
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+    // the arguments sanitised on the GPU first: XCL's pass binds its own compute pipeline, so it
+    // goes before the call's own bindings
+    // `XCL_GPU_MARKERS`: the first compute calls after any skip keep their words for the log
+    let capture = compute && super::markers::enabled() && capture_now();
+    if let Some(tp) = two_pass {
+        // in two passes: each command's prepass and mesh call read the sanitised copy
+        let plan = two_pass_indirect_plan(&tp, max);
+        let safe = args_title.and_then(|a| super::indirect::sanitise(this as usize, list, sig, max, a, count_title, false, Some(plan)));
+        match two_pass_indirect(this, list, pso, &tp, sig, max, safe, plan, pc) {
+            Ok(()) => {
+                count(DRAWS);
+                mesh_ran(MESH_TWO_PASS);
+                mark(this, "ExecuteIndirect(mesh dispatch in two passes)");
+            }
+            Err(e) => {
+                count(DRAWS_SKIPPED);
+                mesh_skipped(this, pso, "an ExecuteIndirect", &e);
+            }
+        }
+        return;
+    }
+    let safe = args_title.and_then(|a| super::indirect::sanitise(this as usize, list, sig, max, a, count_title, capture, None));
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
+            if mesh_sig {
+                mesh_ran(MESH_NATIVE);
+            }
             count(if gfx { DRAWS } else { DISPATCHES });
-            pc(this, sig, max, args, args_off, count_buf, count_off)
+            let position = capture.then(|| super::markers::position(this as usize)).flatten();
+            execute(safe);
+            mark(this, kind);
+            if compute {
+                note_dispatch_binding(this, title_pso, None);
+                super::indirect::produced(title_pso);
+            }
+            if capture {
+                let (writer, writer_at) = args_title.map_or(("unknown".into(), None), writer_of);
+                let what = format!(
+                    "{} on list {:#x}, at most {max} records at {} (count at {}); the arguments' writer: {writer}",
+                    super::markers::pipeline(title_pso),
+                    this as usize,
+                    args_title.map_or("an address outside title memory".into(), |a| format!("{a:#x}")),
+                    count_title.map_or("none".into(), |c| format!("{c:#x}")),
+                );
+                super::indirect::capture(list, safe, what, position, writer_at);
+            }
         }
         Err(e) => {
             count(if gfx { DRAWS_SKIPPED } else { DISPATCHES_SKIPPED });
+            if compute {
+                note_skipped_writer(this, pso, title_pso);
+            }
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: ExecuteIndirect with a translated pipeline skipped: {e}");
@@ -214,11 +405,121 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     }
 }
 
+/// Why an ExecuteIndirect cannot run its untranslated pipeline `pso` (what `resolve_wait` gave
+/// for the title's `title_pso`).
+#[derive(Debug, PartialEq)]
+enum IndirectSkip {
+    /// dispatches: `resolve_wait` waited until the build ended, as for Dispatch, and it gave no
+    /// translation (failed or refused) – skipped as Dispatch skips it, and what the pipeline
+    /// would have written is unwritten (`note_skipped_writer`)
+    Untranslated,
+    /// draws: the pipeline is still being built after the draw backstop – skipped as a draw is
+    Building,
+}
+
+/// None: the call runs (a PC pipeline, with the title's root signature, as for a draw).
+fn indirect_skip(dispatches: bool, title_pso: usize) -> Option<IndirectSkip> {
+    if dispatches {
+        return Some(IndirectSkip::Untranslated);
+    }
+    super::pso_async::is_pending(title_pso).then_some(IndirectSkip::Building)
+}
+
+/// A DrawInstanced of the console's rect list (three corners of each rectangle, the fourth
+/// implied) as two triangles a rectangle; false: not a rect list, or one this cannot expand
+/// (the caller draws the three vertices as a triangle – half of each rectangle).
+///
+/// The PC has no rect lists. The fourth corner is made here, on the CPU, from the title's
+/// vertex data: v3 = v0 + v2 − v1 (seen in a retail title's full-screen passes: (−1,1) (−1,−1)
+/// (1,−1) with texture coordinates (0,0) (0,1) (1,1) – the missing corner is (1,1), (1,0)).
+/// The vertex layout is not looked at: each 4-byte word that is the same in all three vertices
+/// is kept (a packed colour), any other is taken as a float. Vertices a shader makes from the
+/// vertex index alone (no vertex buffer) are not expanded.
+unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) -> bool {
+    if !cpu_rect_expansion(with(this, |s| s.pso)) {
+        return false;
+    }
+    let Some(vbs) = super::list_x::rect_list_state(this) else { return false };
+    let rects = (vertices / 3) as usize;
+    if vbs.is_empty() || rects == 0 || rects > 4096 {
+        return false;
+    }
+    let mut views = Vec::new();
+    for &(slot, (va, bytes, stride), _) in &vbs {
+        let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
+        let len = rects * 3 * s;
+        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
+            return false;
+        }
+        let p = allocate_upload_memory(this, rects * 6 * s, 16);
+        if p.is_null() {
+            return false;
+        }
+        let word = |v: usize, w: usize| (at as *const u8).add(v * s + w * 4).cast::<u32>().read_unaligned();
+        for r in 0..rects {
+            let out = p.add(r * 6 * s);
+            let src = (at as *const u8).add(r * 3 * s);
+            // v0 v1 v2, then v0 v2 v3
+            std::ptr::copy_nonoverlapping(src, out, 3 * s);
+            std::ptr::copy_nonoverlapping(src, out.add(3 * s), s);
+            std::ptr::copy_nonoverlapping(src.add(2 * s), out.add(4 * s), s);
+            for w in 0..s / 4 {
+                let (a, b, c) = (word(r * 3, w), word(r * 3 + 1, w), word(r * 3 + 2, w));
+                let d = if a == b && b == c { a } else { (f32::from_bits(a) + f32::from_bits(c) - f32::from_bits(b)).to_bits() };
+                out.add(5 * s + w * 4).cast::<u32>().write_unaligned(d);
+            }
+        }
+        views.push((slot, D3D12_VERTEX_BUFFER_VIEW { BufferLocation: super::list_x::pc_va_of(p as u64), SizeInBytes: (rects * 6 * s) as u32, StrideInBytes: stride }));
+    }
+    for (slot, v) in &views {
+        list.IASetVertexBuffers(*slot, Some(&[*v]));
+    }
+    list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
+    for &(slot, _, pc) in &vbs {
+        if let Some(v) = pc {
+            list.IASetVertexBuffers(slot, Some(&[v]));
+        }
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: rect lists are drawn as two triangles a rectangle, the fourth corner made on the CPU");
+    }
+    true
+}
+
+/// Whether a rect list drawn with the bound pipeline `pso` is expanded on the CPU (`draw_rects`):
+/// not with the rect list GS (`real::has_rect_list_gs`), which completes each rect itself – both
+/// would draw every rect twice (each CPU half is three corners of the rect).
+fn cpu_rect_expansion(pso: usize) -> bool {
+    !super::real::has_rect_list_gs(super::pso_async::resolve(pso))
+}
+
 /// #12 DrawInstanced
 pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+    reach(this);
     if let Some(list) = graphics_bound(this) {
-        list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        super::residency::note_list_untracked(this as usize);
+        if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+            super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
+            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+        }
+        mark(this, "draw");
+    }
+}
+
+/// `XCL_GPU_MARKERS`: an op is about to be recorded on `this` – before its bindings and what
+/// else XCL records for it (`markers::before_op`).
+fn reach(this: *mut c_void) {
+    if super::markers::enabled() {
+        unsafe { super::markers::before_op(this) }
+    }
+}
+
+/// `XCL_GPU_MARKERS`: the op just recorded on `this`, with its bound pipeline.
+fn mark(this: *mut c_void, kind: &'static str) {
+    if super::markers::enabled() {
+        unsafe { super::markers::after_op(this, kind, with(this, |s| s.pso)) }
     }
 }
 
@@ -229,10 +530,37 @@ thread_local! {
 
 /// #13 DrawIndexedInstanced
 pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
-    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
-    if let Some(list) = graphics_bound(this) {
-        list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
+        super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
+        emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
     }
+}
+
+/// Prepare an indexed draw once, before callers make temporary native state changes.
+pub(super) unsafe fn prepare_indexed_draw(
+    this: *mut c_void,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+) -> Option<ID3D12GraphicsCommandList> {
+    DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+    reach(this);
+    graphics_bound(this)
+}
+
+/// Submit an indexed draw whose translated graphics state has already been prepared.
+pub(super) unsafe fn emit_prepared_indexed_draw(
+    list: &ID3D12GraphicsCommandList,
+    indices: u32,
+    instances: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    super::residency::note_list_untracked(list.as_raw() as usize);
+    list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    mark(list.as_raw(), "indexed draw");
 }
 
 /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
@@ -242,7 +570,14 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
     let pso = with(this, |s| s.pso);
     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
+    let real = super::pso_async::resolve_wait(pso);
+    let two_pass = super::real::two_pass_of(real);
+    if two_pass.is_some() || super::real::is_native_mesh(real) {
+        // the PC draw with a mesh pipeline is invalid; mesh pipelines draw through DispatchMesh
+        mesh_skipped(this, real, "a draw", if two_pass.is_some_and(|tp| tp.kind != "MS") { GS_TWO_PASS } else { "its pipeline is a mesh pipeline" });
+        return None;
+    }
+    if !super::real::is_translated_graphics(real) {
         count(DRAWS_PC);
         if super::present::trace_frame() {
             // which pipelines draw without a translation (first 12 distinct)
@@ -259,7 +594,14 @@ unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList>
                 );
             }
         }
-        return Some(list); // a PC pipeline: its own root signature and arguments
+        // a PC pipeline (also a stand-in or fallback: made with the title's root signature):
+        // the title's root signature, which nothing else binds on the PC list – a draw without
+        // one is invalid (the debug layer reports it on every GPU; WARP faults on it)
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+            list.SetGraphicsRootSignature(r);
+        }
+        return Some(list);
     }
     if super::present::trace_frame() {
         trace_ui_draw(this, pso);
@@ -500,10 +842,14 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
 
 /// #33 SetComputeRootSignature (PC #29)
 pub(super) unsafe extern "system" fn set_compute_root_signature(this: *mut c_void, rs: *mut c_void) {
+    if with(this, |s| s.rs == rs as usize && s.layout.is_some()) {
+        return;
+    }
     let layout = console_list::layout_of(rs as usize);
     with(this, |s| {
         s.args = vec![0u8; layout.as_ref().map_or(0, |l| l.size as usize)];
         s.layout = layout;
+        s.rs = rs as usize;
     });
 }
 
@@ -538,22 +884,821 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
     super::real::bind_pipeline(this, pso);
 }
 
+/// What each dispatch skipped for want of a translated pipeline may have written, by its
+/// pipeline: its root descriptors (console addresses, 16 MB assumed) and the buffer views of its
+/// descriptor tables (console address, size, PC resource, slot) – checked against the arguments
+/// of indirect calls after it (`note_indirect`).
+static SKIPPED_WRITERS: Mutex<Vec<(usize, Vec<(u64, u64, usize, String)>)>> = Mutex::new(Vec::new());
+
+/// A dispatch of `pso` (the title's `title_pso`) on `this` was skipped: the memory it may have
+/// written is kept, for the log and as unwritten (`indirect::skipped_producer`).
+fn note_skipped_writer(this: *mut c_void, pso: usize, title_pso: usize) {
+    let writes = with(this, |s| s.layout.as_ref().map_or_else(Vec::new, |l| bound_writes(l, &s.args)));
+    super::indirect::skipped_producer(title_pso, &writes.iter().map(|&(base, size, _, _)| (base, if size == 16 << 20 { 64 << 10 } else { size })).collect::<Vec<_>>());
+    let mut w = SKIPPED_WRITERS.lock().unwrap();
+    if w.len() < 256 && !w.iter().any(|e| e.0 == pso) {
+        w.push((pso, writes));
+    }
+}
+
+/// Whether indirect calls are captured now (`XCL_GPU_MARKERS`): fewer than the most so far, and
+/// console code has had a dispatch, draw or indirect call skipped, or a dispatch is waiting for
+/// its compute pipeline.
+fn capture_now() -> bool {
+    let skipped = COUNTS[DISPATCHES_SKIPPED].load(Ordering::Relaxed) + COUNTS[DRAWS_SKIPPED].load(Ordering::Relaxed) > 0;
+    (skipped || super::pso_async::compute_bound_pending()) && super::indirect::capture_wanted()
+}
+
+/// mesh calls of console code (DispatchMesh, mesh ExecuteIndirect): run as a host mesh shader,
+/// run in two passes, skipped
+static MESH_CALLS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+const MESH_NATIVE: usize = 0;
+const MESH_TWO_PASS: usize = 1;
+const MESH_SKIPPED: usize = 2;
+
+/// why a call with a console geometry-shader pipeline (`real::TwoPassPso::kind` "GS") does not
+/// run: its two passes (the vertex and geometry programs as compute, then the pass-through)
+/// are made at pipeline creation, and no draw runs them yet
+const GS_TWO_PASS: &str = "its pipeline has a console geometry shader in two passes, which draws do not run yet";
+
+fn mesh_ran(how: usize) {
+    MESH_CALLS[how].fetch_add(1, Ordering::Relaxed);
+}
+
+/// A draw, mesh dispatch or indirect call (`what`) on the list `this` with the pipeline `pso` does
+/// not run: `why`.
+fn mesh_skipped(this: *mut c_void, pso: usize, what: &str, why: &str) {
+    if super::markers::enabled() {
+        // what it was bound to may never be written: kept for the snapshot (`describe_dispatch`)
+        let bound = with(this, |s| s.layout_gfx.as_ref().map_or_else(Vec::new, |l| bound_writes(l, &s.args_gfx)));
+        let mut r = REFUSED_BOUND.lock().unwrap();
+        for (base, size, ..) in bound {
+            if r.len() < 8192 && !r.iter().any(|&(b, _, p)| b == base && p == pso) {
+                r.push((base, size, pso));
+            }
+        }
+    }
+    let n = MESH_CALLS[MESH_SKIPPED].fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: {what} with mesh work skipped (pipeline {pso:#x}): {why} (#{n})");
+    }
+}
+
+/// The indirect calls so far by type and how mesh calls ran, for the 30 s line.
+pub fn indirect_calls() -> String {
+    let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
+    let (native, two_pass) = super::real::mesh_pipeline_counts();
+    let trips = trips(0).first().map_or(String::new(), |t| format!("; {t}"));
+    format!(
+        "ExecuteIndirect {}; mesh pipelines {native} as host mesh shaders, {two_pass} in two passes; mesh calls {} as host mesh shaders, {} in two passes, {} skipped{trips}",
+        super::indirect::calls_summary(),
+        c(MESH_NATIVE),
+        c(MESH_TWO_PASS),
+        c(MESH_SKIPPED)
+    )
+}
+
+/// PC ID3D12GraphicsCommandList6::DispatchMesh of the PC list behind `this`.
+unsafe fn pc_dispatch_mesh(this: *mut c_void) -> Option<unsafe extern "system" fn(*mut c_void, u32, u32, u32)> {
+    let slot = super::layout::slot(super::layout::find("ID3D12GraphicsCommandList6")?, "DispatchMesh")?;
+    let f = super::real::orig_fn(this, slot);
+    (f != 0).then(|| std::mem::transmute(f))
+}
+
+/// DispatchMesh(x, y, z) – #127 of the older console layout, #129 of the newer: the bound mesh
+/// pipeline's console program runs as a host mesh shader (one PC DispatchMesh with XCL's ABI
+/// bound, as a draw with a translated pipeline), or in two passes (`two_pass_direct`). A console
+/// program numbers its groups on one axis (it finds its group in one register), so y and z fold
+/// into x in both forms.
+pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let title_pso = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_wait(title_pso);
+    note_named_use(title_pso, pso, "mesh dispatch");
+    let (Some(list), Some(pc)) = (ID3D12GraphicsCommandList::from_raw_borrowed(&this), pc_dispatch_mesh(this)) else {
+        mesh_skipped(this, pso, "a DispatchMesh", "the PC command list has no DispatchMesh");
+        return;
+    };
+    reach(this);
+    if let Some(tp) = super::real::two_pass_of(pso) {
+        if tp.kind != "MS" {
+            count(DRAWS_SKIPPED);
+            mesh_skipped(this, pso, "a DispatchMesh", GS_TWO_PASS);
+            return;
+        }
+        match two_pass_direct(this, list, pso, &tp, x, y, z, pc) {
+            Ok(()) => {
+                count(DRAWS);
+                mesh_ran(MESH_TWO_PASS);
+                mark(this, "mesh dispatch in two passes");
+            }
+            Err(e) => {
+                count(DRAWS_SKIPPED);
+                mesh_skipped(this, pso, "a DispatchMesh", &e);
+            }
+        }
+        return;
+    }
+    if !super::real::is_translated_graphics(pso) {
+        // a PC pipeline (also a stand-in): the title's root signature, as for a draw
+        // (`graphics_bound`)
+        count(DRAWS_PC);
+        let rs = with(this, |s| s.rs_gfx) as *mut c_void;
+        if let Some(r) = ID3D12RootSignature::from_raw_borrowed(&rs) {
+            list.SetGraphicsRootSignature(r);
+        }
+        super::residency::note_list_untracked(this as usize);
+        pc(this, x, y, z);
+        mark(this, "mesh dispatch with a PC pipeline");
+        return;
+    }
+    if !super::real::is_native_mesh(pso) {
+        count(DRAWS_SKIPPED);
+        mesh_skipped(this, pso, "a DispatchMesh", "its pipeline has no mesh shader");
+        return;
+    }
+    let groups = (x as u64).saturating_mul(y as u64).saturating_mul(z as u64);
+    if groups > 65535 {
+        count(DRAWS_SKIPPED);
+        mesh_skipped(this, pso, "a DispatchMesh", &format!("{groups} groups are over what one host DispatchMesh takes on an axis"));
+        return;
+    }
+    match bind_abi(this, list, pso, true) {
+        Ok(()) => {
+            count(DRAWS);
+            mesh_ran(MESH_NATIVE);
+            super::residency::note_list_untracked(this as usize);
+            pc(this, groups as u32, 1, 1);
+            mark(this, "mesh dispatch");
+        }
+        Err(e) => {
+            count(DRAWS_SKIPPED);
+            mesh_skipped(this, pso, "a DispatchMesh", &e);
+        }
+    }
+}
+
+/// DispatchMeshX(x, flags, indirect arguments, payload) – #98 of the older console layout, #100
+/// of the newer: the direct form is DispatchMesh(x, 1, 1). With indirect arguments the call is
+/// skipped: the layout of what the console reads there is not known (no title seen uses the
+/// form; its indirect mesh work goes through ExecuteIndirect). A payload is not passed on –
+/// a console mesh program without an amplification shader declares none.
+pub(super) unsafe extern "system" fn dispatch_mesh_x(this: *mut c_void, x: u32, _flags: u64, indirect: u64, payload: u64) {
+    if indirect != 0 {
+        count(DRAWS_SKIPPED);
+        mesh_skipped(this, with(this, |s| s.pso), "a DispatchMeshX", "it takes its group count from memory");
+        return;
+    }
+    if payload != 0 {
+        static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            crate::xlog_warn!("D3D12.X: a DispatchMeshX passes a payload, which the mesh program does not get");
+        }
+    }
+    dispatch_mesh(this, x, 1, 1);
+}
+
+/// record bytes one mesh dispatch in two passes may take from unified memory
+const TWO_PASS_BYTES: u64 = 256 << 20;
+/// XCL's record memory for mesh calls in two passes (`two_pass_scratch`)
+const TWO_PASS_SCRATCH_BYTES: u64 = 32 << 20;
+/// commands one indirect mesh call in two passes may hold
+const TWO_PASS_INDIRECT_COMMANDS: u32 = 64;
+
+/// The GPU address of XCL's record memory for mesh calls in two passes: one buffer of
+/// `TWO_PASS_SCRATCH_BYTES` every such call writes (its prepass) and reads (its mesh call) from
+/// the start. The GPU runs a queue's calls in their order, and a prepass leaves no word of an
+/// earlier call for its mesh call to read (it empties its thread's primitive and its group's
+/// counts first, `emit`'s mesh entry), so the calls need no memory of their own – an indirect
+/// call's group counts are the GPU's, and thousands of such calls a frame could not each take
+/// their worst case. (Mesh calls of two queues at once would share it; console titles record
+/// their graphics work for one.)
+unsafe fn two_pass_scratch() -> Result<u64, String> {
+    static MADE: Mutex<Option<(usize, u64)>> = Mutex::new(None);
+    let mut g = MADE.lock().unwrap();
+    if let Some((_, va)) = *g {
+        return Ok(va);
+    }
+    let raw = super::real::device_raw();
+    let dev = ID3D12Device::from_raw_borrowed(&raw).ok_or("no device")?;
+    let props = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: TWO_PASS_SCRATCH_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+        ..Default::default()
+    };
+    let mut r: Option<ID3D12Resource> = None;
+    super::title_textures::own_work(|| dev.CreateCommittedResource(&props, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, None, &mut r)).map_err(|e| format!("no record memory for mesh calls in two passes: {e}"))?;
+    let r = r.ok_or("no record memory for mesh calls in two passes")?;
+    let va = r.GetGPUVirtualAddress();
+    *g = Some((r.into_raw() as usize, va));
+    Ok(va)
+}
+
+/// Record memory for a mesh dispatch of `bytes` of records: XCL's (`two_pass_scratch`), or for
+/// more than that holds the list's unified memory.
+unsafe fn two_pass_records(this: *mut c_void, bytes: u64) -> Result<u64, String> {
+    if bytes <= TWO_PASS_SCRATCH_BYTES {
+        return two_pass_scratch();
+    }
+    let p = allocate_upload_memory(this, bytes as usize, 256);
+    if p.is_null() {
+        return Err(format!("no unified memory for {} MB of mesh records", bytes >> 20));
+    }
+    super::real::uma_va_of(p as usize).ok_or_else(|| "the mesh records are outside the memory windows".into())
+}
+
+fn uav_barrier_all() -> D3D12_RESOURCE_BARRIER {
+    D3D12_RESOURCE_BARRIER { Type: D3D12_RESOURCE_BARRIER_TYPE_UAV, ..Default::default() }
+}
+
+/// A mesh dispatch with a two-pass pipeline (`real::TwoPassPso`): the console program as a
+/// compute pass writes one record per group, then the title's mesh pipeline (the pass-through)
+/// draws the records. The console numbers mesh groups in x only, so y and z fold into x.
+unsafe fn two_pass_direct(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, tp: &super::real::TwoPassPso, x: u32, y: u32, z: u32, pc: unsafe extern "system" fn(*mut c_void, u32, u32, u32)) -> Result<(), String> {
+    let groups = (x as u64).saturating_mul(y as u64).saturating_mul(z as u64);
+    if groups == 0 {
+        return Ok(());
+    }
+    let split = tp.mesh_groups_per_record.max(1) as u64;
+    let bytes = groups.saturating_mul(tp.record.record_dwords() as u64 * 4);
+    if groups > 65535 || groups * split > 65535 || bytes > TWO_PASS_BYTES {
+        return Err(format!("{groups} groups in two passes are over what one prepass holds ({} MB of records)", bytes >> 20));
+    }
+    let (real, [io, _]) = abi_views(this, pso, true)?;
+    let res = two_pass_records(this, bytes)?;
+    bind_views(this, list, tp.compute_rs, tp.compute, [io, res], false)?;
+    super::residency::note_list_untracked(this as usize);
+    list.Dispatch(groups as u32, 1, 1);
+    list.ResourceBarrier(&[uav_barrier_all()]);
+    bind_views(this, list, tp.mesh_rs, real, [io, res], true)?;
+    pc(this, (groups * split) as u32, 1, 1);
+    Ok(())
+}
+
+/// How an indirect mesh call of `max` commands runs in two passes: (thread groups a command may
+/// run – its share of the call's record memory –, mesh groups per record).
+fn two_pass_indirect_plan(tp: &super::real::TwoPassPso, max: u32) -> (u32, u32) {
+    let split = tp.mesh_groups_per_record.max(1);
+    let record = tp.record.record_dwords() as u64 * 4;
+    let groups = TWO_PASS_SCRATCH_BYTES / max.max(1) as u64 / record.max(1);
+    ((groups as u32).clamp(1, 65535 / split), split)
+}
+
+/// An indirect mesh call with a two-pass pipeline. The group counts are the GPU's, so the record
+/// memory cannot follow them: each command gets room for `plan.0` groups (the sanitiser clamps
+/// its count to that) at its own place – the res view moves – and runs as its own prepass
+/// (XCL's dispatch signature over the sanitised copy) and mesh call (the copy for the mesh pass,
+/// its counts times the pass-through's split). Commands past the GPU's count are empty there.
+#[allow(clippy::too_many_arguments)]
+unsafe fn two_pass_indirect(
+    this: *mut c_void,
+    list: &ID3D12GraphicsCommandList,
+    pso: usize,
+    tp: &super::real::TwoPassPso,
+    sig: usize,
+    max: u32,
+    safe: Option<(usize, u64, u64)>,
+    plan: (u32, u32),
+    pc: unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64),
+) -> Result<(), String> {
+    let (scratch, records, count_at) = safe.ok_or("its arguments could not be sanitised (two passes need the sanitised copy)")?;
+    if max == 0 || max > TWO_PASS_INDIRECT_COMMANDS {
+        return Err(format!("{max} commands in two passes (at most {TWO_PASS_INDIRECT_COMMANDS})"));
+    }
+    let stride = super::indirect::stride_of(sig).ok_or("unknown command signature")? as u64;
+    let dispatch_sig = super::indirect::dispatch_signature(stride as u32).ok_or("no dispatch signature for the prepass")?;
+    let per_command = plan.0 as u64 * tp.record.record_dwords() as u64 * 4;
+    static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !TOLD.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("D3D12.X: an indirect mesh call runs in two passes: each of its {max} commands draws at most {} thread groups ({} KB of records); more are cut", plan.0, per_command >> 10);
+    }
+    let (real, [io, _]) = abi_views(this, pso, true)?;
+    let res = two_pass_scratch()?;
+    super::residency::note_list_untracked(this as usize);
+    // the mesh pass's records follow the count in the sanitised copy
+    let mesh_records = count_at + 4;
+    for k in 0..max as u64 {
+        let views = [io, res + k * per_command];
+        bind_views(this, list, tp.compute_rs, tp.compute, views, false)?;
+        pc(this, dispatch_sig, 1, scratch, records + k * stride, 0, 0);
+        list.ResourceBarrier(&[uav_barrier_all()]);
+        bind_views(this, list, tp.mesh_rs, real, views, true)?;
+        pc(this, sig, 1, scratch, mesh_records + k * stride, 0, 0);
+    }
+    Ok(())
+}
+
+/// (`XCL_GPU_MARKERS`) A translated dispatch as it was bound.
+struct BoundDispatch {
+    title_pso: usize,
+    layout: Arc<Layout>,
+    args: Vec<u8>,
+    /// its place in its recording: (marker slot, generation, op from 0)
+    at: Option<(usize, u32, usize)>,
+    /// its thread groups (none: an indirect dispatch)
+    groups: Option<[u32; 3]>,
+    /// the buffers its arguments bound then (`bound_writes`)
+    buffers: Vec<(u64, u64, usize, String)>,
+    images: Vec<BoundImage>,
+    /// its user SGPRs as `bind_abi` built them (`State::last_io`)
+    io: (Vec<u32>, Option<u32>, u32),
+}
+
+struct BoundImage {
+    table: u32,
+    param: usize,
+    slot: u32,
+    srv: u32,
+    resource: usize,
+    view: crate::gpu::desc::Image,
+}
+
+/// (`XCL_GPU_MARKERS`) the latest translated dispatches – what `writer_of` and
+/// `describe_dispatch` search
+static DISPATCH_BINDINGS: Mutex<std::collections::VecDeque<BoundDispatch>> = Mutex::new(std::collections::VecDeque::new());
+
+/// (`XCL_GPU_MARKERS`) buffers bound to skipped mesh calls: (console address, bytes, pipeline)
+static REFUSED_BOUND: Mutex<Vec<(u64, u64, usize)>> = Mutex::new(Vec::new());
+
+/// The bytes of a bound buffer that count as its memory: a root descriptor's size is not known.
+fn span(size: u64) -> u64 {
+    if size == 16 << 20 {
+        64 << 10
+    } else {
+        size
+    }
+}
+
+fn note_dispatch_binding(this: *mut c_void, title_pso: usize, groups: Option<[u32; 3]>) {
+    if !super::markers::enabled() {
+        return;
+    }
+    let Some((layout, args, io)) = with(this, |s| s.layout.clone().map(|l| (l, s.args.clone(), std::mem::take(&mut s.last_io)))) else { return };
+    note_dispatch_snapshot(this as usize, title_pso, groups, layout, args, io);
+}
+
+pub(super) fn note_dispatch_snapshot(list: usize, title_pso: usize, groups: Option<[u32; 3]>, layout: Arc<Layout>, args: Vec<u8>, io: (Vec<u32>, Option<u32>, u32)) {
+    let at = super::markers::position(list).map(|(s, g, op)| (s, g, op.saturating_sub(1)));
+    let mut images = Vec::new();
+    let buffers = bound_resources(&layout, &args, Some(&mut images));
+    let mut d = DISPATCH_BINDINGS.lock().unwrap();
+    if d.len() >= 16384 {
+        d.pop_front();
+    }
+    d.push_back(BoundDispatch { title_pso, layout, args, at, groups, buffers, images, io });
+}
+
+/// (`XCL_GPU_MARKERS`) What the dispatch that is op `op` (from 0) of the recording at marker
+/// `slot` / `generation` was bound to, for the snapshot of a GPU that hangs in it: its thread
+/// groups, its root arguments, and for each buffer bound what memory holds there now, whether a
+/// skipped dispatch or a skipped mesh call was bound to it too (it may never have been
+/// written), and the latest dispatch before it that was.
+pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<String> {
+    let d = DISPATCH_BINDINGS.lock().unwrap();
+    let Some(i) = d.iter().rposition(|b| b.at == Some((slot, generation, op))) else {
+        return vec![format!("not among the last {} dispatches kept", d.len())];
+    };
+    let b = &d[i];
+    let word = |at: usize| b.args.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).unwrap_or(0);
+    let hex = |w: &[u32]| w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" ");
+    let mut out = vec![format!("{}; thread groups {}", super::markers::pipeline(b.title_pso), b.groups.map_or("from an argument buffer".into(), |g| format!("{} x {} x {}", g[0], g[1], g[2])))];
+    // the registers the shader was given: s0:s1 the argument table, from s4 the first `inline`
+    // bytes of the packed arguments (`console_list::user_data_for`)
+    let (io, user_sgprs, inline) = &b.io;
+    out.push(format!(
+        "io words 0-15 as bound: {}; the shader has {} user registers, {inline} of the {} argument bytes are in registers from s4 (the root signature's rule: {}), the rest in the table at s0:s1",
+        hex(io),
+        user_sgprs.map_or("an unknown number of".into(), |n| n.to_string()),
+        b.layout.size,
+        b.layout.inline
+    ));
+    let place = |at: u32, bytes: u32| format!("bytes {at}..{} {}", at + bytes, if at + bytes <= *inline { format!("in s{}", 4 + at / 4) } else { "in the table".into() });
+    out.push(format!(
+        "root signature layout: {}",
+        b.layout.params.iter().enumerate().map(|(k, p)| match *p {
+            Param::Constants { at, count } => format!("p{k} {count} constants, {}", place(at, 4 * count)),
+            Param::Descriptor { at } => format!("p{k} descriptor, {}", place(at, 8)),
+            Param::Table { at } => format!("p{k} table, {}", place(at, 4)),
+        }).collect::<Vec<_>>().join("; ")
+    ));
+    for (k, p) in b.layout.params.iter().enumerate() {
+        out.push(match *p {
+            Param::Constants { at, count } => format!("p{k} constants: {}", hex(&(0..count.min(64) as usize).map(|n| word(at as usize + 4 * n)).collect::<Vec<_>>())),
+            Param::Descriptor { at } => format!("p{k} root descriptor: {:#x}", word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32),
+            Param::Table { at } => format!("p{k} table at {:#x}", word(at as usize)),
+        });
+    }
+    if let Some(t) = TRIPS.lock().unwrap().as_ref().filter(|t| !t.pieces.is_empty()) {
+        if let Some(i) = (0..TRIP_RING).find(|&i| t.slots[i].0 != 0 && t.slots[i].1 == b.at) {
+            out.push(format!("guard tripwire now: {} gave up", trip_text(&t.words(i).map(|w| w as u64))));
+        }
+    }
+    for BoundImage { table, param, slot, srv, resource, view } in &b.images {
+        out.push(format!(
+            "p{param} table {table:#x} slot {slot} image {:?} {}x{}x{}, GFX10 format {}, {} view mips, SRV index {srv}, companion UAV index {}, resource {resource:#x}",
+            view.ty, view.width, view.height, view.depth, view.format, view.last_level + 1, srv.saturating_add(1)
+        ));
+    }
+    let overlaps = |base: u64, size: u64, other: u64, other_size: u64| base < other + span(other_size) && other < base + span(size);
+    let refused = REFUSED_BOUND.lock().unwrap();
+    for (base, size, res, what) in b.buffers.iter().take(64) {
+        let now = words8(*base).map_or("not readable by the CPU".into(), |w| hex(&w));
+        let skipped = super::indirect::unwritten_overlapping(*base, span(*size)).map_or(String::new(), |(s, e, p)| format!("; NEVER WRITTEN? a skipped dispatch was bound to {s:#x}..{e:#x} ({})", super::markers::pipeline(p)));
+        let mesh = refused.iter().find(|&&(rb, rs, _)| overlaps(*base, *size, rb, rs)).map_or(String::new(), |&(_, _, p)| format!("; a skipped mesh call was bound to it too (pipeline {p:#x})"));
+        let before = d.iter().take(i).rev().enumerate().find(|(_, e)| e.buffers.iter().any(|&(eb, es, ..)| overlaps(*base, *size, eb, es))).map_or("; no dispatch kept before it was bound to it".to_string(), |(n, e)| {
+            format!("; bound before by {}, {} dispatches earlier{}", super::markers::pipeline(e.title_pso), n + 1, e.at.map_or(String::new(), |(s, _, o)| format!(" (op {} of slot {s})", o + 1)))
+        });
+        out.push(format!("{what}: {base:#x}+{:#x}{}: now {now}{skipped}{mesh}{before}", span(*size), if *res == 0 { String::new() } else { format!(" (resource {res:#x})") }));
+    }
+    out
+}
+
+/// (`XCL_GPU_MARKERS`) The guard tripwire's counters (`recomp::IO_TRIP_AT`): four words of
+/// committed unified memory per slot, one for each of `recomp::TRIP_KINDS` – the lanes of a translated shader in which
+/// that guard gave up. Every translated dispatch gets the next slot of a ring; a graphics
+/// pipeline keeps one slot for all its draws.
+struct Trips {
+    /// the counters' memory: pieces of `TRIP_PIECE` slots (no memory: no tripwire)
+    pieces: Vec<usize>,
+    /// per slot: the title pipeline it counts for, the place in its recording (dispatches),
+    /// and the counts already added to `totals`
+    slots: Vec<(usize, Option<(usize, u32, usize)>, [u32; 4])>,
+    /// dispatches given a slot so far
+    next: usize,
+    /// the graphics pipelines' slots (after the ring)
+    gfx: HashMap<usize, usize>,
+    /// by title pipeline: lanes by kind, and the dispatches (or looks at a graphics slot) with any
+    totals: HashMap<usize, ([u64; 4], u64)>,
+    told: u32,
+    /// the first dispatches a guard gave up in, to be described (`describe_tripped`)
+    pending: Vec<(usize, u32, usize)>,
+}
+
+const TRIP_RING: usize = 16384;
+const TRIP_GFX: usize = 4096;
+const TRIP_PIECE: usize = 4096;
+static TRIPS: Mutex<Option<Trips>> = Mutex::new(None);
+
+fn trip_text(c: &[u64; 4]) -> String {
+    let t: Vec<String> = crate::gpu::recomp::TRIP_KINDS.iter().zip(c).filter(|(_, n)| **n != 0).map(|(k, n)| format!("{k} {n}")).collect();
+    if t.is_empty() {
+        "nothing".into()
+    } else {
+        t.join(", ")
+    }
+}
+
+impl Trips {
+    fn over(pieces: Vec<usize>) -> Trips {
+        Trips { pieces, slots: vec![(0, None, [0; 4]); TRIP_RING + TRIP_GFX], next: 0, gfx: HashMap::new(), totals: HashMap::new(), told: 0, pending: Vec::new() }
+    }
+
+    /// where slot `i`'s four words are
+    fn at(&self, i: usize) -> usize {
+        self.pieces[i / TRIP_PIECE] + 16 * (i % TRIP_PIECE)
+    }
+
+    fn words(&self, i: usize) -> [u32; 4] {
+        std::array::from_fn(|k| unsafe { std::ptr::read_volatile((self.at(i) + 4 * k) as *const u32) })
+    }
+
+    /// What slot `i` counted since it was last looked at: into the totals, and a line for the
+    /// first ones.
+    fn harvest(&mut self, i: usize) {
+        let now = self.words(i);
+        let (pso, at, seen) = self.slots[i];
+        if now == seen {
+            return;
+        }
+        let delta: [u64; 4] = std::array::from_fn(|k| now[k].wrapping_sub(seen[k]) as u64);
+        self.slots[i].2 = now;
+        let t = self.totals.entry(pso).or_default();
+        for k in 0..4 {
+            t.0[k] += delta[k];
+        }
+        t.1 += 1;
+        self.told += 1;
+        if let Some(at) = at.filter(|_| self.told <= 8) {
+            self.pending.push(at);
+        }
+        if self.told <= 64 || self.told.is_power_of_two() {
+            let place = at.map_or(String::new(), |(s, _, op)| format!(" (op {} of slot {s})", op + 1));
+            crate::xlog_warn!(
+                "guard tripwire: lanes gave up – {} – in {} with {}{place} (#{})",
+                trip_text(&delta),
+                if i < TRIP_RING { "a dispatch" } else { "draws" },
+                super::markers::pipeline(pso),
+                self.told
+            );
+        }
+    }
+
+    /// The slot for the next dispatch (the oldest of the ring, harvested and cleared) or for
+    /// graphics pipeline `title_pso`.
+    fn take(&mut self, title_pso: usize, at: Option<(usize, u32, usize)>, gfx: bool) -> usize {
+        if gfx {
+            let n = TRIP_RING + self.gfx.len().min(TRIP_GFX - 1);
+            let i = *self.gfx.entry(title_pso).or_insert(n);
+            if self.slots[i].0 == 0 {
+                self.slots[i].0 = title_pso;
+            }
+            return i;
+        }
+        let i = self.next % TRIP_RING;
+        self.next += 1;
+        self.harvest(i);
+        unsafe { std::ptr::write_bytes(self.at(i) as *mut u8, 0, 16) };
+        self.slots[i] = (title_pso, at, [0; 4]);
+        i
+    }
+
+    /// Every slot looked at, then: the lanes by kind in all, and the `most` pipelines with the
+    /// most lanes.
+    fn lines(&mut self, most: usize) -> Vec<String> {
+        for i in 0..self.slots.len() {
+            if self.slots[i].0 != 0 {
+                self.harvest(i);
+            }
+        }
+        let mut v: Vec<(usize, [u64; 4], u64)> = self.totals.iter().map(|(&p, &(lanes, hits))| (p, lanes, hits)).collect();
+        v.sort_by_key(|&(_, lanes, _)| std::cmp::Reverse(lanes.iter().sum::<u64>()));
+        let all: [u64; 4] = std::array::from_fn(|k| v.iter().map(|e| e.1[k]).sum());
+        let mut out = vec![format!("guard tripwire: {} gave up in {} pipelines ({} dispatches and {} graphics pipelines watched)", trip_text(&all), v.len(), self.next, self.gfx.len())];
+        for (p, lanes, hits) in v.into_iter().take(most) {
+            out.push(format!("guard tripwire: {} in {hits} {} with {}", trip_text(&lanes), if self.gfx.contains_key(&p) { "looks at draws" } else { "dispatches" }, super::markers::pipeline(p)));
+        }
+        out
+    }
+}
+
+/// (`XCL_GPU_MARKERS`) io[`IO_TRIP_WINDOW`] and io[`IO_TRIP_AT`] for the next dispatch or draw
+/// of `list` with `title_pso`: the memory window of its four counters and their offset in it;
+/// offset 0: no tripwire.
+pub(super) fn trip_watch(list: *mut c_void, title_pso: usize, gfx: bool) -> (u32, u32) {
+    let Some(u) = crate::gpu::uma::get().filter(|_| super::markers::enabled()) else { return (0, 0) };
+    let at = if gfx { None } else { super::markers::position(list as usize) };
+    let mut g = TRIPS.lock().unwrap();
+    let t = g.get_or_insert_with(|| {
+        // from XCL's own pool, as the lists' argument tables are (the coherent window, which
+        // the CPU reads; the title holds the rest of it)
+        let (mut arena, mut blocks) = (crate::gpu::uma::Arena::default(), Vec::new());
+        let pieces: Option<Vec<usize>> = (0..(TRIP_RING + TRIP_GFX) / TRIP_PIECE)
+            .map(|_| {
+                let p = arena.take(u, 16 * TRIP_PIECE, 16, &mut blocks).filter(|&p| u.is_committed(p as usize))?;
+                unsafe { std::ptr::write_bytes(p, 0, 16 * TRIP_PIECE) };
+                Some(p as usize)
+            })
+            .collect();
+        match &pieces {
+            Some(p) => crate::xlog_info!("guard tripwire: counters for {TRIP_RING} dispatches and {TRIP_GFX} graphics pipelines, the first at {:#x}", p[0]),
+            None => crate::xlog_warn!("guard tripwire: no room in committed unified memory for its counters – off"),
+        }
+        Trips::over(pieces.unwrap_or_default())
+    });
+    if t.pieces.is_empty() {
+        return (0, 0);
+    }
+    let i = t.take(title_pso, at, gfx);
+    let a = t.at(i);
+    let pending = std::mem::take(&mut t.pending);
+    drop(g);
+    describe_tripped(pending);
+    u.window_of(a).map_or((0, 0), |k| (k as u32, (a - u.window(k).0) as u32))
+}
+
+/// What the first dispatches a guard gave up in were bound to (`describe_dispatch`: their
+/// registers, root arguments and buffers) – the lock on the counters is not held here.
+fn describe_tripped(pending: Vec<(usize, u32, usize)>) {
+    for (slot, generation, op) in pending {
+        for line in describe_dispatch(slot, generation, op) {
+            crate::xlog_warn!("guard tripwire: slot {slot} op {}: {line}", op + 1);
+        }
+    }
+}
+
+/// (`XCL_GPU_MARKERS`) The guards that gave up so far (`Trips::lines`); nothing without a
+/// tripwire.
+pub(super) fn trips(most: usize) -> Vec<String> {
+    let (lines, pending) = TRIPS.lock().unwrap().as_mut().filter(|t| !t.pieces.is_empty()).map_or_else(Default::default, |t| (t.lines(most), std::mem::take(&mut t.pending)));
+    describe_tripped(pending);
+    lines
+}
+
+/// (`XCL_GPU_MARKERS`) The dispatches of the recordings `open` (marker slot, generation) in
+/// which a guard has given up by now: (slot, op from 0, the lanes by kind), from the counters as
+/// they are. A dispatch whose counters the ring has given to a later one is not among them.
+pub(super) fn trips_in(open: &[(usize, u32)]) -> Vec<(usize, usize, String)> {
+    let g = TRIPS.lock().unwrap();
+    let Some(t) = g.as_ref().filter(|t| !t.pieces.is_empty()) else { return Vec::new() };
+    let mut v: Vec<(usize, usize, String)> = (0..TRIP_RING)
+        .filter_map(|i| {
+            let (pso, at, _) = t.slots[i];
+            let (slot, _, op) = at.filter(|&(s, generation, _)| pso != 0 && open.contains(&(s, generation)))?;
+            let w = t.words(i);
+            w.iter().any(|&n| n != 0).then(|| (slot, op, trip_text(&w.map(|n| n as u64))))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// (`XCL_GPU_MARKERS`) The lanes that gave up in the draws of graphics pipeline `title_pso`,
+/// all of them so far, by kind (None: its draws are not watched).
+pub(super) fn trips_of_draws(title_pso: usize) -> Option<String> {
+    let g = TRIPS.lock().unwrap();
+    let t = g.as_ref().filter(|t| !t.pieces.is_empty())?;
+    t.gfx.get(&title_pso).map(|&i| trip_text(&t.words(i).map(|n| n as u64)))
+}
+
+/// The process ends: the guards that gave up since the last 30 s line would be lost.
+pub fn log_trips() {
+    for line in trips(24) {
+        crate::xlog_info!("at the end: {line}");
+    }
+}
+
+/// The latest translated dispatch whose bound buffers (as bound then) cover console address
+/// `va`, as text, and its place in its recording.
+fn writer_of(va: u64) -> (String, Option<(usize, u32, usize)>) {
+    let d = DISPATCH_BINDINGS.lock().unwrap();
+    for b in d.iter().rev() {
+        if let Some((base, size, _, what)) = b.buffers.iter().find(|&&(base, size, _, _)| va >= base && va < base + size) {
+            return (format!("{} through {what} ({base:#x}+{size:#x})", super::markers::pipeline(b.title_pso)), b.at);
+        }
+    }
+    if let Some((s, e, p)) = super::indirect::unwritten_at(va) {
+        return (format!("none of the last {} dispatches; unwritten since pipeline {p:#x} was skipped ({s:#x}..{e:#x})", d.len()), None);
+    }
+    (format!("none of the last {} dispatches binds it", d.len()), None)
+}
+
+/// The buffers root arguments `args` of `layout` bind (console address, bytes, PC resource,
+/// which argument): the memory a dispatch with them may write.
+fn bound_writes(layout: &Layout, args: &[u8]) -> Vec<(u64, u64, usize, String)> {
+    bound_resources(layout, args, None)
+}
+
+fn bound_resources(
+    layout: &Layout,
+    args: &[u8],
+    mut images: Option<&mut Vec<BoundImage>>,
+) -> Vec<(u64, u64, usize, String)> {
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut out = Vec::new();
+    for (i, p) in layout.params.iter().enumerate() {
+        match *p {
+            Param::Descriptor { at } => {
+                let va = word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32;
+                if va != 0 {
+                    out.push((va, 16 << 20, 0, format!("p{i} root descriptor")));
+                }
+            }
+            Param::Table { at } => {
+                let t = word(at as usize);
+                for k in 0..64u32 {
+                    let addr = t.wrapping_add(32 * k);
+                    let Some(w) = super::console_heap::words_at(addr) else { break };
+                    let resource = || crate::gpu::uma::get().and_then(|u| super::console_heap::resource_at(u.base() + addr as usize)).unwrap_or(0);
+                    if w[3] >> 30 != 0 {
+                        if let Some(images) = images.as_deref_mut() {
+                            if let Some(view) = crate::gpu::desc::image(&w) {
+                                images.push(BoundImage { table: t, param: i, slot: k, srv: w[0], resource: resource(), view });
+                            }
+                        }
+                        continue;
+                    }
+                    let (base, stride, records) = (w[0] as u64 | ((w[1] & 0xffff) as u64) << 32, ((w[1] >> 16) & 0x3fff) as u64, w[2] as u64);
+                    if base == 0 || records == 0 {
+                        continue;
+                    }
+                    out.push((base, records * stride.max(1), resource(), format!("p{i} table {t:#x} slot {k}")));
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The arguments and counts of the first indirect calls after a skipped dispatch (console
+/// addresses), read again when the device is removed (`indirect_args_at_removal`).
+static INDIRECT_SEEN: Mutex<Vec<(u64, Option<u64>)>> = Mutex::new(Vec::new());
+
+/// The first 8 words at a console address, when the CPU can read it.
+fn words8(va: u64) -> Option<[u32; 8]> {
+    if va == 0 || !crate::gpu::shader::readable(va as usize, 32) {
+        return None;
+    }
+    let mut w = [0u32; 8];
+    for (k, x) in w.iter_mut().enumerate() {
+        *x = unsafe { ((va as usize + 4 * k) as *const u32).read_unaligned() };
+    }
+    Some(w)
+}
+
+/// An indirect call after a dispatch was skipped: its most commands, where its arguments and
+/// count are, what they hold now, and which skipped dispatch's buffers cover them (logged, the
+/// first 64).
+unsafe fn note_indirect(pso: usize, sig: usize, max: u32, args: usize, args_off: u64, count_buf: usize, count_off: u64) {
+    let writers = SKIPPED_WRITERS.lock().unwrap();
+    if writers.is_empty() {
+        return;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) >= 64 {
+        return;
+    }
+    let va = |r: usize, off: u64| {
+        (r != 0).then(|| super::real::title_address(r).map_or_else(|| ID3D12Resource::from_raw_borrowed(&(r as *mut c_void)).map_or(0, |r| r.GetGPUVirtualAddress()), |a| a as u64) + off)
+    };
+    let (args_va, count_va) = (va(args, args_off).unwrap_or(0), va(count_buf, count_off));
+    let covers = |res: usize, at: u64| {
+        writers.iter().find_map(|(p, ws)| {
+            ws.iter()
+                .find(|&&(base, size, r, _)| (r != 0 && r == res) || (at >= base && at < base + size))
+                .map(|(base, size, r, what)| format!("{p:#x} ({what}: {base:#x}, {size} B{})", if *r == res && res != 0 { ", the same resource" } else { "" }))
+        })
+    };
+    let producer = match (covers(args, args_va), count_va.and_then(|v| covers(count_buf, v))) {
+        (None, None) => format!("no skipped dispatch's root descriptors or table buffers cover them ({} skipped pipelines)", writers.len()),
+        (a, c) => format!("arguments written by skipped {}, count by skipped {}", a.unwrap_or_else(|| "none".into()), c.unwrap_or_else(|| "none".into())),
+    };
+    {
+        let mut seen = INDIRECT_SEEN.lock().unwrap();
+        if seen.len() < 16 {
+            seen.push((args_va, count_va));
+        }
+    }
+    crate::xlog_warn!(
+        "D3D12.X: ExecuteIndirect after a skipped dispatch (pipeline {pso:#x}, translated graphics {}, compute {}; signature {sig:#x}): at most {max} commands, arguments at {args_va:#x} (now {:x?}), count {}; {producer}",
+        super::real::is_translated_graphics(pso),
+        super::real::is_translated_compute(pso),
+        words8(args_va),
+        count_va.map_or_else(|| "none (max is the count)".to_string(), |v| format!("at {v:#x} (now {:x?})", words8(v).map(|w| w[0])))
+    );
+}
+
+/// When the device is removed: what the arguments of the first indirect calls after a skipped
+/// dispatch hold then (written by the GPU by that time, where the CPU can read them).
+pub(super) fn indirect_args_at_removal() {
+    for (args, count) in INDIRECT_SEEN.lock().unwrap().iter() {
+        crate::xlog_error!(
+            "D3D12.X: at the removal, ExecuteIndirect arguments at {args:#x}: {:x?}{}",
+            words8(*args),
+            count.map_or(String::new(), |c| format!(", count at {c:#x}: {:x?}", words8(c).map(|w| w[0])))
+        );
+    }
+}
+
+/// The first dispatch or indirect call of a traced named pipeline (`XCL_TRACE_NAMED_PSO`).
+fn note_named_use(title_pso: usize, pso: usize, what: &str) {
+    let Some(name) = super::real::traced_pso(title_pso) else { return };
+    static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+    let mut seen = SEEN.lock().unwrap();
+    if seen.len() >= 4096 || seen.contains(&title_pso) {
+        return;
+    }
+    seen.push(title_pso);
+    let state = if super::real::is_translated_compute(pso) || super::real::is_translated_graphics(pso) {
+        "translated, run".to_string()
+    } else {
+        format!("no translation, skipped: {}", super::real::why_untranslated(pso).unwrap_or_else(|| "no reason kept".into()))
+    };
+    crate::xlog_info!("named pipeline '{name}': first {what} with {pso:#x} (title's {title_pso:#x}): {state}");
+}
+
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
-    let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
+    let title_pso = with(this, |s| s.pso);
+    let pso = super::pso_async::resolve_wait(title_pso);
+    note_named_use(title_pso, pso, "dispatch");
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
+        note_skipped_writer(this, pso, title_pso);
         // a console pipeline without a translation (including a background build that
         // failed): nothing to run (its root arguments were not given to the PC list either)
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
-            crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped");
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            let why = super::real::why_untranslated(pso).unwrap_or_else(|| "no reason kept (not made through XCL's compute pipeline path)".into());
+            crate::xlog_warn!("D3D12.X: Dispatch with a pipeline that has no translated console shader ({pso:#x}) skipped: {why}");
         }
         count(DISPATCHES_SKIPPED);
         return;
     }
+    reach(this);
     match translated_dispatch(this, list, pso, x, y, z) {
-        Ok(()) => count(DISPATCHES),
+        Ok(()) => {
+            count(DISPATCHES);
+            mark(this, "dispatch");
+            note_dispatch_binding(this, title_pso, Some([x, y, z]));
+            super::indirect::produced(title_pso);
+        }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -674,14 +1819,71 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    super::residency::note_list_untracked(this as usize);
     list.Dispatch(x, y, z);
     Ok(())
 }
 
+/// `XCL_DS_VALIDATE`: io[`IO_CARRY_AT`], the window 0 offset of a word translated shaders set
+/// when a lane's address leaves the window of its scalar base (`emit::Em::check_carry`), and a
+/// warning the first time one did.
+pub(super) fn carry_watch() -> u32 {
+    static WORD: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    static TOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let p = *WORD.get_or_init(|| {
+        if !std::env::var("XCL_DS_VALIDATE").is_ok_and(|v| v != "0") {
+            return 0;
+        }
+        let Some(p) = crate::gpu::uma::get().and_then(|u| u.alloc_in(0, 16, 16)) else { return 0 };
+        unsafe { std::ptr::write_volatile(p as *mut u32, 0) };
+        p as usize
+    });
+    if p == 0 {
+        return 0;
+    }
+    if unsafe { std::ptr::read_volatile(p as *const u32) } != 0 && !TOLD.swap(true, Ordering::Relaxed) {
+        crate::xlog_warn!("XCL_DS_VALIDATE: a translated shader addressed memory past the 4 GiB window of its scalar base (outside any allocation): the access wrapped inside that window");
+    }
+    p as u32
+}
+
 /// XCL's ABI for a translated pipeline: its root signature, the user SGPRs (`io`, the kept
 /// arguments the console's way – compute or graphics) and the argument table in unified
-/// memory, u1 res, u2… the memory windows; then the pipeline.
+/// memory, u1 res, the shared descriptor heap (the memory windows' views, `real::mem_views`);
+/// then the pipeline.
 unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usize, gfx: bool) -> Result<(), String> {
+    let (real, views) = abi_views(this, pso, gfx)?;
+    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
+    bind_views(this, list, rs, real, views, gfx)
+}
+
+/// The ABI's root signature `rs`, its two root views (io, res) and the pipeline `pipeline` on
+/// `list`, as compute or graphics state.
+unsafe fn bind_views(this: *mut c_void, list: &ID3D12GraphicsCommandList, rs: usize, pipeline: usize, views: [u64; 2], gfx: bool) -> Result<(), String> {
+    let rs = rs as *mut c_void;
+    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
+    super::list_x::ensure_view_heap(this);
+    if gfx {
+        list.SetGraphicsRootSignature(rs);
+        for (k, v) in views.into_iter().enumerate() {
+            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
+        }
+    } else {
+        list.SetComputeRootSignature(rs);
+        for (k, v) in views.into_iter().enumerate() {
+            list.SetComputeRootUnorderedAccessView(k as u32, v);
+        }
+    }
+    let pipeline = pipeline as *mut c_void;
+    let pc = ID3D12PipelineState::from_raw_borrowed(&pipeline).ok_or("pipeline")?;
+    list.SetPipelineState(pc);
+    Ok(())
+}
+
+/// What `bind_abi` binds for the pipeline `pso`: the pipeline (a build in the background waited
+/// for) and the GPU addresses of its io (the user SGPRs, the argument table written to unified
+/// memory) and of a small res.
+unsafe fn abi_views(this: *mut c_void, pso: usize, gfx: bool) -> Result<(usize, [u64; 2]), String> {
     let u = crate::gpu::uma::get().ok_or("no unified memory")?;
     let windows = super::real::uma_window_vas();
     let first = super::real::shader_window_base(&windows)?;
@@ -692,38 +1894,29 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
         Ok(p as usize)
     };
-    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { l.inline } as usize).min(args.len());
+    // a pipeline still being built in the background is waited for
+    let real = super::pso_async::resolve_wait(pso);
+    // a compute shader takes no more arguments from registers than it has (`inline_for`)
+    let user_sgprs = if gfx { None } else { super::real::pso_user_sgprs(real) };
+    let inline = layout.as_ref().map_or(0, |l| if gfx { l.inline_gfx } else { console_list::inline_for(l, user_sgprs) } as usize).min(args.len());
     let table_at = copy(&args[inline..])?;
     let mut io = match layout.as_ref() {
         Some(l) if gfx => console_list::user_data_gfx(l, &args, table_at as u64),
-        Some(l) => console_list::user_data(l, &args, table_at as u64),
+        Some(l) => console_list::user_data_for(l, user_sgprs, &args, table_at as u64),
         None => vec![table_at as u32, (table_at >> 32) as u32],
     };
     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+    if !gfx && super::markers::enabled() {
+        with(this, |s| s.last_io = (io[..16].to_vec(), user_sgprs, inline as u32));
+    }
+    io[crate::gpu::recomp::IO_UMA_BASE_HI] = (u.base() >> 32) as u32;
+    io[crate::gpu::recomp::IO_MEM_VIEWS] = super::real::mem_views().ok_or("memory windows have no views")?;
+    io[crate::gpu::recomp::IO_CARRY_AT] = carry_watch();
+    (io[crate::gpu::recomp::IO_TRIP_WINDOW], io[crate::gpu::recomp::IO_TRIP_AT]) = trip_watch(this, with(this, |s| s.pso), gfx);
     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
     let res_at = copy(&[0u8; 256])?;
     let va = |p: usize| super::real::uma_va_of(p).unwrap_or(first);
-    // a pipeline still being built in the background is waited for
-    let real = super::pso_async::resolve_wait(pso);
-    let rs = super::real::pso_root_signature(real).or_else(|| super::real::abi_rs_cached().map(|p| p as usize)).ok_or("no XCL ABI root signature")?;
-    let rs = rs as *mut c_void;
-    let rs = ID3D12RootSignature::from_raw_borrowed(&rs).ok_or("root signature")?;
-    let views = [va(io_at), va(res_at)].into_iter().chain((0..4).map(|k| windows.get(k).copied().unwrap_or(first)));
-    if gfx {
-        list.SetGraphicsRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetGraphicsRootUnorderedAccessView(k as u32, v);
-        }
-    } else {
-        list.SetComputeRootSignature(rs);
-        for (k, v) in views.enumerate() {
-            list.SetComputeRootUnorderedAccessView(k as u32, v);
-        }
-    }
-    let real = real as *mut c_void;
-    let pc = ID3D12PipelineState::from_raw_borrowed(&real).ok_or("pipeline")?;
-    list.SetPipelineState(pc);
-    Ok(())
+    Ok((real, [va(io_at), va(res_at)]))
 }
 
 #[cfg(test)]
@@ -752,6 +1945,74 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
+    #[test]
+    fn rect_lists_with_the_rect_list_gs_are_not_expanded_on_the_cpu() {
+        let (with_gs, without) = (0x7E57_4000usize, 0x7E57_5000usize);
+        real::register_rect_list_gs_for_test(with_gs);
+        assert!(!cpu_rect_expansion(with_gs));
+        assert!(cpu_rect_expansion(without) && cpu_rect_expansion(0));
+        real::forget_pso_for_test(with_gs);
+        assert!(cpu_rect_expansion(with_gs));
+    }
+
+    /// An ExecuteIndirect of dispatches waits for its compute pipeline as Dispatch does, past the
+    /// draw backstop, and runs it once built; one whose build failed is skipped as Dispatch skips
+    /// it. An ExecuteIndirect of draws follows the draw backstop: skipped while its pipeline is
+    /// still being built after it, and a failed one goes to the PC call (its stand-in draws
+    /// nothing). The gate `execute_indirect` uses after `resolve_wait`.
+    #[test]
+    fn execute_indirect_waits_for_a_compute_pipeline_and_a_draw_follows_the_backstop() {
+        let (compute, compute_failed, draw, draw_failed) = (0x7E57_6011usize, 0x7E57_6012usize, 0x7E57_6013usize, 0x7E57_6014usize);
+        let gate = std::sync::Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let held = |g: std::sync::Arc<(Mutex<bool>, std::sync::Condvar)>, real: usize| -> pso_async::Job {
+            Box::new(move || {
+                if pso_async::preparing() {
+                    return 0;
+                }
+                let mut open = g.0.lock().unwrap();
+                while !*open {
+                    open = g.1.wait(open).unwrap();
+                }
+                real
+            })
+        };
+        pso_async::submit_lazy(compute, true, held(gate.clone(), 0x1241), 0);
+        pso_async::submit_lazy(draw, false, held(gate.clone(), 0x1243), 0);
+        pso_async::submit_lazy(compute_failed, true, Box::new(|| 0), 0);
+        pso_async::submit_lazy(draw_failed, false, Box::new(|| 0), 0);
+        real::register_translated_compute_for_test(0x1241);
+
+        pso_async::BACKSTOP.with(|b| b.set(Some(Some(std::time::Duration::from_millis(100)))));
+        let t0 = std::time::Instant::now();
+        assert_eq!(pso_async::resolve_wait(draw), draw, "a draw is not waited for past the backstop");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(indirect_skip(false, draw), Some(IndirectSkip::Building));
+
+        let waiter = std::thread::spawn(move || {
+            pso_async::BACKSTOP.with(|b| b.set(Some(Some(std::time::Duration::from_millis(100)))));
+            pso_async::resolve_wait(compute)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        assert!(!waiter.is_finished(), "dispatches wait past the backstop");
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        let built = waiter.join().unwrap();
+        assert_eq!(built, 0x1241);
+        assert!(real::is_translated_compute(built), "built: it runs translated, never skipped");
+
+        assert_eq!(pso_async::resolve_wait(compute_failed), compute_failed);
+        assert!(!real::is_translated_compute(compute_failed));
+        assert_eq!(indirect_skip(true, compute_failed), Some(IndirectSkip::Untranslated), "a failed build is skipped as Dispatch skips it");
+        assert_eq!(pso_async::resolve_wait(draw_failed), draw_failed);
+        assert_eq!(indirect_skip(false, draw_failed), None, "a failed draw pipeline goes to the PC call");
+
+        real::forget_pso_for_test(0x1241);
+        for p in [compute, compute_failed, draw, draw_failed] {
+            pso_async::released(p);
+        }
+    }
+
     /// Minimal RTS0 v2 root signature blob with one 4-constant parameter.
     fn test_rts0_blob() -> Vec<u8> {
         let words: [u32; 12] = [
@@ -760,6 +2021,134 @@ mod tests {
             0, 0, 4,           // shader_reg=0, reg_space=0, num_32bit_values=4
         ];
         words.iter().flat_map(|w| w.to_le_bytes()).collect()
+    }
+
+    /// Setting the root signature already set keeps the root arguments (D3D12 leaves them
+    /// undefined only when the root signature changes); another one starts from zero.
+    #[test]
+    fn the_same_root_signature_again_keeps_the_root_arguments() {
+        let list = 0x7100_0501usize as *mut c_void;
+        let (rs, other) = (0x7100_0510usize, 0x7100_0520usize);
+        let blob = test_rts0_blob();
+        console_list::note_root_signature(rs, &blob);
+        console_list::note_root_signature(other, &blob);
+        reset(list, 0x7100_0600, 0);
+        let holds = |gfx: bool, v: u32| with(list, |s| if gfx { &s.args_gfx } else { &s.args }.windows(4).any(|w| w == v.to_le_bytes()));
+        unsafe {
+            set_compute_root_signature(list, rs as *mut c_void);
+            set_compute_root_constant(list, 0, 0xDEAD_BEEF, 0);
+            set_graphics_root_signature(list, rs as *mut c_void);
+            set_graphics_root_constant(list, 0, 0xCAFE_BABE, 0);
+            set_compute_root_signature(list, rs as *mut c_void);
+            set_graphics_root_signature(list, rs as *mut c_void);
+        }
+        assert!(holds(false, 0xDEAD_BEEF) && holds(true, 0xCAFE_BABE));
+        unsafe {
+            set_compute_root_signature(list, other as *mut c_void);
+            set_graphics_root_signature(list, other as *mut c_void);
+        }
+        assert!(!holds(false, 0xDEAD_BEEF) && !holds(true, 0xCAFE_BABE));
+        assert!(with(list, |s| !s.args.is_empty() && s.args.iter().chain(&s.args_gfx).all(|&b| b == 0)));
+        remove_state_for_test(list);
+    }
+
+    /// Indirect calls with a mesh signature are known as mesh work, and every skipped mesh call
+    /// is counted for the 30 s line.
+    #[test]
+    fn mesh_signatures_are_known_and_skipped_mesh_calls_counted() {
+        let (mesh, dispatch) = (0x7100_0701usize, 0x7100_0702usize);
+        super::super::indirect::note_signature(mesh, super::super::indirect::DISPATCH_MESH, 12, true);
+        super::super::indirect::note_signature(dispatch, super::super::indirect::DISPATCH, 12, true);
+        assert!(super::super::indirect::dispatches_mesh(mesh) && !super::super::indirect::dispatches_mesh(dispatch));
+        assert_eq!(super::super::indirect::stride_of(mesh), Some(12));
+        let before = MESH_CALLS[MESH_SKIPPED].load(Ordering::Relaxed);
+        mesh_skipped(0x7100_0711usize as *mut c_void, 0x7100_0710, "a test call", "a test");
+        assert_eq!(MESH_CALLS[MESH_SKIPPED].load(Ordering::Relaxed), before + 1);
+        assert!(indirect_calls().contains("as host mesh shaders"));
+    }
+
+    /// The tripwire's readback: a dispatch's slot is counted once into its pipeline's totals,
+    /// the ring clears a slot before the next dispatch takes it, and a graphics pipeline keeps
+    /// one slot whose counts add up.
+    #[test]
+    fn tripped_guards_are_counted_by_pipeline_and_dispatch() {
+        let mut words = vec![0u32; 4 * (TRIP_RING + TRIP_GFX)];
+        let mut t = Trips::over((0..(TRIP_RING + TRIP_GFX) / TRIP_PIECE).map(|p| words.as_mut_ptr() as usize + 16 * TRIP_PIECE * p).collect());
+        let set = |t: &Trips, i: usize, k: usize, n: u32| unsafe { std::ptr::write_volatile((t.at(i) + 4 * k) as *mut u32, n) };
+        let (cs, vs) = (0x7100_0910usize, 0x7100_0920usize);
+        let first = t.take(cs, Some((990_002, 3, 0)), false);
+        assert_eq!((first, t.take(cs, Some((990_002, 3, 1)), false)), (0, 1));
+        set(&t, 0, 0, 640);
+        set(&t, 0, 3, 2);
+        let lines = t.lines(8);
+        assert!(lines[0].contains("loop guard 640, compare-exchange retries 2 gave up in 1 pipelines (2 dispatches"), "{lines:?}");
+        assert!(lines[1].contains("in 1 dispatches with pipeline 0x71000910"), "{lines:?}");
+        assert_eq!(t.lines(8), lines, "a slot already counted is not counted again");
+
+        let g = t.take(vs, None, true);
+        assert_eq!((g, t.take(vs, None, true)), (TRIP_RING, TRIP_RING));
+        set(&t, g, 1, 5);
+        t.lines(0);
+        set(&t, g, 1, 9);
+        assert!(t.lines(8).iter().any(|l| l.contains("wave64 meet 9 in 2 looks at draws with pipeline 0x71000920")), "{:?}", t.lines(8));
+
+        // the ring comes round: the slot is cleared for its next dispatch, its counts are kept
+        t.next = TRIP_RING;
+        assert_eq!(t.take(0x7100_0930, None, false), 0);
+        assert_eq!(t.words(0), [0; 4]);
+        assert_eq!(t.totals[&cs], ([640, 0, 0, 2], 1));
+    }
+
+    /// The snapshot's account of a dispatch: its groups, its root arguments, and for each buffer
+    /// it was bound to whether a skipped dispatch or a skipped mesh call was bound to it too
+    /// and which dispatch before it was.
+    #[test]
+    fn a_dispatch_is_described_with_what_its_buffers_were_bound_to_before() {
+        let rs = 0x7100_0810usize;
+        console_list::note_root_signature(rs, &test_rts0_blob());
+        let layout = console_list::layout_of(rs).unwrap();
+        let (slot, skipped_pso, mesh_pso) = (990_001usize, 0x7100_0820usize, 0x7100_0830usize);
+        let (a, b, c) = (0x7_1000_0000u64, 0x7_2000_0000u64, 0x7_3000_0000u64);
+        let bound = |pso: usize, op: usize, buffers: &[u64]| BoundDispatch {
+            title_pso: pso,
+            layout: layout.clone(),
+            args: vec![0xEF, 0xBE, 0xAD, 0xDE, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            at: Some((slot, 7, op)),
+            groups: Some([8, 4, 1]),
+            buffers: buffers.iter().map(|&base| (base, 0x100, 0, "p1 table 0x40 slot 0".to_string())).collect(),
+            images: vec![BoundImage {
+                table: 0x40,
+                param: 1,
+                slot: 5,
+                srv: 10,
+                resource: 0x1234,
+                view: crate::gpu::desc::image(&crate::gpu::desc::xcl_image_for_view(10, 22, crate::gpu::desc::ImageType::D3, 8, 4, 2, 1)).unwrap(),
+            }],
+            io: (vec![0x5000, 7, 0, 0, 0xDEAD_BEEF, 0, 0, 0], Some(8), 16),
+        };
+        {
+            let mut d = DISPATCH_BINDINGS.lock().unwrap();
+            d.push_back(bound(0x7100_0840, 0, &[a]));
+            d.push_back(bound(0x7100_0850, 1, &[a, b, c]));
+        }
+        super::super::indirect::skipped_producer(skipped_pso, &[(b + 0x80, 0x40)]);
+        REFUSED_BOUND.lock().unwrap().push((c, 0x100, mesh_pso));
+
+        let lines = describe_dispatch(slot, 7, 1);
+        assert!(lines.iter().any(|s| s.contains("p1 table 0x40 slot 5 image D3 8x4x2") && s.contains("SRV index 10, companion UAV index 11, resource 0x1234")), "{lines:?}");
+        assert!(lines[0].contains("thread groups 8 x 4 x 1"), "{lines:?}");
+        assert!(lines[1].contains("io words 0-15 as bound: 5000 7 0 0 deadbeef 0 0 0; the shader has 8 user registers, 16 of the 16 argument bytes are in registers"), "{lines:?}");
+        assert!(lines[2].contains("root signature layout: p0 4 constants, bytes 0..16 in s4"), "{lines:?}");
+        assert!(lines[3].contains("p0 constants: deadbeef 0 0 0"), "{lines:?}");
+        let of = |base: u64| lines.iter().find(|l| l.contains(&format!("{base:#x}+0x100"))).unwrap_or_else(|| panic!("{lines:?}"));
+        assert!(of(a).contains("bound before by") && of(a).contains("1 dispatches earlier (op 1 of slot 990001)") && !of(a).contains("NEVER WRITTEN"), "{}", of(a));
+        assert!(of(b).contains("NEVER WRITTEN? a skipped dispatch was bound to") && of(b).contains("no dispatch kept before"), "{}", of(b));
+        assert!(of(c).contains("a skipped mesh call was bound to it too (pipeline 0x71000830)"), "{}", of(c));
+        assert_eq!(describe_dispatch(slot, 8, 1).len(), 1, "another generation of the slot is another recording");
+
+        super::super::indirect::produced(skipped_pso);
+        DISPATCH_BINDINGS.lock().unwrap().retain(|e| e.at.is_none_or(|at| at.0 != slot));
+        REFUSED_BOUND.lock().unwrap().retain(|e| e.2 != mesh_pso);
     }
 
     #[test]
@@ -979,6 +2368,88 @@ mod tests {
         let _ = pso_async::released(standin_ok);
         let _ = pso_async::released(standin_fail);
         real::forget_pso_for_test(real_ok);
+    }
+
+    unsafe extern "system" fn fake_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+        let f = &*(this as *const FakeAdoptedList);
+        f.dispatch_calls.fetch_add(1, Ordering::Relaxed);
+        f.set_compute_uav_calls.store((x as usize) << 32 | (y as usize) << 16 | z as usize, Ordering::Relaxed);
+    }
+
+    /// How mesh calls are routed: DispatchMesh with a PC pipeline is the PC call with the
+    /// title's counts; a pipeline with no mesh shader, a draw with a mesh pipeline and an
+    /// indirect call whose signature and pipeline disagree are skipped and counted, and never
+    /// reach the PC list; DispatchMeshX from memory is skipped.
+    #[test]
+    fn mesh_calls_reach_the_pc_list_only_with_a_mesh_pipeline() {
+        let slot = super::super::layout::slot(super::super::layout::find("ID3D12GraphicsCommandList6").unwrap(), "DispatchMesh").unwrap();
+        let mut orig_vt = [0usize; 96];
+        orig_vt[1] = fake_add_ref as usize;
+        orig_vt[2] = fake_release as usize;
+        orig_vt[25] = fake_set_pso as usize;
+        orig_vt[59] = fake_execute_indirect as usize;
+        orig_vt[slot] = fake_dispatch_mesh as usize;
+        let mut ext_vt = vec![0usize; 97];
+        ext_vt[0] = orig_vt.as_ptr() as usize;
+        ext_vt[1..].copy_from_slice(&orig_vt);
+        let fake = Box::new(FakeAdoptedList {
+            // SAFETY: as in `async_compute_pso_success_and_failure_in_dispatch_and_execute_indirect`
+            vt: unsafe { ext_vt.as_ptr().add(1) },
+            refs: AtomicUsize::new(1),
+            dispatch_calls: AtomicUsize::new(0),
+            set_compute_rs_calls: AtomicUsize::new(0),
+            set_compute_uav_calls: AtomicUsize::new(0),
+            set_pso_calls: AtomicUsize::new(0),
+            execute_indirect_calls: AtomicUsize::new(0),
+        });
+        let list = &*fake as *const FakeAdoptedList as *mut c_void;
+        let skipped = || MESH_CALLS[MESH_SKIPPED].load(Ordering::Relaxed);
+        let pc_calls = || (fake.dispatch_calls.load(Ordering::Relaxed), fake.execute_indirect_calls.load(Ordering::Relaxed));
+        let (pc_pso, plain, native) = (0x7300_0001usize, 0x7300_0002usize, 0x7300_0003usize);
+        real::register_translated_graphics_for_test(plain);
+        real::register_translated_graphics_for_test(native);
+        real::register_native_mesh_for_test(native);
+        let (mesh_sig, draw_sig) = (0x7300_00F1usize, 0x7300_00F2usize);
+        super::super::indirect::note_signature(mesh_sig, super::super::indirect::DISPATCH_MESH, 12, true);
+        super::super::indirect::note_signature(draw_sig, super::super::indirect::DRAW, 16, true);
+
+        // a PC pipeline: the PC DispatchMesh with the title's three counts
+        reset(list, 0x7300_0100, pc_pso);
+        unsafe { dispatch_mesh(list, 5, 2, 3) };
+        assert_eq!(pc_calls(), (1, 0));
+        assert_eq!(fake.set_compute_uav_calls.load(Ordering::Relaxed), 5 << 32 | 2 << 16 | 3);
+
+        // a translated pipeline with no mesh shader: skipped
+        reset(list, 0x7300_0100, plain);
+        let before = skipped();
+        unsafe { dispatch_mesh(list, 5, 1, 1) };
+        assert!(skipped() > before);
+        assert_eq!(pc_calls(), (1, 0));
+        // … and with a mesh signature
+        let before = skipped();
+        unsafe { execute_indirect(list, mesh_sig, 1, 0, 0, 0, 0) };
+        assert!(skipped() > before);
+        assert_eq!(pc_calls(), (1, 0));
+
+        // a mesh pipeline: a draw and an indirect draw are skipped
+        reset(list, 0x7300_0100, native);
+        let before = skipped();
+        assert!(unsafe { graphics_bound(list) }.is_none());
+        unsafe { execute_indirect(list, draw_sig, 1, 0, 0, 0, 0) };
+        assert!(skipped() >= before + 2);
+        assert_eq!(pc_calls(), (1, 0));
+        // more groups than one axis takes (y and z fold into x), and DispatchMeshX with its
+        // counts in memory
+        let before = skipped();
+        unsafe { dispatch_mesh(list, 65535, 2, 1) };
+        unsafe { dispatch_mesh_x(list, 1, 0, 0x1000, 0) };
+        assert!(skipped() >= before + 2);
+        assert_eq!(pc_calls(), (1, 0));
+        assert!(indirect_calls().contains("skipped"));
+
+        forget(list);
+        real::forget_pso_for_test(plain);
+        real::forget_pso_for_test(native);
     }
 
     #[test]

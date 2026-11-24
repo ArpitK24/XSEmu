@@ -62,8 +62,15 @@ pub fn pc_queue_desc(d: [u32; 4]) -> [u32; 4] {
         0 | 100 | 10000 => d[1], // NORMAL, HIGH, GLOBAL_REALTIME
         _ => 100,
     };
-    let flags = d[2] & D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT.0 as u32;
-    [pc_list_type(d[0]), priority, flags, if d[3] == 0 { 0 } else { 1 }]
+    // flags: the PC has only DISABLE_GPU_TIMEOUT (1); the console's others (a retail game: 2, 3 on
+    // compute queues) are dropped – the PC refuses them with E_INVALIDARG
+    if d[2] & !1 != 0 {
+        static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SEEN.swap(true, Ordering::Relaxed) {
+            crate::xlog_info!("D3D12.X: command queue flags {:#x} (type {}) – the console-only bits are dropped", d[2], d[0]);
+        }
+    }
+    [pc_list_type(d[0]), priority, d[2] & 1, if d[3] == 0 { 0 } else { 1 }]
 }
 
 /// device #8 CreateCommandQueue / #48 CreateCommandQueueX(desc, riid, queue)
@@ -75,16 +82,21 @@ pub(super) unsafe extern "system" fn create_command_queue_x(this: *mut c_void, d
     if unmapped != 0 && UNMAPPED.fetch_or(unmapped as u64, Ordering::Relaxed) & unmapped as u64 != unmapped as u64 {
         crate::xlog_warn!("D3D12.X: command queue flags {unmapped:#x} have no Windows mapping");
     }
-    let hr = real::dev_create_command_queue(this, d.as_ptr() as usize, riid, ppv);
+    // (`single`) every queue is made a direct one: the first runs the others' work too
+    let made = [super::single::list_type(d[0] as usize) as u32, d[1], d[2], d[3]];
+    let hr = real::dev_create_command_queue(this, made.as_ptr() as usize, riid, ppv);
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         super::list_x::on_queue_create(*ppv as usize, this as usize, D3D12_COMMAND_LIST_TYPE(d[0] as i32));
+        if super::single::enabled() {
+            super::single::adopt(*ppv as usize, d[0] as i32);
+        }
     }
     hr
 }
 
 /// device #9 CreateCommandAllocator(type, riid, allocator)
 pub(super) unsafe extern "system" fn create_command_allocator_x(this: *mut c_void, ty: u32, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    real::dev_create_command_allocator(this, pc_list_type(ty) as usize, riid, ppv)
+    real::dev_create_command_allocator(this, super::single::list_type(pc_list_type(ty) as usize), riid, ppv)
 }
 
 unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -92,10 +104,10 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso: 
     let riid = if dma { &IID_GRAPHICS_COMMAND_LIST as *const GUID } else { riid };
     let (node, ty) = (if node == 0 { 0 } else { 1 }, pc_list_type(ty) as usize);
     let hr = if super::console_list::enabled() {
-        real::dev_create_command_list_x(this, node, ty, alloc, pso, riid, ppv)
+        real::dev_create_command_list_x(this, node, super::single::list_type(ty), alloc, pso, riid, ppv)
     } else {
         let resolved_pso = super::pso_async::resolve_for_bind(pso);
-        let hr = real::dev_create_command_list(this, node, ty, alloc, resolved_pso, riid, ppv);
+        let hr = real::dev_create_command_list(this, node, super::single::list_type(ty), alloc, resolved_pso, riid, ppv);
         if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
             super::list_x::on_create(*ppv, alloc, pso, D3D12_COMMAND_LIST_TYPE(ty as i32));
         }
@@ -143,7 +155,20 @@ pub(super) unsafe extern "system" fn create_graphics_pso_x(this: *mut c_void, de
 /// device #10 CreateGraphicsPipelineState(desc, riid, pipeline): remembered as a base for
 /// derived pipelines and tagged with `D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS` when supported.
 pub(super) unsafe extern "system" fn create_graphics_pso_pc(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    create_graphics_pso_tracked(this, desc, riid, ppv)
+    checked_pso("CreateGraphicsPipelineState", create_graphics_pso_tracked(this, desc, riid, ppv), ppv)
+}
+
+/// A pipeline the title asked for and did not get: it keeps no pipeline object and skips every
+/// draw that needs it (the first 16 failures are logged).
+unsafe fn checked_pso(what: &str, hr: HRESULT, ppv: *mut *mut c_void) -> HRESULT {
+    static FAILED: AtomicU64 = AtomicU64::new(0);
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        let n = FAILED.fetch_add(1, Ordering::Relaxed);
+        if n < 16 {
+            crate::xlog_warn!("D3D12.X: {what} failed ({hr:#x}, pipeline {:?}) – failure #{}", ppv.as_ref().copied(), n + 1);
+        }
+    }
+    hr
 }
 
 /// Cached result of `CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16).DynamicDepthBiasSupported`:
@@ -565,7 +590,7 @@ pub(super) unsafe extern "system" fn create_derived_pso_x(this: *mut c_void, bas
 
 /// device #86 CreatePipelineState(stream desc, riid, pipeline)
 pub(super) unsafe extern "system" fn create_pipeline_state_x(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    real::dev_create_pipeline_state(this, desc, riid, ppv)
+    checked_pso("CreatePipelineState", real::dev_create_pipeline_state(this, desc, riid, ppv), ppv)
 }
 
 /// device #56 / #66 SerializePipelineStateX: not available in a release title
@@ -649,12 +674,143 @@ pub(super) unsafe extern "system" fn create_sampler_x(this: *mut c_void, x: *con
 pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     let mut d = *x;
     let dim = u32::from_le_bytes(d[0..4].try_into().unwrap());
-    let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let mut flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
+    let format = u32::from_le_bytes(d[0x20..0x24].try_into().unwrap());
+    // the console's D16_UNORM_S8_UINT family (118 – 120): the PC's D24S8 one, typeless so its
+    // depth and stencil views both fit
+    if matches!(format, 118..=120) {
+        d[0x20..0x24].copy_from_slice(&44u32.to_le_bytes());
+    }
+    // a depth buffer in a typed depth format: typeless, as the console's shaders read it too
+    // (R32_FLOAT of a D32_FLOAT buffer – on the PC only a typeless resource has both views)
+    if flags & 2 != 0 {
+        if let Some(t) = depth_typeless(format) {
+            d[0x20..0x24].copy_from_slice(&t.to_le_bytes());
+        }
+    }
+    // the console's R10G10B10_7E3_A2_FLOAT / _6E4_A2_FLOAT: the PC has none – half floats hold them
+    if matches!(format, 116 | 117) {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
+    // B5G5R5A1 / B4G4R4A4 targets: not ones a PC driver takes for rendering together with
+    // unordered access (a retail game's 2560x1440 one, flags 0x5: E_INVALIDARG) – R8G8B8A8, the
+    // same values with more bits; the GPU's own (nothing of the CPU's is laid out for them)
+    if matches!(format, 86 | 115) && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+    }
+    // R9G9B9E5_SHAREDEXP targets / UAV textures: the PC renders to and writes neither (a retail
+    // game's Series S 1920x1080 one, flags 0x5: E_INVALIDARG, and the title threw) –
+    // R16G16B16A16_FLOAT holds the same values; the GPU's own, as above
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
+    // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
+    // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
+    if flags & 2 != 0 {
+        flags &= !4;
+    }
     d[8..16].fill(0); // alignment: the driver's
     let layout = if dim == D3D12_RESOURCE_DIMENSION_BUFFER.0 as u32 { D3D12_TEXTURE_LAYOUT_ROW_MAJOR.0 } else { D3D12_TEXTURE_LAYOUT_UNKNOWN.0 };
     d[0x2C..0x30].copy_from_slice(&(layout as u32).to_le_bytes());
     d[0x30..0x34].copy_from_slice(&(flags & 0xFF).to_le_bytes());
     d
+}
+
+/// The PC format of a view, pipeline or clear value in the console's D16_UNORM_S8_UINT family:
+/// D24_UNORM_S8_UINT, R24_UNORM_X8_TYPELESS, X24_TYPELESS_G8_UINT (`pc_resource_desc` makes such
+/// resources R24G8_TYPELESS).
+pub fn pc_view_format(f: u32) -> u32 {
+    match f {
+        118 => 45,
+        119 => 46,
+        120 => 47,
+        116 | 117 => 10,
+        f => f,
+    }
+}
+
+/// The typeless format of a depth format's family (None: not a depth format).
+fn depth_typeless(f: u32) -> Option<u32> {
+    match f {
+        20 => Some(19), // D32_FLOAT_S8X24_UINT
+        40 => Some(39), // D32_FLOAT
+        45 => Some(44), // D24_UNORM_S8_UINT
+        55 => Some(53), // D16_UNORM
+        _ => None,
+    }
+}
+
+/// The format of a render target / depth view or pipeline on the PC: `pc_view_format`, a
+/// B5G5R5A1 / B4G4R4A4 target is R8G8B8A8 and an R9G9B9E5 one R16G16B16A16_FLOAT
+/// (`pc_resource_desc`).
+pub fn pc_target_format(f: u32) -> u32 {
+    match f {
+        86 | 115 => 28,
+        67 => 10,
+        f => pc_view_format(f),
+    }
+}
+
+/// The format a shader's view of a resource whose PC format is `resource` has on the PC (`view`
+/// 0: the resource's own). The console names depth buffers' views plainly (R16_UNORM of a D16S8
+/// buffer, R32_FLOAT of a D32 one, even the depth format itself); the PC wants its family's
+/// readable formats and removes the device for anything else (0x887A0001).
+pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
+    let view = pc_view_format(view);
+    match (resource, view) {
+        // R32G8X24_TYPELESS: depth 21, stencil 22
+        (19..=22, 0 | 19 | 20 | 21 | 39 | 40 | 41) => 21,
+        (19..=22, 22 | 61 | 62) => 22,
+        // R24G8_TYPELESS: depth 46, stencil 47
+        (44..=47, 0 | 41 | 44 | 45 | 46 | 53 | 54 | 55 | 56) => 46,
+        (44..=47, 47 | 61 | 62) => 47,
+        // R32_TYPELESS, R16_TYPELESS
+        (39 | 40, 0 | 39 | 40) => 41,
+        (53 | 55, 0 | 53 | 55) => 56,
+        // a target made R8G8B8A8 (`pc_resource_desc`)
+        (28, 86 | 115) => 28,
+        // a target made R16G16B16A16_FLOAT
+        (10, 67) => 10,
+        (_, v) => v,
+    }
+}
+
+/// Whether a shader view in `pc_shader_view_format`'s format reads the stencil (plane 1 on the PC).
+pub fn stencil_view(resource: u32, view: u32) -> bool {
+    matches!((resource, view), (19..=22, 22) | (44..=47, 47))
+}
+
+pub(super) unsafe fn pc_clear(
+    clear: *const c_void,
+    buf: &mut D3D12_CLEAR_VALUE,
+    descs: Option<(&[u8; 0x38], &[u8; 0x38])>,
+) -> *const c_void {
+    if clear.is_null() || !crate::gpu::shader::readable(clear as usize, std::mem::size_of::<D3D12_CLEAR_VALUE>()) {
+        return clear;
+    }
+    *buf = clear.cast::<D3D12_CLEAR_VALUE>().read_unaligned();
+    let f = buf.Format.0 as u32;
+    let target = pc_target_format(f);
+    let format = if let Some((console, host)) = descs {
+        let src = u32::from_le_bytes(console[0x20..0x24].try_into().unwrap());
+        let dst = u32::from_le_bytes(host[0x20..0x24].try_into().unwrap());
+        let flags = u32::from_le_bytes(host[0x30..0x34].try_into().unwrap());
+        let mapped = if f == src && !matches!(dst, 19 | 39 | 44 | 53) { dst } else { target };
+        let matching_depth = mapped == dst && flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL.0 as u32 != 0;
+        match mapped {
+            19 if matching_depth => 20,
+            39 if matching_depth => 40,
+            44 if matching_depth => 45,
+            53 if matching_depth => 55,
+            1 | 5 | 9 | 15 | 19 | 21 | 22 | 23 | 27 | 33 | 39 | 44 | 46 | 47 | 48 | 53 | 60 | 70
+            | 73 | 76 | 79 | 82 | 90 | 92 | 94 | 97 => return std::ptr::null(),
+            _ => mapped,
+        }
+    } else {
+        target
+    };
+    buf.Format.0 = format as i32;
+    (buf as *const D3D12_CLEAR_VALUE).cast()
 }
 
 /// device #25 GetResourceAllocationInfo(visible mask, count, descs) → {size, alignment},
@@ -663,7 +819,15 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
 /// Textures get the console's size (XG: what the title then places them in); buffers and
 /// what XG does not model the PC's.
 pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38]) -> *mut [u64; 2] {
-    let (this, ret) = if real::is_adopted(a) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    let info = resource_allocation_info(this, mask, n, descs);
+    if !ret.is_null() {
+        *ret = info;
+    }
+    ret
+}
+
+unsafe fn resource_allocation_info(this: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x38]) -> [u64; 2] {
     type F = unsafe extern "system" fn(*mut c_void, *mut [u64; 2], u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
     let pc: F = std::mem::transmute(real::orig_fn(this, 25));
     let (mut size, mut align) = (0u64, 0u64);
@@ -685,23 +849,128 @@ pub(super) unsafe extern "system" fn get_resource_allocation_info_x(a: *mut c_vo
         size = size.div_ceil(a) * a + s;
         align = align.max(a);
     }
+    [size, align]
+}
+
+/// device #108 (a retail game) GetResourceAllocationInfo2(visible mask, count, D3D12_RESOURCE_DESC1s,
+/// D3D12_RESOURCE_ALLOCATION_INFO1* each) -> {size, alignment} of them all, returned like #25's;
+/// each resource's {offset, alignment, size} goes to the last argument when there is one.
+pub(super) unsafe extern "system" fn get_resource_allocation_info2_x(a: *mut c_void, b: *mut c_void, mask: u32, n: u32, descs: *const [u8; 0x48], infos: *mut [u64; 3]) -> *mut [u64; 2] {
+    real::note_newer_device_method(108);
+    let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u64; 2]) } else { (b, a as *mut [u64; 2]) };
+    let (mut size, mut align) = (0u64, 0u64);
+    for k in 0..n as usize {
+        let d = if descs.is_null() { std::ptr::null() } else { descs.add(k) as *const [u8; 0x38] };
+        let r = resource_allocation_info(this, mask, 1, d);
+        if r[0] == u64::MAX || r[1] == 0 {
+            size = u64::MAX;
+            break;
+        }
+        let offset = size.next_multiple_of(r[1]);
+        if !infos.is_null() {
+            *infos.add(k) = [offset, r[1], r[0]];
+        }
+        size = offset + r[0];
+        align = align.max(r[1]);
+    }
     if !ret.is_null() {
         *ret = [size, align];
     }
     ret
 }
 
-pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void, b: *mut c_void, mask: u32, heap: D3D12_HEAP_TYPE) -> *mut D3D12_HEAP_PROPERTIES {
-    let device = real::device_raw();
-    let (this, ret) = if a == device || (b != device && real::is_adopted(a)) { (a, b) } else { (b, a) };
-    let ret = ret.cast::<D3D12_HEAP_PROPERTIES>();
-    if ret.is_null() || !real::is_adopted(this) {
-        return std::ptr::null_mut();
+/// device #26 GetCustomHeapProperties(node mask, heap type) -> D3D12_HEAP_PROPERTIES (20 bytes),
+/// returned through a hidden pointer - like #25 called the C way (a retail game: return buffer, device,
+/// ...) or the C++ way.
+pub(super) unsafe extern "system" fn get_custom_heap_properties_x(a: *mut c_void, b: *mut c_void, mask: u32, ty: u32) -> *mut [u32; 5] {
+    let (this, ret) = if real::this_first(a, b) { (a, b as *mut [u32; 5]) } else { (b, a as *mut [u32; 5]) };
+    type F = unsafe extern "system" fn(*mut c_void, *mut [u32; 5], u32, u32) -> *mut [u32; 5];
+    let pc: F = std::mem::transmute(real::orig_fn(this, 26));
+    let mut r = [0u32; 5];
+    pc(this, &mut r, mask, ty);
+    if !ret.is_null() {
+        *ret = r;
     }
-    let pc: unsafe extern "system" fn(*mut c_void, *mut D3D12_HEAP_PROPERTIES, u32, D3D12_HEAP_TYPE) =
-        std::mem::transmute(real::orig_fn(this, 26));
-    pc(this, ret, mask, heap);
     ret
+}
+
+/// device #133 (a retail game): CreatePlacedResourceX with a barrier layout (D3D12_BARRIER_LAYOUT) in
+/// the initial state's place. GPU-owned textures created UNDEFINED are placed with that layout
+/// (enhanced barriers); buffers at addresses outside unified memory go to `external_buffers`.
+pub(super) unsafe extern "system" fn create_placed_resource_layout_x(
+    this: *mut c_void, va: u64, desc: *const u8, layout: D3D12_BARRIER_LAYOUT,
+    clear: *const c_void, riid: *const GUID, ppv: *mut *mut c_void,
+) -> HRESULT {
+    real::note_newer_device_method(133);
+    static N: AtomicU64 = AtomicU64::new(0);
+    static TEXTURE_DIMENSIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
+    static UNDEFINED_KINDS_LOGGED: AtomicU64 = AtomicU64::new(0);
+    if ppv.is_null() {
+        return E_INVALIDARG;
+    }
+    *ppv = std::ptr::null_mut();
+    if va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38)
+        || !crate::gpu::shader::readable(riid as usize, std::mem::size_of::<GUID>())
+        || (!clear.is_null() && !crate::gpu::shader::readable(clear as usize, std::mem::size_of::<D3D12_CLEAR_VALUE>()))
+    {
+        return E_INVALIDARG;
+    }
+    if guid_bytes(&riid.read_unaligned()) != guid_bytes(&GUID::from_u128(ID3D12Resource::IID.to_u128())) {
+        return E_NOTIMPL;
+    }
+    let x = desc.cast::<[u8; 0x38]>().read_unaligned();
+    let d = pc_resource_desc(&x);
+    let pc = d.as_ptr().cast::<D3D12_RESOURCE_DESC>().read_unaligned();
+    if matches!(pc.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D | D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D) {
+        let state = layout_state(layout);
+        let native_undefined = layout == D3D12_BARRIER_LAYOUT_UNDEFINED && super::vram::gpu_owned(pc.Flags.0 as u32);
+        if state.is_none() && !native_undefined {
+            static UNSUPPORTED: AtomicU64 = AtomicU64::new(0);
+            if once(&UNSUPPORTED, 8) {
+                crate::xlog_warn!("D3D12.X: placed texture slot 133: unsupported initial layout {} (dimension {}, format {}, flags {:#x})", layout.0, pc.Dimension.0, pc.Format.0, pc.Flags.0);
+            }
+            return E_NOTIMPL;
+        }
+        let hr = if let Some(state) = state {
+            create_placed_resource_x(this, va, x.as_ptr(), state.0 as u32, clear, riid, ppv)
+        } else {
+            note_alias(va as usize, &x);
+            let mut clear_buf = D3D12_CLEAR_VALUE::default();
+            let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));
+            super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Undefined, clear, None, riid, ppv).unwrap_or(E_NOTIMPL)
+        };
+        let dimension = 1 << pc.Dimension.0;
+        let first = TEXTURE_DIMENSIONS_LOGGED.fetch_or(dimension, Ordering::Relaxed) & dimension == 0;
+        let kind = 1 << (pc.Flags.0 & 7);
+        let first_undefined = layout == D3D12_BARRIER_LAYOUT_UNDEFINED && hr >= 0
+            && UNDEFINED_KINDS_LOGGED.fetch_or(kind, Ordering::Relaxed) & kind == 0;
+        if hr < 0 || first || first_undefined || once(&N, 8) {
+            crate::xlog_info!(
+                "D3D12.X: placed texture slot 133: dimension {} {}x{}x{}, format {}, {} samples, flags {:#x}, initial layout {} → {hr:#x}",
+                pc.Dimension.0, pc.Width, pc.Height, pc.DepthOrArraySize, pc.Format.0, pc.SampleDesc.Count, pc.Flags.0, layout.0
+            );
+        }
+        return hr;
+    }
+    if layout != D3D12_BARRIER_LAYOUT_UNDEFINED || !clear.is_null()
+        || pc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER
+        || !matches!(pc.Flags, D3D12_RESOURCE_FLAG_NONE | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
+    {
+        return E_NOTIMPL;
+    }
+    if pc.Width == 0 || va.checked_add(pc.Width).is_none() {
+        return E_INVALIDARG;
+    }
+    let state = D3D12_RESOURCE_STATE_COMMON.0 as u32;
+    let result = if crate::gpu::uma::get().is_some_and(|u| u.contains(va as usize)) {
+        real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv).unwrap_or(E_FAIL)
+    } else {
+        real::place_external_buffer(this, va as usize, &pc, state, riid, ppv)
+    };
+    if result < 0 || once(&N, 8) {
+        crate::xlog_info!("D3D12.X: placed buffer slot 133 at {va:#x}, {:#x} bytes → {result:#x}", pc.Width);
+    }
+    result
 }
 
 /// Resources the title placed at an address an earlier one was placed at: on the console they
@@ -735,26 +1004,54 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     note_alias(va as usize, &x);
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
-    let state = state & real::PC_RESOURCE_STATES;
+    let mut state = state & real::PC_RESOURCE_STATES;
+    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
+    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
+        state = (state & !0x8) | 0x10;
+    }
+    let mut clear_buf = D3D12_CLEAR_VALUE::default();
+    let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));
     if buffer {
         if let Some(hr) = real::place_at_title_address(this, va as usize, &d, state, clear, riid, ppv) {
             return hr;
         }
     }
-    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`)
+    // render targets, depth buffers, UAV textures: in video memory, aliased by address (`vram`);
+    // sampled textures: on the same shared 64 KiB pages when tiled resources allow, else committed
     let flags = u32::from_le_bytes(d[0x30..0x34].try_into().unwrap());
-    if !buffer && super::vram::gpu_owned(flags) {
+    let mut placed_hr = None;
+    if !buffer {
         let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
-        if let Some(hr) = super::vram::place(this, va as usize, &pc, state, clear, riid, ppv) {
-            return hr;
+        let console_bytes = crate::hle::xg::Texture::new(&x).ok().map(|t| t.size()).filter(|&s| s != u64::MAX && s != 0);
+        if super::vram::gpu_owned(flags) {
+            if let Some(hr) = super::vram::place(this, va as usize, &pc, super::vram::TextureInitial::Legacy(state), clear, console_bytes, riid, ppv) {
+                if hr >= 0 && !(*ppv).is_null() {
+                    if let Some(bytes) = console_bytes {
+                        super::title_textures::retire_overlapping(va as usize, bytes as usize);
+                    }
+                    real::note_title_address(*ppv as usize, va as usize);
+                    super::title_textures::note_cpu_color_view(this, *ppv, va as usize, x, D3D12_RESOURCE_STATES(state as i32));
+                }
+                return hr;
+            }
+        } else {
+            placed_hr = super::vram::place_pages(this, va as usize, &pc, state, clear, console_bytes, riid, ppv);
         }
     }
-    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
-    let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
+    let hr = match placed_hr {
+        Some(hr) => hr,
+        None => {
+            let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
+            real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv)
+        }
+    };
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
         match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
-            Ok(()) => return hr,
+            Ok(()) => {
+                real::note_title_address(*ppv as usize, va as usize);
+                return hr;
+            }
             Err(e) if once(&M, 4) => {
                 let u = |o: usize| u32::from_le_bytes(x[o..o + 4].try_into().unwrap());
                 crate::xlog_warn!(
@@ -765,6 +1062,7 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             }
             Err(_) => {}
         }
+        super::title_textures::note_cpu_color_view(this, *ppv, va as usize, x, D3D12_RESOURCE_STATES(state as i32));
     }
     if hr >= 0 && !(*ppv).is_null() {
         real::note_title_address(*ppv as usize, va as usize);
@@ -781,6 +1079,39 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
         );
     }
     hr
+}
+
+/// The legacy initial state for a defined barrier layout.
+pub(super) fn layout_state(layout: D3D12_BARRIER_LAYOUT) -> Option<D3D12_RESOURCE_STATES> {
+    Some(match layout {
+        D3D12_BARRIER_LAYOUT_COMMON | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON
+        | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON | D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON => D3D12_RESOURCE_STATE_COMMON,
+        D3D12_BARRIER_LAYOUT_GENERIC_READ | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_GENERIC_READ => D3D12_RESOURCE_STATE_GENERIC_READ,
+        D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_GENERIC_READ => D3D12_RESOURCE_STATES(
+            D3D12_RESOURCE_STATE_GENERIC_READ.0 & !(D3D12_RESOURCE_STATE_INDEX_BUFFER.0 | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0),
+        ),
+        D3D12_BARRIER_LAYOUT_RENDER_TARGET => D3D12_RESOURCE_STATE_RENDER_TARGET,
+        D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_UNORDERED_ACCESS
+        | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_UNORDERED_ACCESS => D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE => D3D12_RESOURCE_STATE_DEPTH_WRITE,
+        D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_READ => D3D12_RESOURCE_STATE_DEPTH_READ,
+        D3D12_BARRIER_LAYOUT_SHADER_RESOURCE | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_SHADER_RESOURCE => D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE,
+        D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_SHADER_RESOURCE => D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+        D3D12_BARRIER_LAYOUT_COPY_SOURCE | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_SOURCE
+        | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_SOURCE => D3D12_RESOURCE_STATE_COPY_SOURCE,
+        D3D12_BARRIER_LAYOUT_COPY_DEST | D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COPY_DEST
+        | D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COPY_DEST => D3D12_RESOURCE_STATE_COPY_DEST,
+        D3D12_BARRIER_LAYOUT_RESOLVE_SOURCE => D3D12_RESOURCE_STATE_RESOLVE_SOURCE,
+        D3D12_BARRIER_LAYOUT_RESOLVE_DEST => D3D12_RESOURCE_STATE_RESOLVE_DEST,
+        D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE => D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE,
+        D3D12_BARRIER_LAYOUT_VIDEO_DECODE_READ => D3D12_RESOURCE_STATE_VIDEO_DECODE_READ,
+        D3D12_BARRIER_LAYOUT_VIDEO_DECODE_WRITE => D3D12_RESOURCE_STATE_VIDEO_DECODE_WRITE,
+        D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_READ => D3D12_RESOURCE_STATE_VIDEO_PROCESS_READ,
+        D3D12_BARRIER_LAYOUT_VIDEO_PROCESS_WRITE => D3D12_RESOURCE_STATE_VIDEO_PROCESS_WRITE,
+        D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_READ => D3D12_RESOURCE_STATE_VIDEO_ENCODE_READ,
+        D3D12_BARRIER_LAYOUT_VIDEO_ENCODE_WRITE => D3D12_RESOURCE_STATE_VIDEO_ENCODE_WRITE,
+        _ => return None,
+    })
 }
 
 /// device #38 GetCopyableFootprints: a console resource desc the PC rejects (total stays
@@ -836,12 +1167,28 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
     if hr >= 0 && !ppv.is_null() && needs_root {
         super::bind::note_root_changing_signature(*ppv as usize);
     }
+    if hr >= 0 && !ppv.is_null() {
+        if let Some(last) = list.last() {
+            super::indirect::note_signature(*ppv as usize, last[0], u32::from_le_bytes(pc[0..4].try_into().unwrap()), list.len() == 1);
+        }
+    }
     hr
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queue_layouts_map_to_legacy_initial_states() {
+        let states = |first| (first..first + 6).map(|n| layout_state(D3D12_BARRIER_LAYOUT(n)).map(|s| s.0).unwrap()).collect::<Vec<_>>();
+        assert_eq!(states(D3D12_BARRIER_LAYOUT_DIRECT_QUEUE_COMMON.0), [0, 0xAC3, 0x8, 0xC0, 0x800, 0x400]);
+        assert_eq!(states(D3D12_BARRIER_LAYOUT_COMPUTE_QUEUE_COMMON.0), [0, 0xA41, 0x8, 0x40, 0x800, 0x400]);
+        assert_eq!(states(D3D12_BARRIER_LAYOUT_VIDEO_DECODE_READ.0), [0x1_0000, 0x2_0000, 0x4_0000, 0x8_0000, 0x20_0000, 0x80_0000]);
+        assert_eq!(layout_state(D3D12_BARRIER_LAYOUT_VIDEO_QUEUE_COMMON), Some(D3D12_RESOURCE_STATE_COMMON));
+        assert_eq!(layout_state(D3D12_BARRIER_LAYOUT_SHADING_RATE_SOURCE), Some(D3D12_RESOURCE_STATE_SHADING_RATE_SOURCE));
+        assert_eq!(layout_state(D3D12_BARRIER_LAYOUT_UNDEFINED), None);
+    }
 
     #[test]
     fn console_queue_flags_create_a_native_compute_queue() {
@@ -874,6 +1221,64 @@ mod tests {
     }
 
     #[test]
+    fn optimized_clear_uses_the_host_resource_or_typed_depth_format() {
+        for (src, flags, expected) in [
+            (67u32, 5u32, 10), (86, 5, 28), (115, 1, 28), (116, 1, 10),
+            (67, 0, 67), (20, 2, 20), (40, 2, 40), (45, 2, 45), (55, 2, 55), (118, 2, 45),
+        ] {
+            let mut console = [0u8; 0x38];
+            console[0] = 3;
+            console[0x20..0x24].copy_from_slice(&src.to_le_bytes());
+            console[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            let host = pc_resource_desc(&console);
+            let input = D3D12_CLEAR_VALUE {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(src as i32),
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.25, 0.5, 0.75, 1.0] },
+            };
+            let mut output = D3D12_CLEAR_VALUE::default();
+            let ptr = unsafe { pc_clear((&input as *const D3D12_CLEAR_VALUE).cast(), &mut output, Some((&console, &host))) };
+            assert_eq!(ptr, (&output as *const D3D12_CLEAR_VALUE).cast());
+            assert_eq!(output.Format.0, expected);
+            assert_eq!(unsafe { output.Anonymous.Color }, [0.25, 0.5, 0.75, 1.0]);
+        }
+    }
+
+    #[test]
+    fn optimized_clear_resolves_matching_typeless_depth_families() {
+        for (resource, flags, clear, expected) in [
+            (20u32, 2u32, 19u32, Some(20)),
+            (40, 2, 39, Some(40)),
+            (45, 2, 44, Some(45)),
+            (55, 2, 53, Some(55)),
+            (118, 2, 44, Some(45)),
+            (118, 2, 119, None),
+            (20, 2, 44, None),
+            (39, 1, 39, None),
+            (27, 1, 27, None),
+            (27, 1, 28, Some(28)),
+        ] {
+            let mut console = [0u8; 0x38];
+            console[0] = 3;
+            console[0x20..0x24].copy_from_slice(&resource.to_le_bytes());
+            console[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            let host = pc_resource_desc(&console);
+            let input = D3D12_CLEAR_VALUE {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(clear as i32),
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.25, 0.5, 0.75, 1.0] },
+            };
+            let mut output = D3D12_CLEAR_VALUE::default();
+            let ptr = unsafe { pc_clear((&input as *const D3D12_CLEAR_VALUE).cast(), &mut output, Some((&console, &host))) };
+            if let Some(format) = expected {
+                assert_eq!(ptr, (&output as *const D3D12_CLEAR_VALUE).cast());
+                assert_eq!(output.Format.0, format);
+                assert_eq!(unsafe { output.Anonymous.Color }, [0.25, 0.5, 0.75, 1.0]);
+            } else {
+                assert!(ptr.is_null());
+            }
+        }
+    }
+
+    #[test]
     fn console_types_and_descs_become_pc_ones() {
         assert_eq!(pc_list_type(XBOX_TYPE_DMA), D3D12_COMMAND_LIST_TYPE_COPY.0 as u32);
         assert_eq!(pc_list_type(2), 2);
@@ -888,6 +1293,41 @@ mod tests {
         assert_eq!((d[8], u32::from_le_bytes(d[0x2C..0x30].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap())), (0, 1, 0x34));
         x[0] = 3; // texture 2D
         assert_eq!(u32::from_le_bytes(pc_resource_desc(&x)[0x2C..0x30].try_into().unwrap()), 0);
+    }
+
+    /// Console depth buffers become PC ones a shader can view: typeless, the D16S8 family as
+    /// D24S8, no UAV flag; views get the family's readable formats (stencil from plane 1).
+    #[test]
+    fn console_depth_buffers_and_their_views_are_the_pcs() {
+        let mut x = [0u8; 0x38];
+        x[0] = 3; // texture 2D
+        let desc = |x: &[u8; 0x38]| {
+            let d = pc_resource_desc(x);
+            (u32::from_le_bytes(d[0x20..0x24].try_into().unwrap()), u32::from_le_bytes(d[0x30..0x34].try_into().unwrap()))
+        };
+        x[0x20] = 118; // D16_UNORM_S8_UINT, depth + UAV + console bits
+        x[0x30..0x34].copy_from_slice(&0x8030_0006u32.to_le_bytes());
+        assert_eq!(desc(&x), (44, 0x2));
+        x[0x20] = 40; // D32_FLOAT depth buffer: typeless
+        x[0x30..0x34].copy_from_slice(&0x2u32.to_le_bytes());
+        assert_eq!(desc(&x), (39, 0x2));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // not a depth buffer: as it is
+        assert_eq!(desc(&x), (40, 0));
+        x[0x20] = 86; // B5G5R5A1 target that is also a UAV
+        x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
+        assert_eq!(desc(&x), (28, 0x5));
+        // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
+        assert_eq!(pc_shader_view_format(44, 45), 46);
+        assert_eq!(pc_shader_view_format(44, 56), 46);
+        assert_eq!(pc_shader_view_format(44, 118), 46);
+        assert_eq!(pc_shader_view_format(44, 120), 47);
+        assert!(stencil_view(44, 47) && !stencil_view(44, 46));
+        assert_eq!(pc_shader_view_format(39, 0), 41);
+        assert_eq!(pc_shader_view_format(19, 62), 22);
+        assert_eq!(pc_shader_view_format(28, 86), 28);
+        assert_eq!(pc_shader_view_format(86, 86), 86, "a B5G5R5A1 texture that stayed one");
+        assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67), pc_target_format(67)), (10, 67, 10));
+        assert_eq!((pc_target_format(86), pc_target_format(118), pc_view_format(117)), (28, 45, 10));
     }
 
     #[test]

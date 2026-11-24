@@ -977,6 +977,88 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         put(&mut d, 400, &[16.6f32.to_bits(), 1f32.to_bits()]); // frameTimeDelta, preExposure
         put(&mut d, 408, &[1]); // reset
         put(&mut d, 412, &[0.1f32.to_bits(), 1000f32.to_bits(), 1.0f32.to_bits(), 1f32.to_bits()]);
+        // `XCL_PROBE_FSR_EXECUTE`: the inputs get content first (colour: a horizontal 0..1 grey
+        // gradient, depth 0.5, no motion) and the recorded frame runs on the GPU below
+        let execute = std::env::var_os("XCL_PROBE_FSR_EXECUTE").is_some();
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).unwrap();
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut fence_value = 0u64;
+        let mut run = |list: &ID3D12GraphicsCommandList| {
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            fence_value += 1;
+            queue.Signal(&fence, fence_value).unwrap();
+            let t0 = std::time::Instant::now();
+            while fence.GetCompletedValue() < fence_value && t0.elapsed().as_secs() < 20 {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let removed = device.GetDeviceRemovedReason();
+            assert!(removed.is_ok() && fence.GetCompletedValue() != u64::MAX, "device removed: {removed:?}");
+            assert!(fence.GetCompletedValue() >= fence_value, "GPU work did not finish in 20 s");
+        };
+        let buffer = |bytes: u64, heap: D3D12_HEAP_TYPE| -> ID3D12Resource {
+            let mut r: Option<ID3D12Resource> = None;
+            device
+                .CreateCommittedResource(
+                    &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
+                    D3D12_HEAP_FLAG_NONE,
+                    &D3D12_RESOURCE_DESC {
+                        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                        Width: bytes,
+                        Height: 1,
+                        DepthOrArraySize: 1,
+                        MipLevels: 1,
+                        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                        ..Default::default()
+                    },
+                    if heap == D3D12_HEAP_TYPE_READBACK { D3D12_RESOURCE_STATE_COPY_DEST } else { D3D12_RESOURCE_STATE_GENERIC_READ },
+                    None,
+                    &mut r,
+                )
+                .unwrap();
+            r.unwrap()
+        };
+        let footprint = |r: &ID3D12Resource| -> (D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64) {
+            let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut total = 0u64;
+            device.GetCopyableFootprints(&r.GetDesc(), 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
+            (fp, total)
+        };
+        if execute {
+            let h = |x: f32| -> u16 {
+                // f32 -> f16 for values in 0..1 (normal or zero)
+                if x <= 0.0 { 0 } else { let b = x.to_bits(); ((((b >> 23) & 0xFF) as i32 - 127 + 15) as u16) << 10 | ((b >> 13) & 0x3FF) as u16 }
+            };
+            let prep_alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let prep: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &prep_alloc, None).unwrap();
+            let mut uploads = Vec::new();
+            for (r, texel) in [
+                (&color, &(|x: u32, _y: u32| { let g = h(x as f32 / 1279.0); [g, g, g, h(1.0)].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>() }) as &dyn Fn(u32, u32) -> Vec<u8>),
+                (&depth, &|_x: u32, _y: u32| 0.5f32.to_le_bytes().to_vec()),
+                (&motion, &|_x: u32, _y: u32| vec![0u8; 4]),
+            ] {
+                let (fp, total) = footprint(r);
+                let up = buffer(total, D3D12_HEAP_TYPE_UPLOAD);
+                let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+                up.Map(0, None, Some(&mut p)).unwrap();
+                let base = p as *mut u8;
+                for y in 0..fp.Footprint.Height {
+                    let mut row = Vec::new();
+                    for x in 0..fp.Footprint.Width {
+                        row.extend(texel(x, y));
+                    }
+                    std::ptr::copy_nonoverlapping(row.as_ptr(), base.add(fp.Offset as usize + (y * fp.Footprint.RowPitch) as usize), row.len());
+                }
+                up.Unmap(0, None);
+                let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(r), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+                let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+                prep.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+                uploads.push(up);
+            }
+            prep.Close().unwrap();
+            run(&prep);
+            println!("FSR inputs uploaded (colour gradient, depth 0.5, no motion)");
+        }
         let dispatch: extern "C" fn(*mut usize, *const u32) -> u32 = std::mem::transmute(proc(&m, "ffxDispatch"));
         let rc = dispatch(&mut ctx, d.as_ptr());
         println!("ffxDispatch: code {rc:#x}");
@@ -1025,5 +1107,98 @@ fn fsr4_console_upscaler_creates_a_context_probe() {
         println!("console list → PC: {t:?}");
         assert!(t.unknown.is_none(), "all FSR records recognised");
         assert!(t.clears > 0 && t.copies > 0 && t.skipped == 0, "UAV clears and copies carried over to the PC");
+        if !execute {
+            return;
+        }
+        assert_eq!(t.skipped_dispatches, 0, "every FSR4 pass translated");
+        let pc_raw = console_list::pc_list(console).expect("the console list's PC list");
+        let pc = ID3D12GraphicsCommandList::from_raw_borrowed(&pc_raw).unwrap().clone();
+        let t0 = std::time::Instant::now();
+        run(&pc);
+        println!("FSR4 frame ran on the GPU in {:.1} ms (with submission)", t0.elapsed().as_secs_f64() * 1000.0);
+        // the output back to the CPU
+        let (fp, total) = footprint(&output);
+        let rb = buffer(total, D3D12_HEAP_TYPE_READBACK);
+        let rb_alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+        let rb_list: ID3D12GraphicsCommandList = device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &rb_alloc, None).unwrap();
+        let barrier = |before, after| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER { pResource: std::mem::transmute_copy(&output), Subresource: 0, StateBefore: before, StateAfter: after }),
+            },
+            ..Default::default()
+        };
+        rb_list.ResourceBarrier(&[barrier(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&rb), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&output), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
+        rb_list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
+        rb_list.Close().unwrap();
+        run(&rb_list);
+        let mut p: *mut std::ffi::c_void = std::ptr::null_mut();
+        rb.Map(0, None, Some(&mut p)).unwrap();
+        let half = |v: u16| -> f32 {
+            let (s, e, m) = ((v >> 15) as u32, ((v >> 10) & 0x1F) as i32, (v & 0x3FF) as f32);
+            let x = if e == 0 { m / 1024.0 * 2f32.powi(-14) } else if e == 31 { if m == 0.0 { f32::INFINITY } else { f32::NAN } } else { (1.0 + m / 1024.0) * 2f32.powi(e - 15) };
+            if s == 1 { -x } else { x }
+        };
+        let (mut finite, mut nonzero, mut n) = (0u64, 0u64, 0u64);
+        let (mut left, mut right) = (0f64, 0f64);
+        for y in (0..1080u32).step_by(8) {
+            let row = (p as *const u8).add(fp.Offset as usize + (y * fp.Footprint.RowPitch) as usize) as *const u16;
+            for x in (0..1920u32).step_by(8) {
+                let r = half(*row.add(4 * x as usize));
+                n += 1;
+                if r.is_finite() {
+                    finite += 1;
+                    if r != 0.0 {
+                        nonzero += 1;
+                    }
+                    if x < 480 {
+                        left += r as f64;
+                    } else if x >= 1440 {
+                        right += r as f64;
+                    }
+                }
+            }
+        }
+        rb.Unmap(0, None);
+        println!("FSR4 output: {n} samples, {finite} finite, {nonzero} non-zero; red mean left quarter {:.3}, right quarter {:.3}", left / (n as f64 / 4.0), right / (n as f64 / 4.0));
+        assert_eq!(finite, n, "no NaN / inf in FSR4's output");
+        assert!(nonzero > n / 2, "FSR4 wrote its output");
+        assert!(right > left, "the input's left-to-right gradient survives the upscale");
     }
+}
+
+/// No GPU: every compute shader inside XboxBvhBuilder.dll (found by its DXBC header) against
+/// what XCL does with its root arguments. The shader's stage descriptor says how many user
+/// SGPRs it has; its RTS0 part gives the argument layout. Arguments must not be put into
+/// registers the shader does not have – with the layout's rule alone that happens for the
+/// builder's shaders (four user SGPRs, s4 = the group id, every argument read from the table),
+/// and the builder then computes nothing.
+#[test]
+fn xbox_bvh_builder_shaders_get_no_argument_in_a_register_they_do_not_have() {
+    use xcl::hle::d3d12x::console_list::{inline_for, layout_from_blob};
+    let Some(dir) = setup() else { return };
+    let dll = std::fs::read(dir.join("XboxBvhBuilder.dll")).unwrap();
+    let word = |at: usize| u32::from_le_bytes(dll[at..at + 4].try_into().unwrap()) as usize;
+    let (mut shaders, mut by_rule_alone, mut wrong) = (0, 0, Vec::new());
+    let mut at = 0;
+    while let Some(i) = dll[at..].windows(4).position(|w| w == b"DXBC") {
+        let start = at + i;
+        at = start + 4;
+        if start + 32 > dll.len() || word(start + 20) != 1 {
+            continue;
+        }
+        let Some(blob) = dll.get(start..start + word(start + 24)) else { continue };
+        let (Some(user), Some(l)) = (xcl::gpu::recomp::pso::compute_user_sgprs(blob), layout_from_blob(blob)) else { continue };
+        shaders += 1;
+        let has = 4 * user.saturating_sub(4);
+        by_rule_alone += (l.inline > has) as u32;
+        if inline_for(&l, Some(user)) > has {
+            wrong.push(format!("+{start:#x}: {user} user SGPRs, {} bytes of arguments in registers", inline_for(&l, Some(user))));
+        }
+    }
+    println!("XboxBvhBuilder.dll: {shaders} compute shaders; by the layout's rule alone {by_rule_alone} would get arguments in registers they do not have");
+    assert!(shaders >= 40, "only {shaders} compute shaders found in the DLL");
+    assert!(wrong.is_empty(), "{} of {shaders} shaders: {:?}", wrong.len(), &wrong[..wrong.len().min(4)]);
 }

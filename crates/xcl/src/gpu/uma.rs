@@ -47,7 +47,7 @@ pub struct Uma {
     win_allocs: Vec<usize>,
     inner: Mutex<Inner>,
     /// free ranges of the sparse windows (address → length) and the reservations in them
-    sparse_free: Mutex<(BTreeMap<usize, usize>, BTreeMap<usize, usize>)>,
+    sparse_free: Mutex<SparseRanges>,
     /// XCL's own pool in window 0 for `Arena` blocks: (start, end, free blocks). The title
     /// cannot take it – a title that commits all of unified memory at start (Unicorn
     /// Overlord: 2046 of 2048 MB) left no room for draw arguments, and draws were skipped.
@@ -63,7 +63,22 @@ struct Inner {
     free: BTreeMap<usize, usize>,
     /// live allocations: offset → length
     used: BTreeMap<usize, usize>,
+    used_bytes: usize,
     reserved: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct SparseRanges {
+    ranges: (BTreeMap<usize, usize>, BTreeMap<usize, usize>),
+    used_bytes: usize,
+}
+
+impl SparseRanges {
+    fn take(&mut self, lo: usize, hi: usize, size: usize, align: usize, single_window: bool) -> Option<usize> {
+        let at = take_sparse_in(&mut self.ranges, lo, hi, size, align, single_window)?;
+        self.used_bytes += size;
+        Some(at)
+    }
 }
 
 /// Carve an `align`-aligned block of `size` bytes from `free` within `[lo_bound, hi_bound)`.
@@ -80,7 +95,7 @@ fn take_sparse_in(
     if lo_bound >= hi_bound {
         return None;
     }
-    let found = g.0.iter().find_map(|(&o, &l)| {
+    let first_fit = |(&o, &l): (&usize, &usize)| {
         let lo = o.max(lo_bound);
         let hi = o.saturating_add(l).min(hi_bound);
         if lo >= hi {
@@ -95,7 +110,9 @@ fn take_sparse_in(
             at = (next_win.checked_add(align - 1)?) & !(align - 1);
         }
         None
-    });
+    };
+    let found = g.0.range(..lo_bound).next_back().and_then(first_fit)
+        .or_else(|| g.0.range(lo_bound..hi_bound).find_map(first_fit));
     let (start, len, at) = found?;
     g.0.remove(&start);
     if at > start {
@@ -146,6 +163,7 @@ impl Uma {
                 g.free.insert(at + bytes, start + len - at - bytes);
             }
             g.used.insert(at, bytes);
+            g.used_bytes += bytes;
             at
         };
         let p = self.base + at;
@@ -163,7 +181,12 @@ impl Uma {
     /// large title reservations and overflow), and window 3 as a smaller committed coherent
     /// window (`OpenExistingHeapFromAddress`) for per-draw arguments and CPU readback buffers.
     pub fn for_runtime(size: usize) -> Option<Uma> {
-        let committed = ((size.min(RUNTIME_COMMITTED_CAP) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
+        Self::for_runtime_with(size, RUNTIME_COMMITTED_CAP)
+    }
+
+    /// `for_runtime` with a coherent window of up to `coherent` bytes (`coherent_hint`).
+    pub fn for_runtime_with(size: usize, coherent: usize) -> Option<Uma> {
+        let committed = ((size.min(coherent.max(RUNTIME_COMMITTED_CAP)) + GRAIN - 1) & !(GRAIN - 1)).clamp(GRAIN, MAX_SIZE);
         let sparse_len = (MAX_WINDOWS - 1) * WINDOW;
         for slot in (4usize..512).step_by(MAX_WINDOWS) {
             let base = slot << 32;
@@ -185,8 +208,8 @@ impl Uma {
             }
             let mut inner = Inner::default();
             inner.free.insert((MAX_WINDOWS - 1) * WINDOW, committed);
-            let mut sparse_free: (BTreeMap<usize, usize>, BTreeMap<usize, usize>) = Default::default();
-            sparse_free.0.insert(base, sparse_len);
+            let mut sparse_free = SparseRanges::default();
+            sparse_free.ranges.0.insert(base, sparse_len);
             let u = Uma {
                 base,
                 kinds: [WindowKind::Sparse, WindowKind::Sparse, WindowKind::Sparse, WindowKind::Committed(committed)],
@@ -215,7 +238,7 @@ impl Uma {
                 self.kinds[k] = WindowKind::Sparse;
             }
             self.win_allocs.push(start);
-            self.sparse_free.lock().unwrap().0.insert(start, len);
+            self.sparse_free.lock().unwrap().ranges.0.insert(start, len);
         } else if !p.is_null() {
             unsafe { VirtualFree(p, 0, MEM_RELEASE) };
         }
@@ -266,6 +289,13 @@ impl Uma {
         self.window_of(p).is_some_and(|k| self.is_committed_window(k))
     }
 
+    /// Whether `[p, p + len)` lies in a committed coherent window – memory that is committed and
+    /// read-write as a whole, so it needs no `VirtualQuery` (which walks a region to its end to
+    /// size it: on a 4 GiB window ~40 ms a call, a retail game's DirectStorage requests crawled).
+    pub fn in_committed_window(&self, p: usize, len: usize) -> bool {
+        len > 0 && self.is_committed(p) && p.checked_add(len - 1).is_some_and(|e| self.window_of(e) == self.window_of(p))
+    }
+
     /// Address space for a title reservation of `size` bytes in the sparse windows (64 KiB
     /// aligned, first fit; not committed). Prefers windows 1+ so window 0 stays uncluttered for
     /// small allocations, falling back to all of the title's sparse space (never `desc_range`).
@@ -277,10 +307,10 @@ impl Uma {
         let mut g = self.sparse_free.lock().unwrap();
         let end = self.base + MAX_WINDOWS * WINDOW;
         let lo = self.title_sparse_start();
-        if let Some(at) = take_sparse_in(&mut g, (self.base + WINDOW).max(lo), end, size, GRAIN, false) {
+        if let Some(at) = g.take((self.base + WINDOW).max(lo), end, size, GRAIN, false) {
             return Some(at);
         }
-        take_sparse_in(&mut g, lo, end, size, GRAIN, false)
+        g.take(lo, end, size, GRAIN, false)
     }
 
     /// Reserve an aligned range strictly inside sparse window `k` (window 0: 32-bit descriptor
@@ -296,12 +326,12 @@ impl Uma {
         let mut g = self.sparse_free.lock().unwrap();
         let desc = if k == 0 { self.desc_range() } else { None };
         if let Some((lo, hi)) = desc {
-            if let Some(at) = take_sparse_in(&mut g, lo, hi, size, align, true) {
+            if let Some(at) = g.take(lo, hi, size, align, true) {
                 return Some((at, size));
             }
         }
         let lo = desc.map_or(w_start, |(lo, _)| lo);
-        take_sparse_in(&mut g, lo, w_start + w_len, size, align, true).map(|at| (at, size))
+        g.take(lo, w_start + w_len, size, align, true).map(|at| (at, size))
     }
 
     /// Reserve an aligned range in the sparse windows that never straddles a 4 GiB window
@@ -319,14 +349,14 @@ impl Uma {
         let above_0 = (self.base + WINDOW).max(lo);
         if size <= WINDOW {
             if self.is_sparse_window(0) {
-                if let Some(at) = take_sparse_in(&mut g, lo, self.base + WINDOW, size, align, true) {
+                if let Some(at) = g.take(lo, self.base + WINDOW, size, align, true) {
                     return Some((at, size));
                 }
             }
-            take_sparse_in(&mut g, above_0, end, size, align, true).map(|at| (at, size))
+            g.take(above_0, end, size, align, true).map(|at| (at, size))
         } else {
-            take_sparse_in(&mut g, above_0, end, size, align, false)
-                .or_else(|| take_sparse_in(&mut g, lo, end, size, align, false))
+            g.take(above_0, end, size, align, false)
+                .or_else(|| g.take(lo, end, size, align, false))
                 .map(|at| (at, size))
         }
     }
@@ -334,31 +364,33 @@ impl Uma {
     /// The bytes of the sparse reservation starting at `p` (it is gone after this).
     pub fn sparse_release(&self, p: usize) -> Option<usize> {
         let mut g = self.sparse_free.lock().unwrap();
-        let size = g.1.remove(&p)?;
+        let size = g.ranges.1.remove(&p)?;
+        g.used_bytes -= size;
+        let free = &mut g.ranges.0;
         let (mut start, mut len) = (p, size);
-        if let Some((&o, &l)) = g.0.range(..p).next_back() {
+        if let Some((&o, &l)) = free.range(..p).next_back() {
             if o + l == p {
-                g.0.remove(&o);
+                free.remove(&o);
                 start = o;
                 len += l;
             }
         }
-        if let Some(l) = g.0.remove(&(p + size)) {
+        if let Some(l) = free.remove(&(p + size)) {
             len += l;
         }
-        g.0.insert(start, len);
+        free.insert(start, len);
         Some(size)
     }
 
     /// The sparse reservation holding `p`: (start, bytes).
     pub fn sparse_reservation(&self, p: usize) -> Option<(usize, usize)> {
         let g = self.sparse_free.lock().unwrap();
-        g.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
+        g.ranges.1.range(..=p).next_back().map(|(&a, &l)| (a, l)).filter(|&(a, l)| p < a + l)
     }
 
     /// Bytes currently reserved/allocated in sparse windows.
     pub fn sparse_used(&self) -> usize {
-        self.sparse_free.lock().unwrap().1.values().sum()
+        self.sparse_free.lock().unwrap().used_bytes
     }
 
     /// `windows` committed windows of `size` bytes each.
@@ -538,13 +570,18 @@ impl Uma {
         let size = size.max(1).checked_next_multiple_of(GRAIN)?;
         let align = align.max(GRAIN).checked_next_power_of_two()?;
         let mut g = self.inner.lock().unwrap();
-        let found = g.free.iter().filter(|(&o, _)| window.is_none_or(|k| o / WINDOW == k)).find_map(|(&o, &l)| {
+        let first_fit = |(&o, &l): (&usize, &usize)| {
             let at = self.base.checked_add(o)?.checked_next_multiple_of(align)? - self.base;
             (at.checked_add(size).is_some_and(|end| end <= o + l)).then_some((o, l, at))
-        });
+        };
+        let found = match window {
+            Some(k) if k < MAX_WINDOWS => g.free.range(k * WINDOW..(k + 1) * WINDOW).find_map(first_fit),
+            Some(_) => None,
+            None => g.free.iter().find_map(first_fit),
+        };
         let Some((start, len, at)) = found else {
             if Self::tracing() {
-                let used = g.used.values().sum();
+                let used = g.used_bytes;
                 drop(g);
                 self.trace(size, None, used);
             }
@@ -558,10 +595,11 @@ impl Uma {
             g.free.insert(at + size, start + len - at - size);
         }
         g.used.insert(at, size);
+        g.used_bytes += size;
         if !zero {
             g.reserved.insert(at);
         }
-        let used = if Self::tracing() && size >= 1 << 20 { Some(g.used.values().sum()) } else { None };
+        let used = (Self::tracing() && size >= 1 << 20).then_some(g.used_bytes);
         drop(g);
         let p = (self.base + at) as *mut u8;
         if let Some(used) = used {
@@ -589,6 +627,7 @@ impl Uma {
         let mut g = self.inner.lock().unwrap();
         let off = p - self.base;
         let Some(orig) = g.used.remove(&off) else { return false };
+        g.used_bytes -= orig;
         g.reserved.remove(&off);
         let (mut start, mut len) = (off, orig);
         // merge with the free neighbours
@@ -608,7 +647,7 @@ impl Uma {
 
     /// Bytes handed out.
     pub fn used(&self) -> usize {
-        self.inner.lock().unwrap().used.values().sum()
+        self.inner.lock().unwrap().used_bytes
     }
 }
 
@@ -669,12 +708,77 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
+/// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
+/// known only once it asks for it, and the window is committed when it is made: its size is
+/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
+/// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
+fn coherent_file() -> std::path::PathBuf {
+    crate::state::data_dir().join("cache").join("uma_coherent.txt")
+}
+
+/// Bytes the coherent window is made with.
+pub fn coherent_hint() -> usize {
+    if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        return (mb << 20).clamp(GRAIN, MAX_SIZE);
+    }
+    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
+    // and textures (WDDM charges commit for each video-memory allocation too) and the window
+    // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
+    // unified memory: no image) rather than taking the system's commit
+    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
+        crate::xlog_warn!(
+            "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
+            free_commit() >> 20,
+            NEEDS_FOR_COHERENT_HEAPS >> 20
+        );
+        return RUNTIME_COMMITTED_CAP;
+    }
+    (title + RUNTIME_COMMITTED_CAP).min(MAX_SIZE)
+}
+
+/// Commit free before the title starts for its GPU heaps to go to the coherent window.
+const NEEDS_FOR_COHERENT_HEAPS: usize = 17 << 30;
+
+fn free_commit() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return usize::MAX;
+    }
+    m.ullAvailPageFile as usize
+}
+
+/// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
+/// next run makes the window that large (this one has the size it was made with).
+pub fn note_coherent_need(bytes: usize) {
+    static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
+        let f = coherent_file();
+        if let Some(d) = f.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let _ = std::fs::write(&f, bytes.to_string());
+        crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (a window of up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(MAX_SIZE) >> 20);
+    }
+}
+
+impl Uma {
+    /// The committed coherent window (None: none).
+    pub fn committed_window(&self) -> Option<usize> {
+        (0..MAX_WINDOWS).find(|&k| self.is_committed_window(k))
+    }
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
         .get_or_init(|| {
             let mb = std::env::var("XCL_UMA_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(2048);
-            let u = Uma::for_runtime(mb << 20);
+            let coherent = coherent_hint();
+            let u = Uma::for_runtime_with((mb << 20).max(coherent), coherent);
             match &u {
                 Some(u) => {
                     let sparse_n = (0..MAX_WINDOWS).filter(|&k| u.is_sparse_window(k)).count();
@@ -695,7 +799,63 @@ pub fn get() -> Option<&'static Uma> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_first_fit_checks_the_hole_straddling_the_lower_bound() {
+        let lo = WINDOW;
+        let hi = lo + 8 * GRAIN;
+        let mut ranges = (
+            BTreeMap::from([(GRAIN, GRAIN), (lo - GRAIN, 4 * GRAIN), (lo + 4 * GRAIN, 4 * GRAIN), (hi, 4 * GRAIN)]),
+            BTreeMap::new(),
+        );
+
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 2 * GRAIN, GRAIN, true), Some(lo));
+        assert_eq!(ranges.0.get(&(lo - GRAIN)), Some(&GRAIN));
+        assert_eq!(ranges.0.get(&(lo + 2 * GRAIN)), Some(&GRAIN));
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 2 * GRAIN, 4 * GRAIN, true), Some(lo + 4 * GRAIN));
+        let after = ranges.clone();
+        assert_eq!(take_sparse_in(&mut ranges, lo, hi, 3 * GRAIN, GRAIN, true), None);
+        assert_eq!(ranges, after);
+    }
+
+    #[test]
+    fn sparse_first_fit_preserves_the_single_window_constraint() {
+        let lo = WINDOW - GRAIN;
+        let hi = WINDOW + 2 * GRAIN;
+        let free = BTreeMap::from([(GRAIN, GRAIN), (lo - GRAIN, 4 * GRAIN)]);
+        let mut single = (free.clone(), BTreeMap::new());
+        let mut cross = (free, BTreeMap::new());
+        assert_eq!(take_sparse_in(&mut single, lo, hi, 2 * GRAIN, GRAIN, true), Some(WINDOW));
+        assert_eq!(take_sparse_in(&mut cross, lo, hi, 2 * GRAIN, GRAIN, false), Some(lo));
+    }
     use super::*;
+
+    #[test]
+    fn committed_usage_counts_pool_and_window_allocations() {
+        let u = Uma::with_windows(2, 16 << 20).unwrap();
+        u.reserve_pool(ARENA_BLOCK);
+        assert_eq!(u.used(), ARENA_BLOCK);
+        let p = u.alloc_in(1, GRAIN + 1, 0).unwrap() as usize;
+        assert_eq!(u.window_of(p), Some(1));
+        assert_eq!(u.used(), ARENA_BLOCK + 2 * GRAIN);
+        assert!(u.alloc_in(MAX_WINDOWS, 1, 0).is_none());
+        assert!(u.free(p));
+        assert!(!u.free(p));
+        assert_eq!(u.used(), ARENA_BLOCK);
+    }
+
+    #[test]
+    fn sparse_usage_counts_rounded_reservations() {
+        let u = Uma::for_runtime(16 << 20).unwrap();
+        let (a, len) = u.sparse_alloc(GRAIN + 1, GRAIN).unwrap();
+        let b = u.sparse_reserve(1).unwrap();
+        assert_eq!(len, 2 * GRAIN);
+        assert_eq!(u.sparse_used(), 3 * GRAIN);
+        assert_eq!(u.sparse_release(a), Some(len));
+        assert_eq!(u.sparse_release(a), None);
+        assert_eq!(u.sparse_used(), GRAIN);
+        assert_eq!(u.sparse_release(b), Some(GRAIN));
+        assert_eq!(u.sparse_used(), 0);
+    }
 
     /// Arena blocks come from XCL's pool while the title holds the rest of window 0, and go
     /// back to it when freed.

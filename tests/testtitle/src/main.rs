@@ -282,6 +282,15 @@ mod xmem_hooks {
         }
         Ok(())
     }
+
+    pub fn with_display_backing(test: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+        unsafe {
+            XMemSetAllocationHooks(alloc as *const () as usize, free as *const () as usize);
+            let result = test();
+            XMemSetAllocationHooks(0, 0);
+            result
+        }
+    }
 }
 
 unsafe extern "system" fn set_flag(ctx: *mut c_void, canceled: bool) {
@@ -769,8 +778,11 @@ fn main() {
     check("D3D12.X: coherent window headroom (CUSTOM+WRITE_BACK & oversized READBACK in sparse VRAM)", gpu::coherent_window_headroom);
     check("D3D12.X: async ring-buffered sparse uploads (80 MiB across 20 submits + reused-tile zeroing)", gpu::sparse_async_ring_upload_stress);
     check("D3D12.X: descriptor heaps still in window 0 after an 8 GiB+ graphics reservation", gpu::descriptor_heaps_after_a_large_graphics_reservation);
+    check("D3D12.X: slot 133 buffer across external XMem mappings", gpu::external_placed_buffer);
     #[cfg(target_env = "msvc")]
-    check("D3D12.X: title-backed view descriptor heap", || xmem_hooks::with_descriptor_backing(gpu::title_backed_view_descriptor_heap));
+    check("D3D12.X: slot 127 display textures use the XMem allocation pool", || xmem_hooks::with_display_backing(|| gpu::title_backed_display_textures(false)));
+    #[cfg(target_env = "msvc")]
+    check("D3D12.X: slot 127 display render targets accept optimized clear values", || xmem_hooks::with_display_backing(|| gpu::title_backed_display_textures(true)));
     check("D3D12.X: committed textures beyond the coherent room are created; a readback buffer still gets coherent memory", gpu::committed_textures_leave_room_for_readback);
     check("D3D12.X: dynamic depth bias via RSSetDepthBiasX (#94)", gpu::dynamic_depth_bias);
     check("D3D12.X: raytracing surface (OPTIONS5, AS SRV descriptor, #146/#148 BVH list slots)", gpu::raytracing_surface);

@@ -304,6 +304,8 @@ struct RecompAgg {
     graphics_wave32: usize,
     graphics_wave64: usize,
     wave_hazards: BTreeMap<String, usize>,
+    /// … and the reads of lanes ≥ 32 the 32-lane form resolves (kind → programs)
+    wave_resolved: BTreeMap<String, usize>,
     /// `--example MNEMONIC`: listing of the first program missing it, its HLSL and profile
     example: Option<(String, String, &'static str)>,
 }
@@ -337,6 +339,9 @@ impl RecompAgg {
         for (k, v) in o.wave_hazards {
             *self.wave_hazards.entry(k).or_default() += v;
         }
+        for (k, v) in o.wave_resolved {
+            *self.wave_resolved.entry(k).or_default() += v;
+        }
         for (k, (a, b)) in o.by_mode {
             let e = self.by_mode.entry(k).or_default();
             e.0 += a;
@@ -345,7 +350,7 @@ impl RecompAgg {
         self.hlsl_bytes += o.hlsl_bytes;
     }
 
-    fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode) {
+    fn add(&mut self, name: &str, code: &[u8], keep: usize, mode: recomp::Mode, wave64: bool) {
         // `XCL_RECOMP_ONLY=<hash>` (the hex prefix of an `XCL_DUMP_HLSL` file): that program alone
         if let Ok(only) = std::env::var("XCL_RECOMP_ONLY") {
             if format!("{:016x}", name_hash(name)) != only {
@@ -353,7 +358,6 @@ impl RecompAgg {
             }
         }
         self.programs += 1;
-        let wave64 = recomp::detect_wave64(code);
         self.wave32 += !wave64 as usize;
         let (label, profile) = match &mode {
             recomp::Mode::Vertex(_) => ("VS", "vs_6_6"),
@@ -366,9 +370,15 @@ impl RecompAgg {
         if matches!(label, "VS" | "PS") {
             if wave64 {
                 self.graphics_wave64 += 1;
-                let hz = recomp::wave_hazards(code);
+                let (hz, resolved) = recomp::wave_lane_reads(code);
                 for k in &hz {
                     *self.wave_hazards.entry(k.to_string()).or_default() += 1;
+                }
+                for k in &resolved {
+                    *self.wave_resolved.entry(k.to_string()).or_default() += 1;
+                }
+                if !resolved.is_empty() {
+                    *self.wave_resolved.entry("(programs)".into()).or_default() += 1;
                 }
                 if !hz.is_empty() {
                     *self.wave_hazards.entry("(programs at risk)".into()).or_default() += 1;
@@ -543,7 +553,8 @@ impl Agg {
                 let mode = recomp::interface(blob, &sh, f).unwrap_or(recomp::Mode::Kernel);
                 for p in &f.programs {
                     let keep = self.keep;
-                    self.rc.add(&format!("{name} FSSM#{fi}"), &f.data[p.offset..p.offset + p.len], keep, mode.clone());
+                    let code = &f.data[p.offset..p.offset + p.len];
+                    self.rc.add(&format!("{name} FSSM#{fi}"), code, keep, mode.clone(), recomp::fssm_wave64(f, code));
                     // `--example name=…`: FSSM header (up to the code) as dwords, once
                     if EXAMPLE_FOR.get().is_some_and(|w| w.starts_with("name=")) && !HEADER_SHOWN.swap(true, Ordering::Relaxed) {
                         let end = f.code.map(|c| c.0).unwrap_or(0x400).min(f.data.len()).min(0x800);
@@ -702,7 +713,9 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
         }
     };
     if args.iter().any(|a| a == "--precompile") {
-        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), t0);
+        let only = args.iter().position(|a| a == "--only").and_then(|i| args.get(i + 1)).map(|s| s.to_ascii_lowercase());
+        let pipelines = args.iter().any(|a| a == "--pipelines");
+        return precompile(&input, opt("--limit").unwrap_or(usize::MAX), opt("--windows").unwrap_or(4) as u32, opt("--split").map(|v| v != 0), only.as_deref(), pipelines, t0);
     }
     let agg = analyze(&input, recomp_on, compile, iface_on);
     drop(input);
@@ -720,13 +733,107 @@ pub fn run(path: &Path, args: &[String]) -> i32 {
 /// no split form, so a title asked for other HLSL and compiled everything again. Still
 /// different at run time: a PS's static samplers after its VS's (sampler base 0 here) and the
 /// mesh pass-through, which the runtime builds for its pixel shader.
-fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0: std::time::Instant) -> i32 {
+/// `--pipelines`: each compute program's pipeline made on the GPU as a title's would be (XCL's
+/// ABI root signature with its static samplers): the driver keeps what it compiled in its own
+/// cache, which the title then finds – a retail game's 1 MB-DXIL programs kept its loading
+/// waiting for the driver's compiler for minutes. Nothing runs on the GPU.
+struct Pipelines {
+    dev: windows::Win32::Graphics::Direct3D12::ID3D12Device,
+    signatures: Mutex<std::collections::HashMap<Vec<u32>, windows::Win32::Graphics::Direct3D12::ID3D12RootSignature>>,
+    made: AtomicUsize,
+    refused: AtomicUsize,
+    /// driver compiles running and the most at once (`XCL_PIPELINE_THREADS`, 4): each of the
+    /// biggest takes ~1.5 GB in the driver – fifteen at once took 24 GB
+    running: (Mutex<usize>, std::sync::Condvar),
+    most: usize,
+}
+
+// D3D12 devices and root signatures are free-threaded
+unsafe impl Sync for Pipelines {}
+
+impl Pipelines {
+    fn new() -> Result<Pipelines, String> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        use windows::Win32::Graphics::Dxgi::*;
+        unsafe {
+            let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| e.to_string())?;
+            let sel = crate::gpu::adapter::Selector::from_env_or("auto");
+            let (adapter, _) = crate::gpu::adapter::candidates(&factory, &sel).into_iter().next().ok_or_else(|| crate::gpu::adapter::no_match(&factory, &sel))?;
+            let dev = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0).map_err(|e| e.to_string())?;
+            let most = std::env::var("XCL_PIPELINE_THREADS").ok().and_then(|v| v.parse().ok()).unwrap_or(4usize).max(1);
+            Ok(Pipelines { dev, signatures: Mutex::new(Default::default()), made: AtomicUsize::new(0), refused: AtomicUsize::new(0), running: (Mutex::new(0), std::sync::Condvar::new()), most })
+        }
+    }
+
+    /// The compute pipeline of `c` (made and released).
+    fn make(&self, c: &recomp::pso::Compiled) {
+        use windows::Win32::Graphics::Direct3D12::*;
+        let key: Vec<u32> = c.samplers.iter().flat_map(|(w, cmp)| w.iter().copied().chain([*cmp as u32])).collect();
+        let rs = {
+            let mut g = self.signatures.lock().unwrap();
+            match g.get(&key) {
+                Some(rs) => rs.clone(),
+                None => match recomp::pso::abi_root_signature_with(&self.dev, true, &c.samplers) {
+                    Ok(rs) => {
+                        g.insert(key, rs.clone());
+                        rs
+                    }
+                    Err(_) => {
+                        self.refused.fetch_add(1, Ordering::Relaxed);
+                        return;
+                    }
+                },
+            }
+        };
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::ManuallyDrop::new(Some(rs)),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: c.dxil.as_ptr() as *const _, BytecodeLength: c.dxil.len() },
+            ..Default::default()
+        };
+        {
+            let mut n = self.running.0.lock().unwrap();
+            while *n >= self.most {
+                n = self.running.1.wait(n).unwrap();
+            }
+            *n += 1;
+        }
+        let r: windows::core::Result<ID3D12PipelineState> = unsafe { self.dev.CreateComputePipelineState(&desc) };
+        *self.running.0.lock().unwrap() -= 1;
+        self.running.1.notify_one();
+        drop(std::mem::ManuallyDrop::into_inner(desc.pRootSignature));
+        let done = match r {
+            Ok(_) => self.made.fetch_add(1, Ordering::Relaxed) + 1,
+            Err(_) => self.refused.fetch_add(1, Ordering::Relaxed) + 1,
+        };
+        if done % 25 == 0 {
+            eprintln!("  pipelines: {} made, {} refused", self.made.load(Ordering::Relaxed), self.refused.load(Ordering::Relaxed));
+        }
+    }
+}
+
+fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, only: Option<&str>, pipelines: bool, t0: std::time::Instant) -> i32 {
+    let pipelines = if pipelines {
+        match Pipelines::new() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("xcl shaders --pipelines: no GPU device: {e}");
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    let pipelines = pipelines.as_ref();
     let n = input.len().min(limit);
     let next = AtomicUsize::new(0);
     let (done, compiled, cached, failed, skipped) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     let errors: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    recomp::dxc::set_memory_reserve(2);
     // the compiles run on the DXC pool; these threads translate and keep it fed
     let threads = recomp::dxc::compile_threads() + 2;
+    // VS / PS: the 32-lane form wherever the GPU can run 32-lane waves (`pso::graphics_wave32`);
+    // `--split` sets both
+    let graphics_split = split.unwrap_or_else(recomp::runner::graphics_wave32);
     let split = split.unwrap_or_else(|| recomp::pso::split_wave64_forced() || recomp::runner::wave64_supported().is_ok_and(|w| !w));
     println!(
         "precompiling {n} shaders into {} ({} compile threads; {windows} memory windows{})",
@@ -744,6 +851,34 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                 let (name, blob) = input.get(i);
                 let Some(blob) = blob else { continue };
                 let Some(sh) = xbox::parse(&blob) else { continue };
+                if only.is_some_and(|o| !sh.stage.eq_ignore_ascii_case(o)) {
+                    done.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                // a compute program as a title's pipeline translates it (`pso::console_to_dxil_in`):
+                // into the translation cache too, so the title does not translate it again
+                if sh.fssm.iter().any(|f| matches!(recomp::interface(&blob, &sh, f), Some(recomp::Mode::Compute(_)))) {
+                    match recomp::pso::console_to_dxil_in(&blob, recomp::pso::Stage::Compute, 0, split, windows) {
+                        Ok(c) => {
+                            if let Some(p) = pipelines {
+                                p.make(&c);
+                            }
+                            compiled.fetch_add(1, Ordering::Relaxed)
+                        }
+                        Err(e) => {
+                            let mut g = errors.lock().unwrap();
+                            if g.len() < 10 {
+                                g.push(format!("{name}: {}", e.lines().find(|l| l.contains("error")).unwrap_or(e.lines().next().unwrap_or(""))));
+                            }
+                            failed.fetch_add(1, Ordering::Relaxed)
+                        }
+                    };
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    if d % 200 == 0 {
+                        eprintln!("  {d}/{n} ({:.0} s)", t0.elapsed().as_secs_f64());
+                    }
+                    continue;
+                }
                 for f in &sh.fssm {
                     let Some(mode) = recomp::interface(&blob, &sh, f) else { continue };
                     let jobs: Vec<(&str, Option<String>)> = match &mode {
@@ -758,10 +893,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
                     };
                     for p in &f.programs {
                         let code = &f.data[p.offset..p.offset + p.len];
-                        // as `pso` translates: VS / PS / CS with the title's memory windows
-                        // (`console_translation`), MS with one (`translate_mesh`)
-                        let mem_windows = if matches!(mode, recomp::Mode::Mesh(_)) { 1 } else { windows };
-                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::detect_wave64(code), split_wave64: split, mem_windows, ..Default::default() };
+                        // as `pso` translates: with the title's memory windows (`console_translation`,
+                        // `translate_mesh`)
+                        let split = if matches!(mode, recomp::Mode::Vertex(_) | recomp::Mode::Pixel(_)) { graphics_split } else { split };
+                        let opt = recomp::Options { mode: mode.clone(), wave64: recomp::fssm_wave64(f, code), split_wave64: split, mem_windows: windows, ..Default::default() };
                         let Ok(t) = recomp::translate(code, &opt) else { continue };
                         if !t.complete() {
                             continue;
@@ -796,6 +931,10 @@ fn precompile(input: &Input, limit: usize, windows: u32, split: Option<bool>, t0
         skipped.into_inner(),
         t0.elapsed().as_secs_f64()
     );
+    if let Some(p) = pipelines {
+        println!("pipelines made on the GPU {}, refused {}", p.made.load(Ordering::Relaxed), p.refused.load(Ordering::Relaxed));
+    }
+    println!("precompile shaders: {}", crate::gpu::recomp::dxc::stage_summary());
     for e in errors.into_inner().unwrap() {
         println!("  {e}");
     }
@@ -1062,8 +1201,8 @@ fn print(path: &Path, what: &str, agg: Agg, top: usize, json: bool, t0: std::tim
             println!("  {k:<60} {v:>6}");
         }
         println!(
-            "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}",
-            rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards
+            "VS/PS and the wave size (the driver picks it): wave32 {} (handled – the halves of a 64-wide wave run separately), wave64 {}; hazards in 32-thread waves: {:?}; reads of lanes ≥ 32 resolved (32-lane GPUs): {:?}",
+            rc.graphics_wave32, rc.graphics_wave64, rc.wave_hazards, rc.wave_resolved
         );
         if let Some((x, hlsl, profile)) = &rc.example {
             println!("example:

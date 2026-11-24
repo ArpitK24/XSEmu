@@ -11,6 +11,8 @@ use crate::config::Config;
 use crate::util::glob_match;
 
 pub mod acphal;
+pub mod bcpack;
+pub mod bink;
 pub mod d3d12_layout;
 pub mod d3d12x;
 pub mod dstorage;
@@ -19,6 +21,7 @@ pub mod gameinput;
 pub mod kbm;
 pub mod kernelx;
 pub mod mfplat;
+pub mod netoff;
 pub mod opus;
 pub mod user;
 pub mod xaudio2;
@@ -88,13 +91,14 @@ pub const XG: &str = "xg_xs.dll";
 pub const XCRDAPI: &str = "xcrdapi.dll";
 /// the console's user32 subset (windows, the message loop): the PC user32
 pub const MINUSERX: &str = "minuserx.dll";
-/// the console's audio processor (APU memory, its channel, SHAPE contexts) and decoder (xapu)
+/// the console's audio processor (APU memory, its channel, SHAPE contexts), decoder (xapu) and
+/// DSP (chad)
 pub const ACPHAL: &str = "acphal.dll";
 /// controllers (`GameInputCreate`)
 pub const GAMEINPUT: &str = "gameinput.dll";
 
 fn build(config: &Config) -> Registry {
-    let modules = vec![
+    let mut modules = vec![
         HleModule::new(KERNELX, kernelx::exports(), &[SELF, "kernelbase.dll", "kernel32.dll", "advapi32.dll", "sechost.dll"]),
         HleModule::new(XGAMERUNTIME, xgameruntime::exports(), &[]),
         HleModule::new(D3D12X, d3d12x::exports(), &[]),
@@ -107,6 +111,14 @@ fn build(config: &Config) -> Registry {
         HleModule::new(ACPHAL, acphal::exports(), &[]),
         HleModule::new(GAMEINPUT, gameinput::exports(), &[]),
     ];
+    let offline = netoff::enabled();
+    if offline {
+        // the system's own network functions too, for whatever reaches them (#305)
+        netoff::install_system_hooks();
+        let mut m = HleModule::new(netoff::NETOFF, netoff::exports(), &[SELF]);
+        m.ordinals = netoff::ordinals().into_iter().collect();
+        modules.push(m);
+    }
     let idx = |n: &str| modules.iter().position(|m| m.name == n).unwrap();
     let mut routes: Vec<(String, Route)> = Vec::new();
     // user aliases first – they take precedence
@@ -132,6 +144,7 @@ fn build(config: &Config) -> Registry {
         "kernelx.dll",
         "kernel32.dll",
         "kernelbase.dll",
+        "psapi.dll",
         "advapi32.dll",
         "kernel32legacy.dll",
         "advapi32legacy.dll",
@@ -167,7 +180,7 @@ fn build(config: &Config) -> Registry {
     let g = idx(XG);
     routes.push((XG.into(), Route::Hle(g)));
     let ap = idx(ACPHAL);
-    for p in ["acphal.dll", "xapu.dll"] {
+    for p in ["acphal.dll", "xapu.dll", "chad.dll"] {
         routes.push((p.into(), Route::Hle(ap)));
     }
     let gi = idx(GAMEINPUT);
@@ -175,6 +188,12 @@ fn build(config: &Config) -> Registry {
     let c = idx(DXCOMPILER);
     for p in ["dxcompiler_xs.dll", "dxcompiler_x.dll"] {
         routes.push((p.into(), Route::Hle(c)));
+    }
+    if offline {
+        let n = idx(netoff::NETOFF);
+        for p in ["winhttp.dll", "ws2_32.dll"] {
+            routes.push((p.into(), Route::Hle(n)));
+        }
     }
     Registry { modules, routes }
 }
@@ -252,5 +271,20 @@ mod tests {
     fn cross_module_lookup_finds_xmem() {
         let r = build(&Config::default());
         assert_eq!(r.find_any("XMemAlloc").map(|(m, _)| m.name), Some(KERNELX));
+    }
+
+    #[test]
+    fn chad_resolves_dsp_lifecycle_exports() {
+        let r = build(&Config::default());
+        let chad = r.hle_for("chad.dll").expect("chad.dll should resolve to HLE");
+        for name in [
+            "XDspConnectWithMaximumStreamLimit",
+            "XDspActivate",
+            "XDspSubmitCommand",
+            "XDspDeactivate",
+            "XDspDisconnect",
+        ] {
+            assert!(chad.exports.contains_key(name), "{name}");
+        }
     }
 }

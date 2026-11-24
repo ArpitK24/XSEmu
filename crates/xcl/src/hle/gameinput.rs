@@ -12,6 +12,7 @@
 //! (polled at 250 Hz). Methods not listed log their slot once and fail.
 //!
 //! `XCL_PRESS_A_AT=s1,s2…`: press A for 200 ms at those seconds after start (tests).
+//! `XCL_INPUT_FILE=<path>`: live input commands taken from a file while the title runs (`live`).
 
 #![allow(non_snake_case)]
 
@@ -162,6 +163,10 @@ const SEARCH_US: u64 = 1_000_000;
 /// The PC's controller (the XInput slot that answers first: an Xbox pad, or any pad Windows
 /// exposes through XInput) as a GameInput gamepad state; None without one.
 fn xinput_pad() -> Option<GamepadState> {
+    static OFF: OnceLock<bool> = OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("XCL_XINPUT").is_ok_and(|v| v == "0")) {
+        return None;
+    }
     let (get, _) = xinput()?;
     let connected = PAD_CONNECTED.load(Ordering::Relaxed);
     let first = PAD.load(Ordering::Relaxed);
@@ -299,9 +304,123 @@ fn merge_host_inputs(
     s.buttons |= read_scripted();
 }
 
+/// `XCL_INPUT_FILE=<path>`: a live input lever. The file is read every 100 ms; whenever it holds
+/// text, the text is taken (the file is emptied) and its lines run one after another on the
+/// gamepad, on top of the PC's controller, the keyboard and `XCL_PRESS_AT`:
+/// `press A[+B…] [ms]` (held 150 ms by default, then 150 ms released), `hold A[+B…] ms`,
+/// `stick L|R x y [ms]` (-1..1, y up; 500 ms), `trigger L|R [value] [ms]` (1.0, 200 ms),
+/// `wait ms`, `look` (the next shown frame is dumped), `threads` (where every thread is, in the
+/// log). Lines starting with `#` are skipped.
+mod live {
+    use super::*;
+
+    #[derive(Clone, Copy)]
+    pub(super) struct Live {
+        pub buttons: u32,
+        pub sticks: [(f32, f32); 2],
+        pub triggers: [f32; 2],
+    }
+
+    static NOW: Mutex<Live> = Mutex::new(Live { buttons: 0, sticks: [(0.0, 0.0); 2], triggers: [0.0; 2] });
+    static ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    /// The live input now (None: no `XCL_INPUT_FILE`); the file's reader starts on the first call.
+    pub(super) fn now() -> Option<Live> {
+        static STARTED: OnceLock<()> = OnceLock::new();
+        STARTED.get_or_init(|| {
+            let Some(path) = std::env::var_os("XCL_INPUT_FILE").map(std::path::PathBuf::from) else { return };
+            ON.store(true, Ordering::Relaxed);
+            crate::xlog_info!("GameInput: live input from {}", path.display());
+            let _ = std::thread::Builder::new().name("xcl-live-input".into()).spawn(move || read(path));
+        });
+        ON.load(Ordering::Relaxed).then(|| *NOW.lock().unwrap())
+    }
+
+    fn read(path: std::path::PathBuf) {
+        loop {
+            std::thread::sleep(Duration::from_millis(100));
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            if text.trim().is_empty() {
+                continue;
+            }
+            let _ = std::fs::write(&path, "");
+            for line in text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
+                match run(line) {
+                    Ok(()) => crate::xlog_info!("GameInput: live input {line:?} done at {:.2} s", crate::log::uptime()),
+                    Err(e) => crate::xlog_warn!("GameInput: live input {line:?} not understood: {e}"),
+                }
+            }
+        }
+    }
+
+    fn set(f: impl FnOnce(&mut Live)) {
+        f(&mut NOW.lock().unwrap());
+    }
+
+    fn sleep(ms: u64) {
+        std::thread::sleep(Duration::from_millis(ms));
+    }
+
+    fn run(line: &str) -> Result<(), String> {
+        let w: Vec<&str> = line.split_whitespace().collect();
+        let arg = |i: usize| w.get(i).copied().ok_or_else(|| format!("argument {i} missing"));
+        let ms = |i: usize, default: u64| w.get(i).map_or(Ok(default), |s| s.parse::<u64>().map_err(|_| format!("{s:?} is not milliseconds")));
+        let num = |i: usize, default: f32| w.get(i).map_or(Ok(default), |s| s.parse::<f32>().map(|v| v.clamp(-1.0, 1.0)).map_err(|_| format!("{s:?} is not a number")));
+        let side = |i: usize| match arg(i)?.to_ascii_uppercase().as_str() {
+            "L" => Ok(0),
+            "R" => Ok(1),
+            s => Err(format!("{s:?} is not L or R")),
+        };
+        let buttons = |s: &str| s.split('+').try_fold(0, |all, b| button_named(b).map(|b| all | b).ok_or_else(|| format!("unknown button {b:?}")));
+        match w[0].to_ascii_lowercase().as_str() {
+            "press" | "hold" => {
+                let b = buttons(arg(1)?)?;
+                let held = ms(2, if w[0].eq_ignore_ascii_case("press") { 150 } else { 1000 })?;
+                set(|l| l.buttons |= b);
+                sleep(held);
+                set(|l| l.buttons &= !b);
+                sleep(150);
+            }
+            "stick" => {
+                let (k, x, y, held) = (side(1)?, num(2, 0.0)?, num(3, 0.0)?, ms(4, 500)?);
+                set(|l| l.sticks[k] = (x, y));
+                sleep(held);
+                set(|l| l.sticks[k] = (0.0, 0.0));
+                sleep(150);
+            }
+            "trigger" => {
+                let (k, v, held) = (side(1)?, num(2, 1.0)?.max(0.0), ms(3, 200)?);
+                set(|l| l.triggers[k] = v);
+                sleep(held);
+                set(|l| l.triggers[k] = 0.0);
+                sleep(150);
+            }
+            "wait" => sleep(ms(1, 500)?),
+            "look" => crate::hle::d3d12x::present::LOOK.store(true, Ordering::Relaxed),
+            "threads" => crate::eh::dump_threads(),
+            other => return Err(format!("unknown command {other:?}")),
+        }
+        Ok(())
+    }
+}
+
 /// the gamepad now
 pub fn poll() -> GamepadState {
     let mut s = xinput_pad().unwrap_or_default();
+    if let Some(l) = live::now() {
+        s.buttons |= l.buttons;
+        for (k, (x, y)) in l.sticks.into_iter().enumerate() {
+            if x != 0.0 || y != 0.0 {
+                if k == 0 {
+                    (s.left_x, s.left_y) = (x, y);
+                } else {
+                    (s.right_x, s.right_y) = (x, y);
+                }
+            }
+        }
+        s.left_trigger = s.left_trigger.max(l.triggers[0]);
+        s.right_trigger = s.right_trigger.max(l.triggers[1]);
+    }
     merge_host_inputs(
         &mut s,
         super::kbm::enabled(),

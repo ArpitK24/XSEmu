@@ -21,7 +21,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde::Serialize;
 use windows::core::{Interface, PCSTR};
@@ -32,8 +32,9 @@ use windows::Win32::Graphics::Dxgi::*;
 use windows_sys::core::GUID;
 
 use super::layout::{self, Iface};
+use super::residency_list;
 use crate::stubs;
-use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, E_OUTOFMEMORY, S_FALSE, S_OK};
+use crate::util::{HRESULT, E_INVALIDARG, E_NOINTERFACE, S_FALSE, S_OK};
 
 const DLL: &str = "d3d12_xs.dll";
 const EXTRA_SLOTS: usize = 64;
@@ -103,6 +104,9 @@ pub struct D3d12Stats {
     pub fallback_root_signatures: u64,
     pub presents: u64,
     pub frame_boundaries: u64,
+    /// Optional content evidence from the existing frame-dump readback; no new GPU readback.
+    #[serde(default)]
+    pub last_frame_dump: Option<super::present::FrameDumpSample>,
     /// unified memory region opened as a GPU heap (`gpu::uma`): size, bytes in use, buffer VA
     #[serde(default)]
     pub uma_mb: u64,
@@ -112,6 +116,9 @@ pub struct D3d12Stats {
     pub uma_gpu_va: String,
     #[serde(default)]
     pub uma_error: String,
+    /// whether the GPU sees CPU writes to the coherent windows (`check_uma_import`)
+    #[serde(default)]
+    pub uma_import_check: String,
     /// graphics pipelines built from recompiled console shaders (XCL shader ABI root signature)
     #[serde(default)]
     pub translated_pipelines: u64,
@@ -161,8 +168,8 @@ pub fn abi_root_signature() -> Option<ID3D12RootSignature> {
     unsafe { ID3D12RootSignature::from_raw_borrowed(&raw).cloned() }
 }
 /// Each UMA window as one D3D12 buffer (placed in a heap opened over the process memory):
-/// `mem`, `mem1`.. of recompiled shaders. (buffer, GPU VA) per window, kept for the process
-/// lifetime.
+/// the memory of recompiled shaders (`MEM_VIEWS`). (buffer, GPU VA) per window, kept for the
+/// process lifetime.
 static UMA_BUFFER: Mutex<Vec<(usize, u64)>> = Mutex::new(Vec::new());
 /// the committed UMA windows opened as D3D12 heaps (indexed by window `k`; `None` for sparse windows)
 static UMA_HEAPS: Mutex<Vec<Option<usize>>> = Mutex::new(Vec::new());
@@ -187,7 +194,15 @@ pub fn uma_gpu_va() -> u64 {
     uma_window_vas().first().copied().unwrap_or(0)
 }
 
-/// GPU virtual addresses of the UMA window buffers (`u2`, `u3`.. of the shader ABI).
+/// Descriptor index in the shared heap of window 0's raw view (window k's at + k): how
+/// translated shaders reach memory (io[`IO_MEM_VIEWS`]). None: UMA is not open on the GPU.
+static MEM_VIEWS: Mutex<Option<u32>> = Mutex::new(None);
+
+pub fn mem_views() -> Option<u32> {
+    *MEM_VIEWS.lock().unwrap()
+}
+
+/// GPU virtual addresses of the UMA window buffers.
 pub fn uma_window_vas() -> Vec<u64> {
     UMA_BUFFER.lock().map(|g| g.iter().map(|b| b.1).collect()).unwrap_or_default()
 }
@@ -226,6 +241,80 @@ pub fn uma_va_of(p: usize) -> Option<u64> {
     let k = u.window_of(p)?;
     let base = UMA_BUFFER.lock().ok()?.get(k)?.1;
     (base != 0).then(|| base + (p - u.window(k).0) as u64)
+}
+
+/// What the start-up check of the coherent UMA windows found (`check_uma_import`): empty – not
+/// run, "ok …", "off (XCL_UMA_CHECK=0)", or why the GPU does not see the CPU's writes.
+static UMA_IMPORT_CHECK: Mutex<String> = Mutex::new(String::new());
+
+/// A word the CPU writes into each coherent window, read back by a GPU copy. The windows are
+/// imported as heaps (`OpenExistingHeapFromAddress`), and a runtime that cannot import them may
+/// still succeed with memory of its own: vkd3d-proton under a Wine without `userfaultfd` write
+/// watches (#175). The GPU then reads zeros where the title wrote, and nothing else says so.
+/// Off with `XCL_UMA_CHECK=0`.
+unsafe fn check_uma_import(device: &ID3D12Device, u: &crate::gpu::uma::Uma, bufs: &[(usize, u64)]) -> Result<String, String> {
+    let t0 = std::time::Instant::now();
+    let wins: Vec<usize> = (0..bufs.len()).filter(|&k| u.is_committed_window(k) && bufs[k].0 != 0).collect();
+    if wins.is_empty() {
+        return Ok("no coherent window".into());
+    }
+    let queue: ID3D12CommandQueue =
+        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_DIRECT, ..Default::default() }).map_err(|e| format!("check not run: queue: {e}"))?;
+    let alloc: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| format!("check not run: allocator: {e}"))?;
+    let list: ID3D12GraphicsCommandList =
+        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(|e| format!("check not run: list: {e}"))?;
+    let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).map_err(|e| format!("check not run: fence: {e}"))?;
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: 256,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut readback: Option<ID3D12Resource> = None;
+    device
+        .CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback)
+        .map_err(|e| format!("check not run: readback buffer: {e}"))?;
+    let readback = readback.ok_or("check not run: readback buffer")?;
+    // a block of the window's own (title data is not touched), one word per window
+    let mut probes = Vec::new();
+    for (i, &k) in wins.iter().take(64).enumerate() {
+        let Some(p) = u.alloc_in(k, 4, 0) else { continue };
+        let canary = 0x5843_4C00 | k as u32; // "XCL" + the window
+        std::ptr::write_volatile(p as *mut u32, canary);
+        if let Some(src) = ID3D12Resource::from_raw_borrowed(&(bufs[k].0 as *mut c_void)) {
+            list.CopyBufferRegion(&readback, 4 * i as u64, src, (p as usize - u.window(k).0) as u64, 4);
+        }
+        probes.push((k, i, p as usize, canary));
+    }
+    let run = || -> Result<Vec<u32>, String> {
+        list.Close().map_err(|e| format!("check not run: Close: {e}"))?;
+        queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().map_err(|e| e.to_string())?)]);
+        queue.Signal(&fence, 1).map_err(|e| format!("check not run: Signal: {e}"))?;
+        crate::gpu::fence::wait(&fence, 1, device, None, 2000).map_err(|e| format!("check not run: {e}"))?;
+        let mut m = std::ptr::null_mut();
+        readback.Map(0, None, Some(&mut m)).map_err(|e| format!("check not run: Map: {e}"))?;
+        let got = std::slice::from_raw_parts(m as *const u32, 64).to_vec();
+        readback.Unmap(0, None);
+        Ok(got)
+    };
+    let got = run();
+    for &(_, _, p, _) in &probes {
+        u.free(p);
+    }
+    let got = got?;
+    let wrong: Vec<String> =
+        probes.iter().filter(|&&(_, i, _, c)| got[i] != c).map(|&(k, i, _, c)| format!("window {k}: wrote {c:#x}, the GPU read {:#x}", got[i])).collect();
+    if !wrong.is_empty() {
+        return Err(format!(
+            "the GPU does not see what the CPU writes to unified memory ({}): the host-memory import fell back to memory of its own (Wine without userfaultfd write watches?); shaders will read zeros or stale data where the title wrote",
+            wrong.join("; ")
+        ));
+    }
+    Ok(format!("ok, {} window(s), {} µs", probes.len(), t0.elapsed().as_micros()))
 }
 
 unsafe fn open_uma(device: &ID3D12Device) {
@@ -273,6 +362,16 @@ unsafe fn open_uma(device: &ID3D12Device) {
             }
         }
     }
+    let check = if std::env::var("XCL_UMA_CHECK").is_ok_and(|v| v == "0") {
+        Ok("off (XCL_UMA_CHECK=0)".into())
+    } else {
+        check_uma_import(device, u, &bufs)
+    };
+    match &check {
+        Ok(s) => crate::xlog_info!("D3D12.X: UMA import check: {s}"),
+        Err(e) => crate::xlog_error!("D3D12.X: UMA import check: {e}"),
+    }
+    *UMA_IMPORT_CHECK.lock().unwrap() = check.unwrap_or_else(|e| e);
     let sparse = super::sparse::init(device);
     for (k, buf_raw, va) in &sparse {
         if let Some(slot) = bufs.get_mut(*k) {
@@ -286,8 +385,42 @@ unsafe fn open_uma(device: &ID3D12Device) {
         u.size() >> 20,
         w0_va
     );
+    match open_mem_views(device, &bufs) {
+        Ok(first) => *MEM_VIEWS.lock().unwrap() = Some(first),
+        Err(e) => crate::xlog_error!("D3D12.X: translated shaders have no memory: {e}"),
+    }
     *UMA_HEAPS.lock().unwrap() = heaps;
     *UMA_BUFFER.lock().unwrap() = bufs;
+}
+
+/// A raw view over each memory window buffer (all of its 4 GB) in the shared descriptor heap:
+/// window k's at the returned index + k, four of them (a missing window gets window 0's), then
+/// the null view (`MEM_NULL_VIEW`). Made once; an UMA opened again rewrites them.
+unsafe fn open_mem_views(device: &ID3D12Device, bufs: &[(usize, u64)]) -> Result<u32, String> {
+    if !super::console_heap::shared_heap(device) {
+        return Err("no shared shader-visible descriptor heap".into());
+    }
+    static OWN: Mutex<Option<(u32, usize, u32)>> = Mutex::new(None);
+    let mut own = OWN.lock().unwrap();
+    if own.is_none() {
+        *own = super::console_heap::reserve_own(crate::gpu::recomp::MEM_NULL_VIEW + 1).map(|(first, cpu, inc)| (first, cpu.ptr, inc));
+    }
+    let (first, cpu, inc) = own.ok_or("no room in the shared descriptor heap")?;
+    let view = |bytes: u64| D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_TYPELESS,
+        ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+        Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Buffer: D3D12_BUFFER_UAV { FirstElement: 0, NumElements: (bytes.min(1 << 32) / 4) as u32, StructureByteStride: 0, CounterOffsetInBytes: 0, Flags: D3D12_BUFFER_UAV_FLAG_RAW },
+        },
+    };
+    let at = |k: u32| D3D12_CPU_DESCRIPTOR_HANDLE { ptr: cpu + k as usize * inc as usize };
+    for k in 0..crate::gpu::recomp::MEM_NULL_VIEW {
+        let raw = bufs.get(k as usize).filter(|b| b.0 != 0).or(bufs.first()).map_or(0, |b| b.0) as *mut c_void;
+        let buf = ID3D12Resource::from_raw_borrowed(&raw).ok_or("a memory window has no buffer")?;
+        device.CreateUnorderedAccessView(buf, None::<&ID3D12Resource>, Some(&view(buf.GetDesc().Width)), at(k));
+    }
+    device.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&view(1 << 32)), at(crate::gpu::recomp::MEM_NULL_VIEW));
+    Ok(first)
 }
 
 pub fn stats() -> D3d12Stats {
@@ -310,6 +443,7 @@ pub fn stats() -> D3d12Stats {
         fallback_root_signatures: FALLBACK_RS.load(Ordering::Relaxed),
         presents,
         frame_boundaries: boundaries,
+        last_frame_dump: super::present::last_frame_dump(),
         uma_mb: crate::gpu::uma::get().map(|u| (u.size() >> 20) as u64).unwrap_or(0),
         uma_used_kb: crate::gpu::uma::get().map(|u| (u.used() >> 10) as u64).unwrap_or(0),
         uma_gpu_va: match uma_gpu_va() {
@@ -317,6 +451,7 @@ pub fn stats() -> D3d12Stats {
             v => format!("{v:#x}"),
         },
         uma_error: UMA_ERROR.lock().map(|e| e.clone()).unwrap_or_default(),
+        uma_import_check: UMA_IMPORT_CHECK.lock().map(|e| e.clone()).unwrap_or_default(),
         translated_pipelines: TRANSLATED_PSO.load(Ordering::Relaxed),
         translation_errors: TRANSLATE_ERRORS.lock().map(|e| e.clone()).unwrap_or_default(),
         background_pipelines: super::pso_async::counts(),
@@ -330,8 +465,29 @@ pub fn stats() -> D3d12Stats {
 
 static DEVICE: AtomicUsize = AtomicUsize::new(0);
 
+/// The device's adapter and its user-mode driver's version (`vendor-device-version`): what
+/// a driver blob kept on disk is good for (`driver_cache`)
+static DRIVER: OnceLock<String> = OnceLock::new();
+
 pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
+}
+
+/// The process's video memory on the device's adapter: (local, non-local) bytes in use.
+pub fn video_memory() -> Option<(u64, u64)> {
+    use windows::Win32::Graphics::Dxgi::*;
+    let raw = device_raw();
+    let dev = unsafe { ID3D12Device::from_raw_borrowed(&raw) }?;
+    unsafe {
+        let luid = dev.GetAdapterLuid();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().ok()?;
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(luid).ok()?;
+        let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        let mut non_local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local).ok()?;
+        adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut non_local).ok()?;
+        Some((local.CurrentUsage, non_local.CurrentUsage))
+    }
 }
 
 /// The device runs only 32-lane waves: wave64 compute, mesh and geometry programs need the
@@ -343,6 +499,19 @@ fn wave32_only(device: *mut c_void) -> bool {
     unsafe {
         let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
         crate::gpu::recomp::pso::wave32_only_for_device(dev)
+    }
+}
+
+/// A wave64 VS / PS may run in 32-lane waves here (`pso::graphics_wave32`: the driver picks
+/// the wave size of graphics shaders): the split flag for VS / PS translation. Unknown
+/// device: assume so.
+fn graphics_wave32(device: *mut c_void) -> bool {
+    if device.is_null() {
+        return true;
+    }
+    unsafe {
+        let Some(dev) = ID3D12Device::from_raw_borrowed(&device) else { return true };
+        crate::gpu::recomp::pso::graphics_wave32_for_device(dev)
     }
 }
 
@@ -386,6 +555,7 @@ pub fn init() -> Result<String, String> {
                 Ok(d) => {
                     d.SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
                     d.SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+                    crate::xlog_info!("D3D12: DRED auto-breadcrumbs and page-fault reporting on (no debug layer)");
                 }
                 Err(e) => {
                     crate::xlog_warn!("D3D12: DRED requested but unavailable: {e}");
@@ -406,6 +576,9 @@ pub fn init() -> Result<String, String> {
                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
                     device = Some(dev);
                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                    let umd = adapter.CheckInterfaceSupport(&IDXGIDevice::IID).unwrap_or(0);
+                    let _ = DRIVER.set(format!("{:04x}-{:04x}-{umd:016x}", desc.VendorId, desc.DeviceId));
+                    crate::gpu::recomp::pso::set_adapter_vendor(desc.VendorId);
                     break;
                 }
             }
@@ -413,7 +586,7 @@ pub fn init() -> Result<String, String> {
         let device = match device {
             Some(d) => d,
             None => {
-                let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
+                let warp = crate::gpu::adapter::software_adapter(&factory)?;
                 let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
                     .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
                 name = "WARP (software renderer)".into();
@@ -433,14 +606,39 @@ pub fn init() -> Result<String, String> {
         adopt(raw, Kind::Device);
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
+        watch_device_removal();
+        // the driver maps its shader cache (about 9 GB here) at device creation and its pages stay
+        // resident; trimmed so far only when the governor held a compile back, so a game with no
+        // compile waiting went from 7 GB available to 727 MB in 11 s. Trimmed whenever the PC has
+        // less than KEEP_FREE available (trim_mapped_files runs at most every 5 s).
+        let _ = std::thread::Builder::new().name("xcl-trim".into()).spawn(|| loop {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            if available_physical() < KEEP_FREE {
+                trim_mapped_files();
+            }
+        });
         Ok(name)
     }
 }
 
-/// A debug layer message: errors and warnings into the log (the first 200).
+/// A debug layer message: errors and warnings into the log – the first 8 of each message id
+/// (3 000 in all). One cap for all of them (200) was used up in seconds by two per-frame state
+/// errors of a retail game, long before the message that came with its device removal.
 unsafe extern "system" fn debug_message(_category: D3D12_MESSAGE_CATEGORY, severity: D3D12_MESSAGE_SEVERITY, id: D3D12_MESSAGE_ID, text: windows::core::PCSTR, _context: *mut c_void) {
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 || N.fetch_add(1, Ordering::Relaxed) >= 200 {
+    static PER_ID: Mutex<Option<HashMap<i32, u32>>> = Mutex::new(None);
+    if severity.0 > D3D12_MESSAGE_SEVERITY_WARNING.0 {
+        return;
+    }
+    {
+        let mut g = PER_ID.lock().unwrap();
+        let n = g.get_or_insert_with(HashMap::new).entry(id.0).or_insert(0);
+        *n += 1;
+        if *n > 8 {
+            return;
+        }
+    }
+    if N.fetch_add(1, Ordering::Relaxed) >= 3000 {
         return;
     }
     let t = if text.is_null() { String::new() } else { String::from_utf8_lossy(text.as_bytes()).into_owned() };
@@ -515,7 +713,35 @@ fn module_of(addr: usize) -> usize {
 
 /// Whether `obj` is an object XCL adopted (its vtable is one of XCL's).
 pub(super) unsafe fn is_adopted(obj: *mut c_void) -> bool {
-    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(*(obj as *const usize))
+    !obj.is_null() && crate::gpu::shader::readable(obj as usize, 8) && is_ext(obj.cast::<usize>().read_unaligned())
+}
+
+/// A struct-returning method's first two arguments: true when `a` is the object (the C++ way:
+/// this, return buffer, …), false when `b` is (the C way: return buffer, this, …). A return
+/// buffer on the stack can hold a stale copy of an object's vtable pointer and look adopted
+/// itself: a retail game's call of GetResourceAllocationInfo the C way then had its result
+/// written over the device's vtable pointer (the next call read slot 25 of "vtable" 0x1000). So
+/// when both look adopted, the one on this thread's stack – or the one that is not the device –
+/// is the buffer.
+pub(super) unsafe fn this_first(a: *mut c_void, b: *mut c_void) -> bool {
+    match (is_adopted(a), is_adopted(b)) {
+        (true, false) => true,
+        (false, true) => false,
+        (true, true) => {
+            let (mut lo, mut hi) = (0usize, 0usize);
+            windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
+            let on_stack = |p: *mut c_void| (lo..hi).contains(&(p as usize));
+            let dev = device_raw();
+            if on_stack(a) != on_stack(b) {
+                on_stack(b)
+            } else if a == dev || b == dev {
+                a == dev
+            } else {
+                true
+            }
+        }
+        (false, false) => false,
+    }
 }
 
 fn is_ext(v: usize) -> bool {
@@ -621,6 +847,13 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
             }
         }
     }
+    if super::residency::eviction_enabled() && matches!(kind, Kind::CommandList | Kind::DmaList) {
+        for &method in residency_list::OPAQUE_METHODS {
+            if let Some(s) = layout::slot(iface, method) {
+                v[1 + s] = super::guard::make_opaque_list_guard(v[1 + s]);
+            }
+        }
+    }
     // the console's layout of the same PC methods (title calls only; the runtime keeps PC's)
     let pc = v.clone();
     for (x, p) in console_remap(kind) {
@@ -662,7 +895,26 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
                 continue;
             }
             let pc = if newer < scanned { *ot.add(newer) } else { v[1 + newer] };
+            let pc = if super::residency::eviction_enabled() && newer < public {
+                super::guard::make_opaque_list_guard(pc)
+            } else { pc };
             v[1 + newer] = super::guard::make_layout_split(super::guard::LayoutTargets { older: v[1 + newer], newer: f, pc, newer_layout: &QUEUE_SHIFTED });
+        }
+        // mesh dispatches: each layout has them at its own slots (past the PC's public methods),
+        // and the other layout has another method there, which keeps what the slot had
+        for (older, newer, f) in MESH_LIST_SLOTS.map(|(o, n, k)| (o, n, mesh_list_method(k))) {
+            if newer >= total || older < public {
+                continue;
+            }
+            // a method of the runtime's own at that index keeps its calls (as `console_slots`)
+            let title = |slot: usize| if slot < scanned { super::guard::make_split(f, *ot.add(slot)) } else { f };
+            v[1 + older] = super::guard::make_layout_switch(title(older), v[1 + older], &QUEUE_SHIFTED);
+            v[1 + newer] = super::guard::make_layout_switch(v[1 + newer], title(newer), &QUEUE_SHIFTED);
+        }
+    }
+    if kind == Kind::CommandList && super::present::list_trace_after().is_some() {
+        for i in 0..total {
+            v[1 + i] = super::guard::make_list_tracer(v[1 + i], i);
         }
     }
     // XCL_D3D12_TRACE: every public method called from console code is logged
@@ -766,6 +1018,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (15, dev_increment_size_x as usize),
                 (17, dev_create_cbv_x as usize),
                 (18, dev_create_srv_x as usize),
+                (21, dev_create_dsv_x as usize),
                 (19, dev_create_uav_x as usize),
                 (22, dev_create_sampler_x as usize),
                 (23, dev_copy_descriptors_x as usize),
@@ -783,6 +1036,8 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (62, dev_create_compute_pso_x as usize),
                 (66, x::serialize_pso_x as usize),
                 (67, x::deserialize_pso_x as usize),
+                (70, dev_create_srv_at_x as usize),
+                (71, dev_create_uav_at_x as usize),
                 (73, x::create_command_list_x as usize),
                 (74, x::register_page_pool_x as usize),
                 (75, x::unregister_page_pool_x as usize),
@@ -794,10 +1049,15 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
                 (80, super::frame::wait_frame_event_x as usize),
                 (81, super::frame::frame_statistics_x as usize),
                 (86, x::create_pipeline_state_x as usize),
+                (108, x::get_resource_allocation_info2_x as usize),
+                (127, dev_create_committed_resource_layout_x as usize),
+                (133, x::create_placed_resource_layout_x as usize),
             ]
         }
         Kind::DescriptorHeap => vec![(9, heap_cpu_start_x as usize), (10, heap_gpu_start_x as usize)],
         Kind::Resource => vec![(11, res_gpu_va_x as usize)],
+        Kind::PipelineState => vec![(11, pso_console_blob_x as usize)],
+        Kind::Fence => vec![(12, super::fence_x::completed_value_address as usize)],
         // the title's calls from #14 on: Signal / Wait / … / SignalX / PresentX at the slots of
         // its runtime's layout (`queue_dispatch`)
         Kind::CommandQueue => QUEUE_SLOTS.iter().enumerate().map(|(k, &f)| (QUEUE_FIRST + k, f as usize)).collect(),
@@ -881,7 +1141,7 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
 /// takes the handle in rax (only `this` passed); the PC methods return it through a hidden
 /// pointer
 unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
-    if let Some(p) = super::console_heap::cpu_start(this as usize) {
+    if let Some(p) = super::console_heap::start(this as usize) {
         return p;
     }
     let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 9));
@@ -919,11 +1179,7 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
     let flags = if shared { d[2] & !(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE.0 as u32) } else { d[2] };
     let pc = [d[0], pc_n, flags, d[3]];
     let hr = dev_create_descriptor_heap(this, pc.as_ptr() as usize, riid, ppv);
-    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
-        let discard = |e| {
-            drop(ID3D12DescriptorHeap::from_raw(std::mem::replace(&mut *ppv, std::ptr::null_mut())));
-            e
-        };
+    if hr >= 0 {
         let raw = *ppv;
         let heap = ID3D12DescriptorHeap::from_raw_borrowed(&raw).unwrap();
         let dev = ID3D12Device::from_raw_borrowed(&this).unwrap();
@@ -950,17 +1206,8 @@ unsafe extern "system" fn dev_create_descriptor_heap_x(this: *mut c_void, desc: 
                 dev.CreateSampler(&zero, D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize });
             }
         }
-        let backing = if !sampler && visible {
-            match super::console_heap::CpuBacking::allocate(d[1]) {
-                Ok(b) => b,
-                Err(e) => return discard(e),
-            }
-        } else {
-            None
-        };
-        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible, backing) {
+        if !super::console_heap::register(raw as usize, d[1], cpu, gpu, inc, sampler, shared, visible) {
             crate::xlog_warn!("console descriptor heap: no room in UMA for {} slots", d[1]);
-            return discard(E_OUTOFMEMORY);
         }
     }
     hr
@@ -1001,7 +1248,8 @@ unsafe fn view_shape(res: &ID3D12Resource, format: windows::Win32::Graphics::Dxg
     let depth = match ty {
         T::D3 => d,
         T::D1Array | T::D2Array | T::D2MsaaArray => array.max(1),
-        T::Cube => 6,
+        // a cube view: its faces (6 per cube)
+        T::Cube => array.max(6),
         _ => 1,
     };
     Some((fmt, ty, w, h, depth, mips))
@@ -1169,6 +1417,31 @@ unsafe fn place_console_buffer_sparse(this: *mut c_void, d: &D3D12_RESOURCE_DESC
     None
 }
 
+pub(super) unsafe fn place_external_buffer(this: *mut c_void, title: usize, desc: &D3D12_RESOURCE_DESC, state: u32, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let bytes = desc.Width as usize;
+    if let Some(why) = super::external_buffers::unsupported(title, bytes) {
+        let mut m: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        windows_sys::Win32::System::Memory::VirtualQuery(title as *const c_void, &mut m, std::mem::size_of_val(&m));
+        crate::xlog_warn!(
+            "D3D12.X: buffer at {title:#x} ({bytes:#x} bytes) outside unified memory: {why} (allocation {:#x}, protection {:#x}, type {:#x})",
+            m.AllocationBase as usize, m.AllocationProtect, m.Type
+        );
+        return crate::util::E_INVALIDARG;
+    }
+    let mut raw = std::ptr::null_mut();
+    let Some(hr) = place_console_buffer_sparse(this, desc, bytes, state, false, riid, &mut raw) else {
+        return crate::util::E_FAIL;
+    };
+    let (mirror, _) = console_buffer(raw as usize).unwrap();
+    if !super::external_buffers::register(raw as usize, title, mirror, bytes) {
+        crate::xlog_warn!("D3D12.X: buffer at {title:#x} ({bytes:#x} bytes) outside unified memory overlaps a mirrored one");
+        res_release(raw);
+        return crate::util::E_INVALIDARG;
+    }
+    *ppv = raw;
+    hr
+}
+
 /// Sanitize a console buffer description and initial state for placement in a coherent
 /// cross-adapter UMA heap (`OpenExistingHeapFromAddress`).
 fn sanitize_coherent_buffer(desc: &D3D12_RESOURCE_DESC, state: usize) -> (D3D12_RESOURCE_DESC, u32) {
@@ -1311,6 +1584,22 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
 /// PC cannot map (a texture XCL keeps in step with it) gives its unified-memory address – what
 /// the console gives; the CPU's writes there reach the texture (`title_textures`).
 unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
+    if let Some(backing) = super::external_buffers::get(this as usize) {
+        if sub != 0 {
+            return crate::util::E_INVALIDARG;
+        }
+        if let Some(r) = (range as *const D3D12_RANGE).as_ref() {
+            let (begin, end) = (r.Begin.min(backing.bytes), r.End.min(backing.bytes));
+            if begin < end && !backing.read(begin, end) {
+                return crate::util::E_INVALIDARG;
+            }
+        }
+        if !data.is_null() {
+            *data = backing.title as *mut c_void;
+        }
+        UNMAPPABLE.lock().unwrap().get_or_insert_with(HashSet::new).insert(this as usize);
+        return S_OK;
+    }
     // a resource in unified memory: its console address (no PC mapping – the PC's would be
     // the start of the PC resource, before the address for a buffer placed below it)
     if let Some((p, bytes)) = console_buffer(this as usize) {
@@ -1404,8 +1693,9 @@ unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c
 }
 
 unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+    let pins = super::sparse::buffer_pins(this as usize);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = super::residency::release(this as usize, || f(this));
     if n == 0 {
         if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
             s.remove(&(this as usize));
@@ -1419,19 +1709,77 @@ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::sparse::forget_buffer(this as usize);
+        super::external_buffers::forget(this as usize);
+        if let Some(pins) = pins {
+            super::sparse::forget_buffer(this as usize, pins);
+        }
         super::vram::forget(this as usize);
         super::title_textures::forget(this as usize);
         let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
         }
     }
     n
+}
+
+/// ID3D12PipelineState #11, past the PC interface: (this, 0, 0, ID3DBlob**) hands back a blob of
+/// the console compile's data for the pipeline (a caller reads a size from its first word and
+/// goes on without one). A PC pipeline has no console compile: no blob, the out pointer cleared.
+unsafe extern "system" fn pso_console_blob_x(_this: *mut c_void, a: usize, b: usize, out: *mut *mut c_void) -> HRESULT {
+    if !out.is_null() && crate::gpu::shader::readable(out as usize, 8) {
+        out.write_unaligned(std::ptr::null_mut());
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) == 0 {
+        crate::xlog_info!("D3D12.X: ID3D12PipelineState #11 ({a:#x}, {b:#x}): no console compile data for a PC pipeline – no blob (E_NOTIMPL)");
+    }
+    E_NOTIMPL_HR
+}
+
+const E_NOTIMPL_HR: HRESULT = 0x8000_4001u32 as i32;
+
+/// The names the title gave its pipeline states (`SetName`), kept for `XCL_TRACE_NAMED_PSO`
+static PSO_NAMES: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+
+/// `XCL_TRACE_NAMED_PSO`: the pipelines whose name holds this text ("all": every named one) are
+/// traced – named, built or failed in the background, their first dispatch or indirect call.
+fn traced_name(name: &str) -> bool {
+    static FILTER: OnceLock<Option<String>> = OnceLock::new();
+    FILTER.get_or_init(|| std::env::var("XCL_TRACE_NAMED_PSO").ok()).as_deref().is_some_and(|f| f == "all" || name.contains(f))
+}
+
+/// The name of pipeline `pso` when it is traced (`XCL_TRACE_NAMED_PSO`).
+/// The name the title gave a pipeline (SetName).
+pub fn pso_name(pso: usize) -> Option<String> {
+    PSO_NAMES.lock().unwrap().as_ref()?.get(&pso).cloned()
+}
+
+pub fn traced_pso(pso: usize) -> Option<String> {
+    PSO_NAMES.lock().unwrap().as_ref()?.get(&pso).filter(|n| traced_name(n)).cloned()
+}
+
+/// ID3D12Object::SetName of a pipeline state: kept, then passed on.
+unsafe extern "system" fn pso_set_name(this: *mut c_void, name: *const u16) -> HRESULT {
+    let readable = |i: usize| crate::gpu::shader::readable(name as usize + 2 * i, 2);
+    if !name.is_null() {
+        let len = (0..256).take_while(|&i| readable(i) && *name.add(i) != 0).count();
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(name, len));
+        if traced_name(&text) {
+            crate::xlog_info!(
+                "named pipeline '{text}' = {this:p}: translated compute {}, building in the background {}",
+                is_translated_compute(this as usize),
+                super::pso_async::is_pending(this as usize)
+            );
+        }
+        PSO_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(this as usize, text);
+    }
+    let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetName")));
+    f(this, name)
 }
 
 /// A stand-in pipeline released for good takes its background-built real pipeline with it.
@@ -1472,6 +1820,24 @@ pub fn is_translated_graphics(pso: usize) -> bool {
     pso != 0 && TRANSLATED_GRAPHICS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
 }
 
+/// graphics pipelines given the generated rect list GS (`rect_list_gs`)
+static RECT_LIST_GS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+/// Whether `pso` (as `is_translated_graphics` takes it: a stand-in resolved) draws rect lists
+/// whole with the generated GS. Its draws must not be expanded to two triangles a rect as well:
+/// each half is three corners of the rect and the GS would complete both.
+pub fn has_rect_list_gs(pso: usize) -> bool {
+    pso != 0 && RECT_LIST_GS.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+/// Note `pso`, made from `copy`, if it kept the generated rect list GS (`rect_gs`; a pipeline
+/// made again without it, `retry_without_rect_gs`, did not).
+fn note_rect_list_gs(pso: usize, copy: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool) {
+    if pso != 0 && rect_gs && !copy.GS.pShaderBytecode.is_null() {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
 /// Whether `pso` runs a translated console compute shader.
 pub fn is_translated_compute(pso: usize) -> bool {
     pso != 0 && TRANSLATED_COMPUTE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
@@ -1481,6 +1847,13 @@ pub fn is_translated_compute(pso: usize) -> bool {
 pub(super) fn register_translated_compute_for_test(pso: usize) {
     if pso != 0 {
         TRANSLATED_COMPUTE.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+    }
+}
+
+#[cfg(test)]
+pub(super) fn register_rect_list_gs_for_test(pso: usize) {
+    if pso != 0 {
+        RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
     }
 }
 
@@ -1497,16 +1870,32 @@ pub(super) fn forget_pso_for_test(pso: usize) {
 }
 
 fn forget_pso(pso: usize) {
+    super::markers::pipeline_gone(pso);
+    if let Some(m) = UNTRANSLATED.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    if let Some(m) = PSO_NAMES.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     if let Some(s) = TRANSLATED_COMPUTE.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
     if let Some(s) = TRANSLATED_GRAPHICS.lock().unwrap().as_mut() {
         s.remove(&pso);
     }
+    if let Some(s) = RECT_LIST_GS.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
     if let Some(m) = PSO_RS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
     super::device_x::forget_base(pso);
+    if let Some(s) = NATIVE_MESH.lock().unwrap().as_mut() {
+        s.remove(&pso);
+    }
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
     drop(gone);
@@ -1517,8 +1906,85 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
     if let Some((p, _)) = console_buffer(this as usize) {
         return p as u64;
     }
+    if let Some(p) = super::title_textures::gpu_address(this) {
+        return p as u64;
+    }
     let f: unsafe extern "system" fn(*mut c_void) -> u64 = std::mem::transmute(orig_fn(this, 11));
-    f(this)
+    // a texture has no GPU address on the PC (0) – on the console every resource has one, and
+    // titles use a texture's as the CPU's pointer to it (a retail game clears a 256x256 R32F one
+    // through it: with 0 it wrote 256 KB at address 0): the title's address it was placed at
+    match f(this) {
+        0 => {
+            let placed = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+            placed.or_else(|| texture_memory(this)).unwrap_or(0) as u64
+        }
+        va => va,
+    }
+}
+
+const TEXTURE_ADDRESS_PAGE: u64 = 0x1_0000;
+const CONSOLE_BC_FOOTPRINT: windows::core::GUID = windows::core::GUID::from_u128(0x049475e9_fa5f_4272_a86b_f244608d62df);
+
+fn console_bc_footprint(desc: &[u8; 0x38]) -> Option<u64> {
+    let format = u32::from_le_bytes(desc[0x20..0x24].try_into().unwrap());
+    if !crate::hle::xg::element(format).is_some_and(|(_, side)| side == 4) {
+        return None;
+    }
+    let bytes = crate::hle::xg::Texture::new(desc).ok()?.size();
+    (bytes != 0).then_some(bytes)
+}
+
+fn texture_address_reserve_size(payload: u64) -> Option<u64> {
+    let padded = payload.checked_add(TEXTURE_ADDRESS_PAGE)?;
+    (padded <= 1 << 30).then(|| padded.next_multiple_of(TEXTURE_ADDRESS_PAGE))
+}
+
+/// Memory for a committed texture's console address, with pages committed on demand.
+/// Writes through this address are not uploaded to the texture.
+unsafe fn texture_memory(res: *mut c_void) -> Option<usize> {
+    use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_RESERVE, PAGE_READWRITE};
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _g = LOCK.lock().unwrap();
+    if let Some(p) = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(res as usize)).copied()) {
+        return Some(p);
+    }
+    let resource = ID3D12Resource::from_raw_borrowed(&res)?;
+    let d = resource.GetDesc();
+    if d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    let mut footprint = 0u64;
+    let mut len = size_of::<u64>() as u32;
+    let has_footprint = crate::hle::xg::element(d.Format.0 as u32).is_some_and(|(_, side)| side == 4)
+        && resource.GetPrivateData(&CONSOLE_BC_FOOTPRINT, &mut len, Some((&mut footprint as *mut u64).cast())).is_ok()
+        && len == size_of::<u64>() as u32
+        && footprint != 0;
+    if !has_footprint {
+        let element_bytes = crate::gpu::desc::gfx10_format(d.Format).map_or(16, |f| crate::gpu::desc::format_bytes(f).max(1) as u64);
+        let texels = d.Width.checked_mul(d.Height as u64)?.checked_mul(d.DepthOrArraySize.max(1) as u64)?;
+        footprint = texels.checked_mul(element_bytes)?.checked_mul(4)? / 3;
+    }
+    let bytes = texture_address_reserve_size(footprint)?;
+    let p = VirtualAlloc(std::ptr::null(), bytes as usize, MEM_RESERVE, PAGE_READWRITE) as usize;
+    if p == 0 {
+        return None;
+    }
+    crate::memmap::reserved(p, bytes as usize);
+    for page in (p..p + bytes as usize).step_by(TEXTURE_ADDRESS_PAGE as usize) {
+        crate::hle::kernelx::lazy::mark(page, None);
+    }
+    note_title_address(res as usize, p);
+    static N: AtomicU64 = AtomicU64::new(0);
+    if N.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!(
+            "D3D12.X: GetGPUVirtualAddress of a committed {}x{} texture (format {}, flags {:#x}): {bytes:#x} bytes at {p:#x} for the title to write through (not uploaded)",
+            d.Width,
+            d.Height,
+            d.Format.0,
+            d.Flags.0
+        );
+    }
+    Some(p)
 }
 
 fn note_buffer_view() {
@@ -1527,8 +1993,9 @@ fn note_buffer_view() {
     }
 }
 
-/// #17 CreateConstantBufferView: a raw V# of the buffer's console address (unified memory;
-/// anything else gets an empty V#). No PC CBV: translated shaders read buffers through `mem`.
+/// #17 CreateConstantBufferView: a V# of float4 rows at the buffer's console address
+/// (`desc::cbv_words`; unified memory, anything else gets an empty V#). No PC CBV: translated
+/// shaders read buffers through `mem`.
 unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12_CONSTANT_BUFFER_VIEW_DESC, cpu: u64) {
     let Some(slot) = super::console_heap::slot(cpu).filter(|s| !s.sampler) else {
         let f: unsafe extern "system" fn(*mut c_void, *const D3D12_CONSTANT_BUFFER_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 17));
@@ -1540,7 +2007,7 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         note_buffer_view();
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
-    super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));
+    super::console_heap::write(&slot, &crate::gpu::desc::cbv_words(va, size));
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3
@@ -1650,8 +2117,100 @@ unsafe extern "system" fn heap_release(this: *mut c_void) -> u32 {
     n
 }
 
+/// #21 CreateDepthStencilView: the console's view formats as the PC's (`pc_view_format`).
+unsafe extern "system" fn dev_create_dsv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_DEPTH_STENCIL_VIEW_DESC, cpu: u64) {
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_DEPTH_STENCIL_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 21));
+    let mut copy = desc.as_ref().copied();
+    if let Some(c) = copy.as_mut() {
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(c.Format.0 as u32) as i32);
+    }
+    // no description: the resource's format – which a depth buffer made typeless
+    // (`device_x::pc_resource_desc`) is not one a view can have
+    if copy.is_none() {
+        copy = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| default_dsv(&r.GetDesc()));
+    }
+    f(this, res, copy.as_ref().map_or(desc, |c| c as *const _), cpu)
+}
+
+/// The view a DSV without a description has, for a depth buffer `pc_resource_desc` made
+/// typeless (None: the resource's own format is a depth one).
+fn default_dsv(d: &D3D12_RESOURCE_DESC) -> Option<D3D12_DEPTH_STENCIL_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    let format = match d.Format.0 {
+        19 => 20,
+        39 => 40,
+        44 => 45,
+        53 => 55,
+        _ => return None,
+    };
+    let mut v = D3D12_DEPTH_STENCIL_VIEW_DESC { Format: DXGI_FORMAT(format), ..Default::default() };
+    if d.DepthOrArraySize > 1 {
+        v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
+        v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_DSV { MipSlice: 0, FirstArraySlice: 0, ArraySize: d.DepthOrArraySize as u32 };
+    } else {
+        v.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+    }
+    Some(v)
+}
+
+/// A shader view `v` (None: the resource's default one) of `rd` with the PC's format names
+/// (`device_x::pc_shader_view_format`) – None: as it is.
+fn pc_srv(rd: &D3D12_RESOURCE_DESC, v: Option<&D3D12_SHADER_RESOURCE_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    if rd.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+        return None;
+    }
+    let rf = rd.Format.0 as u32;
+    let mut out = match v {
+        Some(v) => *v,
+        None => {
+            // only a typeless depth buffer needs a description of its own
+            if !matches!(rf, 19 | 39 | 44 | 53) {
+                return None;
+            }
+            let mut v = D3D12_SHADER_RESOURCE_VIEW_DESC { Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING, ..Default::default() };
+            if rd.DepthOrArraySize > 1 {
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+                v.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: rd.DepthOrArraySize as u32, ..Default::default() };
+            } else {
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                v.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
+            }
+            v
+        }
+    };
+    if out.ViewDimension == D3D12_SRV_DIMENSION_BUFFER || out.ViewDimension == D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE {
+        return None;
+    }
+    let f = super::device_x::pc_shader_view_format(rf, out.Format.0 as u32);
+    let stencil = super::device_x::stencil_view(rf, f);
+    if v.is_some() && f == out.Format.0 as u32 && !stencil {
+        return None;
+    }
+    out.Format = DXGI_FORMAT(f as i32);
+    // the PC reads stencil from plane 1; the console's view of it is plane 0 in a stencil format
+    if stencil {
+        if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D {
+            out.Anonymous.Texture2D.PlaneSlice = 1;
+        } else if out.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2DARRAY {
+            out.Anonymous.Texture2DArray.PlaneSlice = 1;
+        }
+    }
+    Some(out)
+}
+
 unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, desc: *const D3D12_SHADER_RESOURCE_VIEW_DESC, cpu: u64) {
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
+    let mut copy = desc.as_ref().copied();
+    if let Some(c) = copy.as_mut() {
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(c.Format.0 as u32) as i32);
+    }
+    // a depth buffer's view in the formats the PC has for it (a D24S8 format itself, R16_UNORM of
+    // a D16S8 buffer …: an invalid call, the device removed)
+    if let Some(v) = ID3D12Resource::from_raw_borrowed(&res).and_then(|r| pc_srv(&r.GetDesc(), copy.as_ref())) {
+        copy = Some(v);
+    }
+    let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, desc, cpu) };
     // Raytracing acceleration structure SRV (pResource == NULL, Location == console GPU VA):
     // translated shaders read BVH nodes from UMA (`bvh_intersect`), never from a PC DXR SRV,
@@ -1669,6 +2228,10 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
         }
         return super::console_heap::write(&slot, &[0; 8]);
     }
+    // translated shaders declare every cube T# as a TextureCubeArray: a title's TEXTURECUBE
+    // view becomes the cube array of that one cube (a dimension mismatch is undefined in D3D12)
+    let cube = desc.as_ref().and_then(cube_as_cube_array);
+    let desc = cube.as_ref().map_or(desc, |v| v as *const _);
     f(this, res, desc, slot.pc_srv);
     super::console_heap::publish(&slot, false);
     super::console_heap::note_resource(&slot, res as usize);
@@ -1702,6 +2265,7 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
                 7 => (a.Texture2DMSArray.ArraySize, 1),
                 8 => (1, a.Texture3D.MipLevels),
                 9 => (6, a.TextureCube.MipLevels),
+                10 => (a.TextureCubeArray.NumCubes.max(1) * 6, a.TextureCubeArray.MipLevels),
                 _ => (1, 1),
             };
             (v.Format, v.ViewDimension.0, array, mips)
@@ -1720,24 +2284,227 @@ unsafe extern "system" fn dev_create_srv_x(this: *mut c_void, res: *mut c_void, 
     }
 }
 
-unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+/// A TEXTURECUBE view as the TEXTURECUBEARRAY of its one cube (None: any other view).
+fn cube_as_cube_array(v: &D3D12_SHADER_RESOURCE_VIEW_DESC) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    if v.ViewDimension != D3D12_SRV_DIMENSION_TEXTURECUBE {
+        return None;
+    }
+    // SAFETY: the union member the view dimension names
+    let c = unsafe { v.Anonymous.TextureCube };
+    Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+        ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+            TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                MostDetailedMip: c.MostDetailedMip,
+                MipLevels: c.MipLevels,
+                First2DArrayFace: 0,
+                NumCubes: 1,
+                ResourceMinLODClamp: c.ResourceMinLODClamp,
+            },
+        },
+        ..*v
+    })
+}
+
+/// The texture a view by address describes: `desc` (a resource desc) placed at `va`, made once
+/// per address and desc – titles make views of the same memory again and again.
+unsafe fn resource_at(this: *mut c_void, desc: *const u8, va: u64) -> *mut c_void {
+    type Key = (u64, [u8; 0x38]);
+    static MADE: Mutex<Option<HashMap<Key, usize>>> = Mutex::new(None);
+    if desc.is_null() || va == 0 || !crate::gpu::shader::readable(desc as usize, 0x38) {
+        return std::ptr::null_mut();
+    }
+    // the PC part of the desc; the flags (@0x30) are its last dword, padding follows
+    let mut x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    x[0x34..].fill(0);
+    if let Some(&r) = MADE.lock().unwrap().get_or_insert_with(HashMap::new).get(&(va, x)) {
+        return r as *mut c_void;
+    }
+    let mut r = std::ptr::null_mut();
+    let hr = super::device_x::create_placed_resource_x(this, va, x.as_ptr(), 0, std::ptr::null(), &ID3D12Resource::IID as *const _ as *const GUID, &mut r);
+    if hr < 0 || r.is_null() {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::xlog_warn!("D3D12.X: view at {va:#x}: the resource cannot be made ({hr:#x}); desc {x:02x?}");
+        }
+        r = std::ptr::null_mut();
+    }
+    MADE.lock().unwrap().get_or_insert_with(HashMap::new).insert((va, x), r as usize);
+    r
+}
+
+/// device #70 (a retail game): a shader resource view of memory, without a resource object:
+/// (resource desc, { the PC's SRV desc; GPU address @0x28; … }, destination).
+unsafe extern "system" fn dev_create_srv_at_x(this: *mut c_void, rdesc: *const u8, view: *const u8, cpu: u64) {
+    if view.is_null() || !crate::gpu::shader::readable(view as usize, 0x40) {
+        return;
+    }
+    let va = (view.add(0x28) as *const u64).read_unaligned();
+    let v = (view as *const D3D12_SHADER_RESOURCE_VIEW_DESC).read_unaligned();
+    if v.ViewDimension == D3D12_SRV_DIMENSION_BUFFER {
+        let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0;
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        return super::console_heap::write(&slot, &words);
+    }
+    dev_create_srv_x(this, resource_at(this, rdesc, va), &v, cpu);
+}
+
+/// device #71: the same for an unordered access view ({ the PC's UAV desc; GPU address @0x28;
+/// the counter's address @0x30; … }).
+unsafe extern "system" fn dev_create_uav_at_x(this: *mut c_void, rdesc: *const u8, view: *const u8, cpu: u64) {
+    if view.is_null() || !crate::gpu::shader::readable(view as usize, 0x40) {
+        return;
+    }
+    let va = (view.add(0x28) as *const u64).read_unaligned();
+    let v = (view as *const D3D12_UNORDERED_ACCESS_VIEW_DESC).read_unaligned();
+    if v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER {
+        let Some(slot) = super::console_heap::slot(cpu) else { return };
+        let b = &v.Anonymous.Buffer;
+        let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
+        let words = buffer_words_at(va, v.Format, b.FirstElement, b.NumElements, b.StructureByteStride, raw);
+        return super::console_heap::write(&slot, &words);
+    }
+    dev_create_uav_x(this, resource_at(this, rdesc, va), std::ptr::null_mut(), &v, cpu);
+}
+
+/// V# of `n` elements from element `first` of the buffer at `va`.
+fn buffer_words_at(va: u64, format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT, first: u64, n: u32, stride: u32, raw: bool) -> [u32; 4] {
+    let fmt = crate::gpu::desc::gfx10_format(format).unwrap_or(22);
+    let (stride, elem) = match (raw, stride) {
+        (true, _) => (0, 4),
+        (false, 0) => {
+            let e = crate::gpu::desc::format_bytes(fmt);
+            (e, e)
+        }
+        (false, s) => (s, s),
+    };
+    let records = if stride == 0 { n.saturating_mul(4) } else { n };
+    crate::gpu::desc::buffer_words(va + first * elem as u64, stride, records, fmt)
+}
+
+fn null_texture_uav(dimension: D3D12_UAV_DIMENSION) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let (dimension, view) = match dimension {
+        D3D12_UAV_DIMENSION_TEXTURE1D | D3D12_UAV_DIMENSION_TEXTURE2D => (dimension, D3D12_UNORDERED_ACCESS_VIEW_DESC_0::default()),
+        D3D12_UAV_DIMENSION_TEXTURE1DARRAY => (dimension, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture1DArray: D3D12_TEX1D_ARRAY_UAV { ArraySize: 1, ..Default::default() },
+        }),
+        D3D12_UAV_DIMENSION_TEXTURE2DARRAY => (dimension, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture2DArray: D3D12_TEX2D_ARRAY_UAV { ArraySize: 1, ..Default::default() },
+        }),
+        D3D12_UAV_DIMENSION_TEXTURE3D => (dimension, D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+            Texture3D: D3D12_TEX3D_UAV { WSize: 1, ..Default::default() },
+        }),
+        _ => (D3D12_UAV_DIMENSION_TEXTURE2D, D3D12_UNORDERED_ACCESS_VIEW_DESC_0::default()),
+    };
+    D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT,
+        ViewDimension: dimension,
+        Anonymous: view,
+    }
+}
+
+fn uav_companion_srv(rd: Option<&D3D12_RESOURCE_DESC>, uav: Option<&D3D12_UNORDERED_ACCESS_VIEW_DESC>) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    let dim = uav.map(|v| v.ViewDimension).or_else(|| rd.map(|d| D3D12_UAV_DIMENSION(resource_dim_to_view(d))))?;
+    let layers = rd.map_or(1, |d| d.DepthOrArraySize as u32);
+    let (dimension, view) = unsafe {
+        match dim {
+            D3D12_UAV_DIMENSION_BUFFER => {
+                let b = uav?.Anonymous.Buffer;
+                let flags = if b.Flags.contains(D3D12_BUFFER_UAV_FLAG_RAW) { D3D12_BUFFER_SRV_FLAG_RAW } else { D3D12_BUFFER_SRV_FLAG_NONE };
+                (D3D12_SRV_DIMENSION_BUFFER, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Buffer: D3D12_BUFFER_SRV { FirstElement: b.FirstElement, NumElements: b.NumElements, StructureByteStride: b.StructureByteStride, Flags: flags },
+                })
+            }
+            D3D12_UAV_DIMENSION_TEXTURE1D => (D3D12_SRV_DIMENSION_TEXTURE1D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture1D: D3D12_TEX1D_SRV { MostDetailedMip: uav.map_or(0, |v| v.Anonymous.Texture1D.MipSlice), MipLevels: 1, ..Default::default() },
+            }),
+            D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                let a = uav.map_or(D3D12_TEX1D_ARRAY_UAV { ArraySize: layers, ..Default::default() }, |v| v.Anonymous.Texture1DArray);
+                (D3D12_SRV_DIMENSION_TEXTURE1DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture1DArray: D3D12_TEX1D_ARRAY_SRV { MostDetailedMip: a.MipSlice, MipLevels: 1, FirstArraySlice: a.FirstArraySlice, ArraySize: a.ArraySize, ..Default::default() },
+                })
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2D => {
+                let a = uav.map_or_else(D3D12_TEX2D_UAV::default, |v| v.Anonymous.Texture2D);
+                (D3D12_SRV_DIMENSION_TEXTURE2D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: a.MipSlice, MipLevels: 1, PlaneSlice: a.PlaneSlice, ..Default::default() },
+                })
+            }
+            D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                let a = uav.map_or(D3D12_TEX2D_ARRAY_UAV { ArraySize: layers, ..Default::default() }, |v| v.Anonymous.Texture2DArray);
+                (D3D12_SRV_DIMENSION_TEXTURE2DARRAY, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                    Texture2DArray: D3D12_TEX2D_ARRAY_SRV { MostDetailedMip: a.MipSlice, MipLevels: 1, FirstArraySlice: a.FirstArraySlice, ArraySize: a.ArraySize, PlaneSlice: a.PlaneSlice, ..Default::default() },
+                })
+            }
+            D3D12_UAV_DIMENSION_TEXTURE3D => (D3D12_SRV_DIMENSION_TEXTURE3D, D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture3D: D3D12_TEX3D_SRV { MostDetailedMip: uav.map_or(0, |v| v.Anonymous.Texture3D.MipSlice), MipLevels: 1, ..Default::default() },
+            }),
+            _ => return None,
+        }
+    };
+    let format = uav.map(|v| v.Format).filter(|f| *f != DXGI_FORMAT_UNKNOWN).or_else(|| rd.map(|d| d.Format))?;
+    let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
+        Format: format,
+        ViewDimension: dimension,
+        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+        Anonymous: view,
+    };
+    Some(rd.and_then(|d| pc_srv(d, Some(&srv))).unwrap_or(srv))
+}
+
+pub(super) unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, counter: *mut c_void, desc: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, cpu: u64) {
+    // the view's format as the PC's for the resource (B5G5R5A1 of a target made R8G8B8A8,
+    // `device_x::pc_resource_desc`: an invalid call, the device removed)
+    let r = ID3D12Resource::from_raw_borrowed(&res);
+    let rd = r.map(|r| r.GetDesc());
+    let mut copy = desc.as_ref().copied();
+    if let (Some(c), Some(rd)) = (copy.as_mut(), rd.as_ref()) {
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rd.Format.0 as u32, c.Format.0 as u32) as i32);
+    }
+    let desc = copy.as_ref().map_or(desc, |c| c as *const _);
     super::present::note_use(res as usize, super::present::USE_UAV);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void, *const D3D12_UNORDERED_ACCESS_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 19));
     if super::present::trace_frame() {
-        let d = ID3D12Resource::from_raw_borrowed(&res).map(|r| r.GetDesc());
-        if d.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
+        if rd.is_some_and(|d| d.Width >= 1920 && d.Flags.0 & 1 != 0) {
             let s = super::console_heap::slot(cpu);
-            crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", d.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
+            crate::xlog_info!("frame trace: UAV of render target {res:p} {:?} at {cpu:#x}: console slot {:?}, view {:?}", rd.map(|d| (d.Width, d.Height, d.Format.0)), s.as_ref().map(|s| (s.index, s.pc_uav, s.at)), desc.as_ref().map(|v| (v.Format.0, v.ViewDimension.0)));
         }
     }
-    let Some(slot) = super::console_heap::slot(cpu) else { return f(this, res, counter, desc, cpu) };
-    f(this, res, counter, desc, slot.pc_uav);
-    super::console_heap::publish(&slot, true);
+    // a resource without ALLOW_UNORDERED_ACCESS (a console depth buffer that also had it: the PC
+    // refuses the pair, `device_x::pc_resource_desc`): a null view – a UAV of it is an invalid
+    // call, and the device is removed (0x887A0001)
+    let no_uav = rd.as_ref().filter(|r| r.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0);
+    let pc_uav = |at: u64| {
+        if let Some(rd) = no_uav {
+            let dim = desc.as_ref().map_or_else(|| D3D12_UAV_DIMENSION(resource_dim_to_view(rd)), |d| d.ViewDimension);
+            let null_desc = null_texture_uav(dim);
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC (a depth buffer) – a null view");
+            }
+            f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
+        } else {
+            f(this, res, counter, desc, at)
+        }
+    };
+    let Some(slot) = super::console_heap::slot(cpu) else { return pc_uav(cpu) };
+    pc_uav(slot.pc_uav);
+    // RDNA images have no SRV / UAV distinction: console shaders may read this slot too.
+    if let Some(srv) = uav_companion_srv(rd.as_ref(), desc.as_ref()) {
+        let srv_res = if rd.is_some_and(|d| d.Flags.contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)) { std::ptr::null_mut() } else { res };
+        let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
+        g(this, srv_res, &srv, slot.pc_srv);
+        super::console_heap::publish_range(&slot, 1);
+    } else {
+        super::console_heap::publish(&slot, true);
+    }
     super::console_heap::note_resource(&slot, res as usize);
-    let Some(r) = ID3D12Resource::from_raw_borrowed(&res) else {
+    let (Some(r), Some(rd)) = (r, rd) else {
         return super::console_heap::write(&slot, &[0; 8]);
     };
-    let rd = r.GetDesc();
     if let Some(v) = desc.as_ref().filter(|v| v.ViewDimension == D3D12_UAV_DIMENSION_BUFFER) {
         let b = &v.Anonymous.Buffer;
         let raw = b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0;
@@ -1763,20 +2530,61 @@ unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *mut c_void, 
         note_buffer_view();
         return super::console_heap::write(&slot, &[0; 8]);
     };
-    // RDNA images have no SRV / UAV distinction: console shaders may read this slot too
-    if dim == 4 {
-        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
-            Format: if format == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN { rd.Format } else { format },
-            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MostDetailedMip: mip, MipLevels: 1, PlaneSlice: 0, ResourceMinLODClamp: 0.0 } },
-        };
-        let g: unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_SHADER_RESOURCE_VIEW_DESC, u64) = std::mem::transmute(orig_fn(this, 18));
-        g(this, res, &srv, slot.pc_srv);
-        super::console_heap::publish(&slot, false);
-    }
     let (w, h) = ((w >> mip).max(1), (h >> mip).max(1));
     super::console_heap::write(&slot, &crate::gpu::desc::xcl_image_for_view(slot.index, fmt, ty, w, h, d, 1));
+}
+
+/// device #127 (a retail game): CreateCommittedResource with a barrier layout in the initial state's place
+/// – the arguments of the PC's CreateCommittedResource3 (heap properties, flags, desc, layout,
+/// clear value, protected session, castable formats, riid, resource).
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn dev_create_committed_resource_layout_x(
+    this: *mut c_void,
+    props: usize,
+    flags: u32,
+    desc: usize,
+    layout: u32,
+    clear: usize,
+    _protected: usize,
+    _castable: u32,
+    _formats: usize,
+    riid: *const GUID,
+    ppv: *mut *mut c_void,
+) -> HRESULT {
+    note_newer_device_method(127);
+    let state = super::device_x::layout_state(D3D12_BARRIER_LAYOUT(layout as i32)).unwrap_or(D3D12_RESOURCE_STATE_COMMON).0 as usize;
+    if flags & D3D12_HEAP_FLAG_ALLOW_DISPLAY.0 as u32 != 0 && desc != 0 && crate::gpu::shader::readable(desc, 0x38) {
+        return create_display_target(this, props, desc, state, clear, riid, ppv);
+    }
+    dev_create_committed_resource_x(this, props, flags as usize, desc, state, clear, riid, ppv)
+}
+
+/// A display target: its console memory comes from the title's allocation hook, as the console
+/// runtime's does (a retail game gives its back buffers one block and asserts that it is used up); on the
+/// PC it is a resource of its own.
+unsafe fn create_display_target(this: *mut c_void, props: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
+    let d = super::device_x::pc_resource_desc(&x);
+    let mut clear_buf = D3D12_CLEAR_VALUE::default();
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, Some((&x, &d))) as usize;
+    let hr = dev_create_committed_resource(this, props, 0, d.as_ptr() as usize, state, clear, riid, ppv);
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        crate::xlog_warn!("D3D12.X: display target: {hr:#x}; desc {x:02x?}");
+        return hr;
+    }
+    let size = crate::hle::xg::Texture::new(&x).map_or(0, |t| t.size()) as usize;
+    let at = if size > 0 { crate::hle::kernelx::runtime_alloc(size, crate::hle::kernelx::D3D_DISPLAY_TARGET) } else { None };
+    if let Some(p) = at {
+        note_title_address(*ppv as usize, p);
+    }
+    crate::xlog_info!(
+        "D3D12.X: display target {}x{} format {}: {size:#x} bytes of the title's memory at {:#x}",
+        u64::from_le_bytes(x[0x10..0x18].try_into().unwrap()),
+        u32::from_le_bytes(x[0x18..0x1C].try_into().unwrap()),
+        u32::from_le_bytes(x[0x20..0x24].try_into().unwrap()),
+        at.unwrap_or(0)
+    );
+    hr
 }
 
 unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, props: usize, flags: usize, desc: usize, state: usize, clear: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
@@ -1820,8 +2628,12 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
     // not placed in unified memory (e.g. its coherent window kept for readback heaps): a PC
     // resource of the PC's description – the console's flag bits (0x1000000, 0x300000 …) and
     // alignments made the PC refuse Fortnite's 3264x1836 scene targets (E_INVALIDARG, a crash)
-    let pc_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38)).then(|| super::device_x::pc_resource_desc(&(console_desc as *const [u8; 0x38]).read_unaligned()));
+    let console_full = (console_desc != 0 && crate::gpu::shader::readable(console_desc, 0x38))
+        .then(|| (console_desc as *const [u8; 0x38]).read_unaligned());
+    let pc_full = console_full.as_ref().map(super::device_x::pc_resource_desc);
     let desc = pc_full.as_ref().map_or(desc, |d| d.as_ptr() as usize);
+    let mut clear_buf = D3D12_CLEAR_VALUE::default();
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, console_full.as_ref().zip(pc_full.as_ref())) as usize;
     // console-only state bits (e.g. 0x100000 on a display target) are not the PC's
     let hr = dev_create_committed_resource(this, props, flags, desc, state & PC_RESOURCE_STATES as usize, clear, riid, ppv);
     if hr < 0 {
@@ -1832,6 +2644,14 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
             pw(4),
             pw(8)
         );
+        return hr;
+    }
+    if !ppv.is_null() {
+        if let (Some(size), Some(unknown)) = (console_full.as_ref().and_then(console_bc_footprint), windows::core::IUnknown::from_raw_borrowed(&*ppv)) {
+            if let Ok(obj) = unknown.cast::<ID3D12Object>() {
+                let _ = obj.SetPrivateData(&CONSOLE_BC_FOOTPRINT, size_of::<u64>() as u32, Some((&size as *const u64).cast()));
+            }
+        }
     }
     hr
 }
@@ -1885,6 +2705,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateReservedResource1", dev_create_reserved_resource1 as usize),
             ("CreateStateObject", dev_create_state_object as usize),
             ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
+            ("CreateCommittedResource3", dev_create_committed_resource3 as usize),
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
             ("CreateCommandQueue1", dev_create_command_queue1 as usize),
         ]),
@@ -1905,7 +2726,10 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Close", cl_close as usize),
             ("Reset", cl_reset as usize),
         ]),
-        Kind::CommandQueue => v.extend_from_slice(&[("Release", q_release as usize), ("ExecuteCommandLists", q_execute_command_lists as usize)]),
+        Kind::CommandQueue => v.extend_from_slice(&[
+            ("Release", q_release as usize),
+            ("ExecuteCommandLists", q_execute_command_lists as usize),
+        ]),
         Kind::CommandAllocator => v.extend_from_slice(&[("Release", alloc_release as usize), ("Reset", alloc_reset as usize)]),
         Kind::Resource => v.extend_from_slice(&[
             ("Release", res_release as usize),
@@ -1913,16 +2737,27 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("Unmap", res_unmap as usize),
             ("WriteToSubresource", res_write_to_subresource as usize),
         ]),
-        Kind::PipelineState => v.push(("Release", pso_release as usize)),
+        Kind::PipelineState => v.extend_from_slice(&[("Release", pso_release as usize), ("SetName", pso_set_name as usize)]),
         Kind::DescriptorHeap => v.push(("Release", heap_release as usize)),
         Kind::Heap => v.push(("Release", mem_heap_release as usize)),
+        Kind::Fence => v.extend_from_slice(&[("Signal", fence_signal as usize), ("SetEventOnCompletion", fence_set_event as usize)]),
         _ => {}
+    }
+    if super::residency::eviction_enabled() {
+        match kind {
+            Kind::CommandList | Kind::DmaList => residency_list::overrides(&mut v),
+            Kind::CommandQueue => v.extend_from_slice(&[
+                ("UpdateTileMappings", q_update_tile_mappings as usize),
+                ("CopyTileMappings", q_copy_tile_mappings as usize),
+            ]),
+            _ => {}
+        }
     }
     v
 }
 
 /// Slot of `method` in the class of an adopted object.
-unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
+pub(super) unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
     let ext = vt(this) as usize;
     let g = CLASSES.lock().unwrap();
     let c = g.iter().find(|c| c.ext == ext).expect("adopted class");
@@ -1967,6 +2802,7 @@ macro_rules! as_usize {
 /// command list's vtable pointer on Close; adopt the runtime's new state vtable so
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
+    super::list_x::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -1980,12 +2816,17 @@ unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
 
 /// Reset (PC path): re-adopt the runtime's new open-state vtable if Reset replaced it.
 unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, initial_state: *mut c_void) -> HRESULT {
+    super::single::before_list_reset(&[this as usize]);
     let ext = *(this as *const usize);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, *mut c_void) -> HRESULT =
         std::mem::transmute(orig_fn(this, slot_of(this, "Reset")));
     let resolved = super::pso_async::resolve_for_bind(initial_state as usize) as *mut c_void;
     let hr = f(this, allocator, resolved);
     preserve_vtable(this, ext);
+    if hr >= 0 {
+        super::list_x::on_pc_reset(this);
+        super::residency::list_reset(this as usize);
+    }
     hr
 }
 
@@ -2042,9 +2883,51 @@ unsafe fn adjust_raytracing_options5(feature: i32, data: *mut u8, size: u32) {
 /// CheckFeatureSupport(feature, data, size): console structures can be larger than the PC's
 /// (XDefiant: D3D12_OPTIONS with 0x40 bytes, 0x3C on the PC – and the title stops on the
 /// error). A size the PC refuses is retried with the PC's, the console's extra bytes zero.
+///
+/// A query about one of the console's own formats (116 – 120, `device_x::pc_view_format`) asks
+/// the PC about the format the resource gets there, and the caller's format field is put back.
+/// A retail title asked FORMAT_SUPPORT of D16_UNORM_S8_UINT (118), the PC called it unsupported,
+/// and the title stopped on its assertion.
 unsafe extern "system" fn dev_check_feature_support(this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
-    type F = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
-    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
+    let f: CheckFeatureSupportFn = std::mem::transmute(orig_fn(this, slot_of(this, "CheckFeatureSupport")));
+    check_feature_support_x(f, this, feature, data, size)
+}
+
+type CheckFeatureSupportFn = unsafe extern "system" fn(*mut c_void, i32, *mut u8, u32) -> HRESULT;
+
+/// `dev_check_feature_support` with the PC device's own CheckFeatureSupport `f`.
+pub(super) unsafe fn check_feature_support_x(f: CheckFeatureSupportFn, this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
+    let console = console_format_query(feature, data, size);
+    let hr = check_feature_support_pc(f, this, feature, data, size);
+    if let Some(format) = console {
+        (data as *mut u32).write_unaligned(format);
+    }
+    hr
+}
+
+/// The features whose data starts with a DXGI_FORMAT the caller asks about.
+fn feature_takes_format(feature: i32) -> bool {
+    matches!(
+        D3D12_FEATURE(feature),
+        D3D12_FEATURE_FORMAT_SUPPORT | D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS | D3D12_FEATURE_FORMAT_INFO | D3D12_FEATURE_PLACED_RESOURCE_SUPPORT_INFO
+    )
+}
+
+/// For a format query (`feature_takes_format`) about a console-only format: its PC format written
+/// into `data` in its place, and the console's returned (to be put back after the call).
+unsafe fn console_format_query(feature: i32, data: *mut u8, size: u32) -> Option<u32> {
+    if !feature_takes_format(feature) || data.is_null() || size < 4 {
+        return None;
+    }
+    let format = (data as *const u32).read_unaligned();
+    let pc = super::device_x::pc_view_format(format);
+    (pc != format).then(|| {
+        (data as *mut u32).write_unaligned(pc);
+        format
+    })
+}
+
+unsafe fn check_feature_support_pc(f: CheckFeatureSupportFn, this: *mut c_void, feature: i32, data: *mut u8, size: u32) -> HRESULT {
     let hr = f(this, feature, data, size);
     if hr >= 0 {
         adjust_raytracing_options5(feature, data, size);
@@ -2100,11 +2983,128 @@ creator!(dev_create_command_queue1, "CreateCommandQueue1", Kind::CommandQueue, [
 creator!(dev_create_command_allocator, "CreateCommandAllocator", Kind::CommandAllocator, [a1]);
 creator!(dev_create_command_list, "CreateCommandList", Kind::CommandList, [a1, a2, a3, a4]);
 creator!(dev_create_command_list1, "CreateCommandList1", Kind::CommandList, [a1, a2, a3]);
+
+/// Create a raw adopted PC `ID3D12GraphicsCommandList` without wrapping it in `title_list`
+/// (used for deferred mid-list split segments on the same allocator).
+pub(super) unsafe fn create_raw_pc_command_list(
+    dev: *mut c_void,
+    ty: D3D12_COMMAND_LIST_TYPE,
+    alloc: usize,
+    init_pso: usize,
+) -> Option<*mut c_void> {
+    if dev.is_null() || alloc == 0 {
+        return None;
+    }
+    let iid = layout::parse_guid(layout::find("ID3D12GraphicsCommandList")?.iid);
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let ty = D3D12_COMMAND_LIST_TYPE(super::single::list_type(ty.0 as usize) as i32);
+    let hr = if is_ext(vt(dev) as usize) {
+        dev_create_command_list(dev, 0, ty.0 as usize, alloc, init_pso, &iid, &mut out)
+    } else {
+        type F = unsafe extern "system" fn(*mut c_void, u32, D3D12_COMMAND_LIST_TYPE, usize, usize, *const GUID, *mut *mut c_void) -> HRESULT;
+        let slot = layout::slot(layout::find("ID3D12Device")?, "CreateCommandList")?;
+        let f: F = std::mem::transmute(*vt(dev).add(slot));
+        let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
+        if hr >= 0 && !out.is_null() {
+            adopt(out, Kind::CommandList);
+        }
+        hr
+    };
+    (hr >= 0 && !out.is_null()).then_some(out)
+}
 creator!(dev_create_descriptor_heap, "CreateDescriptorHeap", Kind::DescriptorHeap, [a1]);
-creator!(dev_create_committed_resource, "CreateCommittedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
-creator!(dev_create_committed_resource1, "CreateCommittedResource1", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_committed_resource2, "CreateCommittedResource2", Kind::Resource, [a1, a2, a3, a4, a5, a6]);
-creator!(dev_create_placed_resource, "CreatePlacedResource", Kind::Resource, [a1, a2, a3, a4, a5]);
+macro_rules! committed_creator {
+    ($name:ident, $raw:ident, $method:literal, $desc1:expr $(, $session:ident)?) => {
+        creator!($raw, $method, Kind::Resource, [props, flags, desc, initial, clear $(, $session)?]);
+
+        pub(super) unsafe extern "system" fn $name(
+            this: *mut c_void, props: usize, flags: usize, desc: usize, initial: usize, clear: usize,
+            $($session: usize,)? riid: *const GUID, ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            let session = 0usize $(| $session)?;
+            committed_with_residency(this, props, flags, desc, $desc1, session, ppv,
+                |p| $raw(this, p, flags, desc, initial, clear $(, $session)?, riid, ppv))
+        }
+    };
+}
+
+committed_creator!(dev_create_committed_resource, dev_create_committed_resource_pc, "CreateCommittedResource", false);
+committed_creator!(dev_create_committed_resource1, dev_create_committed_resource1_pc, "CreateCommittedResource1", false, session);
+committed_creator!(dev_create_committed_resource2, dev_create_committed_resource2_pc, "CreateCommittedResource2", true, session);
+creator!(dev_create_committed_resource3_pc, "CreateCommittedResource3", Kind::Resource, [props, flags, desc, layout, clear, session, n, formats]);
+
+unsafe extern "system" fn dev_create_committed_resource3(
+    this: *mut c_void, props: usize, flags: usize, desc: usize, layout: usize, clear: usize,
+    session: usize, n: usize, formats: usize, riid: *const GUID, ppv: *mut *mut c_void,
+) -> HRESULT {
+    committed_with_residency(this, props, flags, desc, true, session, ppv,
+        |p| dev_create_committed_resource3_pc(this, p, flags, desc, layout, clear, session, n, formats, riid, ppv))
+}
+
+unsafe fn committed_with_residency(
+    this: *mut c_void, props: usize, flags: usize, desc: usize, desc1: bool, session: usize,
+    ppv: *mut *mut c_void, mut create: impl FnMut(usize) -> HRESULT,
+) -> HRESULT {
+    if ppv.is_null() || super::title_textures::is_own_work()
+        || !crate::gpu::shader::readable(props, size_of::<D3D12_HEAP_PROPERTIES>())
+        || !crate::gpu::shader::readable(desc, size_of::<D3D12_RESOURCE_DESC>())
+    {
+        return create(props);
+    }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&this) else { return create(props) };
+    let properties = (props as *const D3D12_HEAP_PROPERTIES).read_unaligned();
+    let flags = D3D12_HEAP_FLAGS(flags as i32);
+    if !super::residency::eviction_enabled() && (session != 0 || !super::residency::could_spill(properties, flags)) {
+        return create(props);
+    }
+    let d = (desc as *const D3D12_RESOURCE_DESC).read_unaligned();
+    let bytes = if desc1 {
+        if !crate::gpu::shader::readable(desc, size_of::<D3D12_RESOURCE_DESC1>()) {
+            return create(props);
+        }
+        let Ok(dev8) = dev.cast::<ID3D12Device8>() else { return create(props) };
+        let d1 = (desc as *const D3D12_RESOURCE_DESC1).read_unaligned();
+        dev8.GetResourceAllocationInfo2(properties.VisibleNodeMask, 1, &d1, None).SizeInBytes
+    } else {
+        dev.GetResourceAllocationInfo(properties.VisibleNodeMask, &[d]).SizeInBytes
+    };
+    let high = super::residency::protected_texture(&d);
+    let mut alloc = |p: &D3D12_HEAP_PROPERTIES| {
+        let hr = windows::core::HRESULT(create(p as *const _ as usize));
+        hr.ok().map(|()| hr.0)
+    };
+    let made = if session == 0 { super::residency::allocate(dev, properties, flags, bytes, high, alloc) } else {
+        alloc(&properties).map(|hr| (hr, false))
+    };
+    match made {
+        Ok((hr, spilled)) => {
+            if !(*ppv).is_null() {
+                super::residency::track(dev, *ppv as usize, properties, bytes, high, session == 0 && super::residency::may_evict(flags), spilled);
+            }
+            hr
+        }
+        Err(e) => e.code().0,
+    }
+}
+
+macro_rules! placed_creator {
+    ($name:ident, $raw:ident, $method:literal) => {
+        creator!($raw, $method, Kind::Resource, [heap, offset, desc, state, clear]);
+
+        pub(super) unsafe extern "system" fn $name(
+            this: *mut c_void, heap: usize, offset: usize, desc: usize, state: usize, clear: usize,
+            riid: *const GUID, ppv: *mut *mut c_void,
+        ) -> HRESULT {
+            let hr = $raw(this, heap, offset, desc, state, clear, riid, ppv);
+            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+                super::residency::link(*ppv as usize, heap);
+            }
+            hr
+        }
+    };
+}
+
+placed_creator!(dev_create_placed_resource, dev_create_placed_resource_pc, "CreatePlacedResource");
 
 /// D3D12_RESOURCE_STATES the PC knows (as `list_x::PC_STATES`)
 pub(super) const PC_RESOURCE_STATES: u32 = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x100 | 0x200 | 0x400 | 0x800 | 0x1000 | 0x2000 | 0xF_0000 | 0x20_0000 | 0x40_0000 | 0x80_0000 | 0x100_0000;
@@ -2142,6 +3142,8 @@ pub(super) unsafe extern "system" fn dev_create_placed_resource_x(this: *mut c_v
     let x: [u8; 0x38] = (desc as *const [u8; 0x38]).read_unaligned();
     let d = super::device_x::pc_resource_desc(&x);
     let st = state as u32 & PC_RESOURCE_STATES;
+    let mut clear_buf = D3D12_CLEAR_VALUE::default();
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, Some((&x, &d))) as usize;
     let hr2 = dev_create_placed_resource(this, heap, offset, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     let heap_desc = pc_heap_desc(heap);
     let pc_size = pc_allocation_size(this, &d);
@@ -2196,6 +3198,8 @@ unsafe fn own_memory_if_larger_on_the_pc(this: *mut c_void, heap: usize, offset:
     }
     let h = pc_heap_desc(heap)?;
     let st = state as u32 & PC_RESOURCE_STATES;
+    let mut clear_buf = D3D12_CLEAR_VALUE::default();
+    let clear = super::device_x::pc_clear(clear as *const c_void, &mut clear_buf, Some((&x, &d))) as usize;
     let mut hr = dev_create_committed_resource(this, &h.Properties as *const _ as usize, 0, d.as_ptr() as usize, st as usize, clear, riid, ppv);
     if hr < 0 && st != 0 {
         // as in the past-the-end fallback: a state the PC refuses for this desc (e.g. UAV
@@ -2240,10 +3244,42 @@ unsafe fn pc_allocation_size(device: *mut c_void, d: &[u8; 0x38]) -> u64 {
     f(device, &mut r, 0, 1, d);
     r[0]
 }
-creator!(dev_create_placed_resource1, "CreatePlacedResource1", Kind::Resource, [a1, a2, a3, a4, a5]);
+placed_creator!(dev_create_placed_resource1, dev_create_placed_resource1_pc, "CreatePlacedResource1");
 creator!(dev_create_reserved_resource, "CreateReservedResource", Kind::Resource, [a1, a2, a3]);
 creator!(dev_create_reserved_resource1, "CreateReservedResource1", Kind::Resource, [a1, a2, a3, a4]);
-creator!(dev_create_heap_pc, "CreateHeap", Kind::Heap, [a1]);
+creator!(dev_create_heap_raw, "CreateHeap", Kind::Heap, [a1]);
+
+unsafe fn dev_create_heap_pc(this: *mut c_void, desc: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    heap_with_residency(this, desc, 0, ppv, |d| dev_create_heap_raw(this, d, riid, ppv))
+}
+
+unsafe fn heap_with_residency(
+    this: *mut c_void, desc: usize, session: usize, ppv: *mut *mut c_void, mut create: impl FnMut(usize) -> HRESULT,
+) -> HRESULT {
+    if ppv.is_null() || super::title_textures::is_own_work() || !crate::gpu::shader::readable(desc, size_of::<D3D12_HEAP_DESC>()) {
+        return create(desc);
+    }
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&this) else { return create(desc) };
+    let d = (desc as *const D3D12_HEAP_DESC).read_unaligned();
+    let high = !d.Flags.contains(D3D12_HEAP_FLAG_DENY_RT_DS_TEXTURES | D3D12_HEAP_FLAG_DENY_NON_RT_DS_TEXTURES);
+    let mut alloc = |p: &D3D12_HEAP_PROPERTIES| {
+        let chosen = D3D12_HEAP_DESC { Properties: *p, ..d };
+        let hr = windows::core::HRESULT(create(&chosen as *const _ as usize));
+        hr.ok().map(|()| hr.0)
+    };
+    let made = if session == 0 { super::residency::allocate(dev, d.Properties, d.Flags, d.SizeInBytes, high, alloc) } else {
+        alloc(&d.Properties).map(|hr| (hr, false))
+    };
+    match made {
+        Ok((hr, spilled)) => {
+            if !(*ppv).is_null() {
+                super::residency::track(dev, *ppv as usize, d.Properties, d.SizeInBytes, high, session == 0 && super::residency::may_evict(d.Flags), spilled);
+            }
+            hr
+        }
+        Err(e) => e.code().0,
+    }
+}
 
 /// D3D12_HEAP_FLAGS the PC knows: SHARED 0x1, DENY_BUFFERS 0x4, ALLOW_DISPLAY 0x8,
 /// SHARED_CROSS_ADAPTER 0x20, DENY_RT_DS_TEXTURES 0x40, DENY_NON_RT_DS_TEXTURES 0x80, then
@@ -2287,7 +3323,7 @@ pub(super) unsafe extern "system" fn dev_create_heap(this: *mut c_void, desc: us
 creator!(dev_create_heap1_pc, "CreateHeap1", Kind::Heap, [a1, a2]);
 
 pub(super) unsafe extern "system" fn dev_create_heap1(this: *mut c_void, desc: usize, session: usize, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let hr = dev_create_heap1_pc(this, desc, session, riid, ppv);
+    let hr = heap_with_residency(this, desc, session, ppv, |d| dev_create_heap1_pc(this, d, session, riid, ppv));
     if hr >= 0 {
         note_heap_uma(desc, ppv);
     }
@@ -2409,12 +3445,12 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
 /// ID3D12Heap::Release: its block of unified memory goes with it.
 unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
-    let n = f(this);
+    let n = super::residency::release(this as usize, || f(this));
     if n == 0 {
         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
             if u.is_sparse(p) {
-                super::sparse::free(p);
+                super::sparse::release_owned_block(p);
             } else {
                 u.free(p);
             }
@@ -2423,6 +3459,16 @@ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
     n
 }
 creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
+
+pub(super) unsafe fn create_residency_fence(dev: &ID3D12Device) -> windows::core::Result<ID3D12Fence> {
+    if !is_ext(vt(dev.as_raw()) as usize) {
+        return dev.CreateFence(0, D3D12_FENCE_FLAG_NONE);
+    }
+    let mut out = std::ptr::null_mut();
+    let iid = pc_iid(Kind::Fence);
+    windows::core::HRESULT(dev_create_fence_pc(dev.as_raw(), 0, 0, &iid, &mut out)).ok()?;
+    Ok(ID3D12Fence::from_raw(out))
+}
 
 /// fences created through the device (AddRef'd: they are released at the end only)
 /// (a read-write lock: `is_fence` reads it on every queue call, and `end_title` reads it with
@@ -2548,7 +3594,7 @@ fn dummy_mesh() -> Option<&'static (Vec<u8>, Vec<u8>)> {
     .as_ref()
 }
 
-fn compile(src: &str, target: &str) -> Vec<u8> {
+pub(super) fn compile(src: &str, target: &str) -> Vec<u8> {
     unsafe {
         let mut blob = None;
         let t = format!("{target}\0");
@@ -2605,11 +3651,16 @@ fn note_fallback(what: &str, hr: HRESULT, ok: bool) {
 type PsoFn = unsafe extern "system" fn(*mut c_void, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
 
 unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    if super::pso_async::preparing() {
+        return E_INVALIDARG;
+    }
+    let t0 = std::time::Instant::now();
     let mut hr = f(this, desc, riid, ppv);
     if hr == E_NOINTERFACE {
         let iid = pc_iid(Kind::PipelineState);
         hr = f(this, desc, &iid, ppv);
     }
+    crate::gpu::recomp::dxc::note_driver(t0.elapsed());
     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
         adopt(*ppv, Kind::PipelineState);
     }
@@ -2619,6 +3670,27 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
 thread_local! {
     /// translation errors noted during a cached-only attempt (`attempt`)
     static ATTEMPT_NOTES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// the translation error this thread noted last (`why_untranslated`)
+    static LAST_NOTE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Why each pipeline the title holds without a translated console shader has none (its CS and
+/// the error noted when the translation or the build failed).
+static UNTRANSLATED: Mutex<Option<HashMap<usize, String>>> = Mutex::new(None);
+
+fn note_untranslated(pso: usize, why: String) {
+    if pso != 0 {
+        UNTRANSLATED.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, why);
+    }
+}
+
+fn take_last_note() -> Option<String> {
+    LAST_NOTE.with(|n| n.borrow_mut().take())
+}
+
+/// Why pipeline `pso` has no translated console shader, when XCL made it.
+pub fn why_untranslated(pso: usize) -> Option<String> {
+    UNTRANSLATED.lock().unwrap().as_ref()?.get(&pso).cloned()
 }
 
 /// Run a translated-pipeline path without compiling (`dxc::cached_only`): (its result, whether
@@ -2633,18 +3705,28 @@ fn attempt<R>(f: impl FnOnce() -> R) -> (R, bool) {
 }
 
 fn note_translation_error(e: String) {
+    LAST_NOTE.with(|n| *n.borrow_mut() = Some(e.clone()));
+    // (`xcl warm-up` logs its failures: no run of the title follows to log them)
+    if super::pso_async::preparing() && WARMING_UP.with(|w| w.get()).is_none() {
+        return;
+    }
     if crate::gpu::recomp::dxc::in_cached_only() {
         ATTEMPT_NOTES.with(|n| n.borrow_mut().push(e));
         return;
     }
+    // every failure counted (`COMPILE_FAILURES`, on the caches line); each different one logged
+    // once (the first five only hid a retail game's "mesh pipeline with AS" behind five earlier
+    // ones). A pipeline left without a translation keeps its stand-in: nothing builds it again.
+    COMPILE_FAILURES.fetch_add(1, Ordering::Relaxed);
     let mut g = TRANSLATE_ERRORS.lock().unwrap();
-    if g.len() < 5 {
-        crate::xlog_warn!("D3D12.X: console shaders in the PSO without a translation: {e}");
-    }
-    if g.len() < 20 && !g.contains(&e) {
+    if g.len() < 400 && !g.contains(&e) {
+        crate::xlog_error!("D3D12.X: compile failed: {e}");
         g.push(e);
     }
 }
+
+/// translations, DXC compiles and driver pipeline builds that failed in the run
+static COMPILE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
 unsafe fn shader_bytes<'a>(b: &D3D12_SHADER_BYTECODE) -> Option<&'a [u8]> {
     let (p, n) = (b.pShaderBytecode as usize, b.BytecodeLength);
@@ -2659,6 +3741,16 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
     if !pso.is_null() {
         PSO_RS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, rs as usize);
     }
+}
+
+/// user SGPRs of the console CS of a translated compute pipeline
+static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
+
+/// How many user SGPRs the console compute shader of a translated pipeline has (None: not
+/// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
+pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
+    let pso = super::pso_async::resolve(pso);
+    PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
 /// The root signature a translated pipeline state was created with.
@@ -2726,6 +3818,275 @@ unsafe fn abi_rs_raw(this: *mut c_void) -> Option<*mut c_void> {
 /// A compute pipeline with a console CS: `None` = not a console shader, `Some(Err)` = console
 /// shader the recompiler could not take, `Some(Ok(hr))` = translated pipeline created (or the
 /// driver's verdict on it).
+/// DXIL size from which a compute pipeline's driver compile goes to the background
+const BIG_DRIVER_COMPILE: usize = 256 << 10;
+
+/// Driver compiles of big programs, within the memory left: a run's background builds and
+/// `xcl warm-up` alike. An NVIDIA driver took 1.4 – 1.6 GB of process memory for each of a
+/// retail game's 1 MB+ DXIL programs (40 – 180 s each), and a warm-up that started them on every
+/// core took 25 GB of a 32 GB PC. A background compile starts only while the physical memory
+/// available (read again each time it looks, so the game's own growth counts), less half the
+/// expected peaks of those running (they may still be growing), stays over `KEEP_FREE` after
+/// its own expected peak (`peak`); within `most` at once, 2 of them giants (`GIANT_DXIL`) or
+/// `GIANTS_AT_ONCE` while the memory would still hold one more giant after it, and the
+/// process's private memory (with half the running peaks) within `cap` when given. A compile a
+/// draw or dispatch waits for (`waited_on`, asked again while it waits) starts at once, outside
+/// those limits, unless its peak would leave under `URGENT_FLOOR` available: then it waits for
+/// the compiles running to finish and, still too big with none running, is refused
+/// (`Refused::NoMemory`); its peak counts while it runs or waits, so the background ones hold back.
+struct Governor {
+    state: Mutex<GovState>,
+    cv: std::sync::Condvar,
+}
+
+struct GovState {
+    running: usize,
+    giants: usize,
+    /// compiles a bind waits for among `running`
+    urgent: usize,
+    /// compiles a bind waits for, waiting for memory (`URGENT_FLOOR`)
+    starving: usize,
+    /// the expected peaks of those running
+    reserved: u64,
+}
+
+struct GovGuard {
+    cost: u64,
+    giant: bool,
+    urgent: bool,
+    _running: crate::progress::Task,
+    _large: Option<crate::progress::Task>,
+}
+
+const KEEP_FREE: u64 = 6 << 30;
+/// The memory the governor keeps available now: `KEEP_FREE`, or the floor of `warm_up_giants` while it runs
+static KEEP_FREE_NOW: AtomicU64 = AtomicU64::new(KEEP_FREE);
+
+fn keep_free() -> u64 {
+    KEEP_FREE_NOW.load(Ordering::Relaxed)
+}
+/// Memory a compile a bind waits for still leaves available: one too big for it keeps its
+/// stand-in (a 27 MB program took an NVIDIA driver past 31 GB of a 32 GB PC).
+const URGENT_FLOOR: u64 = 2 << 30;
+
+/// Why `Governor::acquire` gave no slot
+#[derive(Clone, Copy, Debug)]
+enum Refused {
+    /// a warm-up's compile that did not fit for 10 s with nothing else running: it never will
+    TooBig,
+    /// a compile a bind waits for whose peak would leave under `URGENT_FLOOR` available
+    NoMemory,
+    /// a warm-up's compile that did not fit for 10 s with nothing else running, but would in this
+    /// PC's memory less `KEEP_FREE` and the warm-up's own: tried again at the end of its phase
+    Later,
+    /// a giant on a warm-up thread leaving them for later (`LEAVE_GIANTS`)
+    Giant,
+}
+
+/// Physical memory installed (0 when the system does not say).
+fn total_physical() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return 0;
+    }
+    m.ullTotalPhys
+}
+
+/// compiles a bind waited for, refused (`Refused::NoMemory`): their pipelines keep the stand-in
+static CANNOT_BUILD: AtomicU64 = AtomicU64::new(0);
+/// DXIL from which a program is a giant: at most `GIANTS_AT_ONCE` of them compile at once
+const GIANT_DXIL: usize = 1 << 20;
+const GIANTS_AT_ONCE: usize = 3;
+/// background driver compiles at once at most; under `GIANT_DXIL` the memory left decides below that
+const SMALL_AT_ONCE: usize = 20;
+/// threads the title keeps for itself beside a run's background driver compiles
+const TITLE_THREADS: usize = 4;
+
+/// A driver compile's expected peak of process memory: 1.5 GB for each MB of DXIL with 256 MB at
+/// least (a warm-up of 0.25 – 1 MB programs held 5 at once within 2.6 GB private, its 6 GB free
+/// never reached); a giant 3.3 GB for each MB with 2 GB at least (a 6.69 MB program took the
+/// process to a 21.9 GB working set before `xcl warm-up --giants-only` was stopped at 506 MB
+/// available).
+fn peak(dxil_len: usize) -> u64 {
+    if dxil_len >= GIANT_DXIL {
+        (dxil_len as u64 * 3380).max(2 << 30)
+    } else {
+        (dxil_len as u64 * 1536).max(256 << 20)
+    }
+}
+
+/// Physical memory available (all of it when the system does not say).
+pub fn available_physical() -> u64 {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut m: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+    m.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+    if unsafe { GlobalMemoryStatusEx(&mut m) } == 0 {
+        return u64::MAX;
+    }
+    m.ullAvailPhys
+}
+
+/// Take the pages of files mapped into this process out of its working set (`VirtualUnlock` of a
+/// range not locked). An NVIDIA driver maps its shader cache (DXCache `*.nvph`) and its lookups
+/// leave most of it resident: 8.8 GB of a warm-up's 10 GB working set, with 1 GB private. Windows
+/// does not count those pages as available until they are trimmed, so the 6 GB floor held back
+/// compiles the PC had memory for (one at a time with 7 GB "available"; 13 GB after a trim). Clean
+/// pages go to the standby list: available, and read back without a disk read if touched again.
+/// Only file-backed views are trimmed, never the sections that back the title's memory. At most
+/// every 5 s; logged when it frees 1 GB or more (at most once a minute).
+fn trim_mapped_files() {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED};
+    use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    static LAST: Mutex<Option<(std::time::Instant, Option<std::time::Instant>)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if last.is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_secs(5)) {
+        return;
+    }
+    let before = available_physical();
+    let (mut at, mut regions) = (0usize, 0usize);
+    loop {
+        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            break;
+        }
+        let mut name = [0u16; 8];
+        if m.State == MEM_COMMIT && m.Type == MEM_MAPPED && unsafe { K32GetMappedFileNameW(GetCurrentProcess(), m.BaseAddress, name.as_mut_ptr(), name.len() as u32) } != 0 {
+            unsafe { VirtualUnlock(m.BaseAddress, m.RegionSize) };
+            regions += 1;
+        }
+        let next = (m.BaseAddress as usize).saturating_add(m.RegionSize);
+        if next <= at {
+            break;
+        }
+        at = next;
+    }
+    let freed = available_physical().saturating_sub(before);
+    let logged = last.and_then(|l| l.1);
+    let log = freed >= 1 << 30 && logged.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60));
+    if log {
+        crate::xlog_info!(
+            "D3D12.X: {} MB of files mapped into XCL (its {regions} file views: the driver's shader cache) taken out of its working set; {} MB available now",
+            freed >> 20,
+            available_physical() >> 20
+        );
+    }
+    *last = Some((std::time::Instant::now(), if log { Some(std::time::Instant::now()) } else { logged }));
+}
+
+impl Governor {
+    /// A slot for a driver compile of `dxil_len` bytes of DXIL, once it fits the limits. With
+    /// `give_up`, one that did not fit for 10 s with no other compile running: `Refused::TooBig`
+    /// when its peak is more than the PC's memory less `KEEP_FREE` and this process's private
+    /// memory, so it never will (a 27 MB program's estimate is more than the PC has; started anyway
+    /// it took an NVIDIA driver past 31 GB, leaving under 1 GB free), else `Refused::Later` (other
+    /// processes hold the memory now). `Refused::NoMemory`: waited for, but
+    /// its peak would leave under `URGENT_FLOOR` available with no other compile running.
+    fn acquire(&self, dxil_len: usize, most: usize, cap: Option<u64>, give_up: bool, waited_on: impl Fn() -> bool) -> Result<GovGuard, Refused> {
+        let cost = peak(dxil_len);
+        let mut s = self.state.lock().unwrap();
+        let mut idle_since = None;
+        let mut starving = false;
+        let urgent = loop {
+            let mut spare = available_physical().saturating_sub(s.reserved / 2);
+            if spare < keep_free() + cost {
+                trim_mapped_files();
+                spare = available_physical().saturating_sub(s.reserved / 2);
+            }
+            let wanted = waited_on();
+            if wanted && spare >= cost + URGENT_FLOOR {
+                break true;
+            }
+            if wanted && s.running == 0 {
+                s.starving -= starving as usize;
+                CANNOT_BUILD.fetch_add(1, Ordering::Relaxed);
+                return Err(Refused::NoMemory);
+            }
+            if wanted != starving {
+                if wanted {
+                    s.starving += 1;
+                } else {
+                    s.starving -= 1;
+                }
+                starving = wanted;
+            }
+            if !wanted {
+                let giants = if spare >= keep_free() + cost + peak(GIANT_DXIL.max(dxil_len)) { GIANTS_AT_ONCE } else { 2 };
+                let held = s.starving > 0
+                    || s.running - s.urgent >= most
+                    || (dxil_len >= GIANT_DXIL && s.giants >= giants)
+                    || spare < keep_free() + cost
+                    || cap.is_some_and(|c| crate::util::process_commit_bytes() + s.reserved / 2 + cost > c);
+                if !held {
+                    break false;
+                }
+            }
+            if s.running == 0 {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if give_up && since.elapsed() >= std::time::Duration::from_secs(10) {
+                    let room = total_physical().saturating_sub(keep_free() + crate::util::process_commit_bytes());
+                    return Err(if cost > room { Refused::TooBig } else { Refused::Later });
+                }
+            } else {
+                idle_since = None;
+            }
+            s = self.cv.wait_timeout(s, std::time::Duration::from_millis(200)).unwrap().0;
+        };
+        s.starving -= starving as usize;
+        let giant = !urgent && dxil_len >= GIANT_DXIL;
+        s.running += 1;
+        s.urgent += urgent as usize;
+        s.giants += giant as usize;
+        s.reserved += cost;
+        Ok(GovGuard { cost, giant, urgent, _running: crate::progress::DRIVER.begin(), _large: (dxil_len >= GIANT_DXIL).then(|| crate::progress::LARGE_DRIVER.begin()) })
+    }
+
+    fn release(&self, g: &GovGuard) {
+        let mut s = self.state.lock().unwrap();
+        s.running -= 1;
+        s.urgent -= g.urgent as usize;
+        s.giants -= g.giant as usize;
+        s.reserved -= g.cost;
+        self.cv.notify_all();
+    }
+
+    /// (compiles running, giants among them, urgent ones among them)
+    fn in_flight(&self) -> (usize, usize, usize) {
+        let s = self.state.lock().unwrap();
+        (s.running, s.giants, s.urgent)
+    }
+}
+
+/// The run's compile failures, the driver compiles running now, the memory left, the binds that
+/// waited and the warm driver cache, for the 30 s caches line.
+pub fn driver_compiles_summary() -> String {
+    let (n, giants, urgent) = DRIVER_COMPILES.in_flight();
+    let (waits, worst) = super::pso_async::waits();
+    let (urgent_builds, window_waits, window_ms, window_skips) = super::pso_async::take_window();
+    format!(
+        "failed {} ({} cannot build within memory); driver compiles running {n} ({giants} giants, {urgent} waited for), {} MB available; binds waited {waits} (worst {worst} ms; since the last line {urgent_builds} builds a bind started, {window_waits} binds waited {window_ms} ms in all); draws skipped {} ({window_skips} since the last line; {} at once for the frame wait budget); GPU waits released on the CPU {}; {}",
+        COMPILE_FAILURES.load(Ordering::Relaxed),
+        CANNOT_BUILD.load(Ordering::Relaxed),
+        available_physical() >> 20,
+        super::pso_async::skips(),
+        super::pso_async::budget_skips(),
+        super::list_x::cpu_releases(),
+        driver_cache::summary()
+    )
+}
+
+impl Drop for GovGuard {
+    fn drop(&mut self) {
+        DRIVER_COMPILES.release(self);
+    }
+}
+
+static DRIVER_COMPILES: Governor = Governor { state: Mutex::new(GovState { running: 0, giants: 0, urgent: 0, starving: 0, reserved: 0 }), cv: std::sync::Condvar::new() };
+
+
+
 unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<Result<HRESULT, ()>> {
     use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
@@ -2736,34 +4097,1583 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
     if !is_console(cs) {
         return None;
     }
+    // made when first bound (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return Some(Err(()));
+    }
+    let translating = crate::progress::TRANSLATIONS.begin();
     let compiled = match console_to_dxil_for(cs, Stage::Compute, 0, wave32_only(this)) {
         Ok(b) => b,
         Err(e) => {
-            note_translation_error(format!("CS: {e}"));
+            note_translation_error(format!("CS {:016x}: {e}", crate::gpu::shader::fnv64(cs)));
             return Some(Err(()));
         }
     };
+    drop(translating);
     let dxil = compiled.dxil;
+    // a big program: the driver's compile takes it seconds to a minute (a retail game's 1 MB
+    // ray-tracing resolve programs ~30 s each, ~600 of them): built in the background like one
+    // whose DXIL is missing – the title's loading does not wait for it, its first bind does
+    let big = dxil.len() >= BIG_DRIVER_COMPILE;
+    if big && crate::gpu::recomp::dxc::defer() {
+        return Some(Err(()));
+    }
     let Some(rs) = abi_rs_for(this, &compiled.samplers) else { return Some(Err(())) };
     LAST_COMPUTE_RS.with(|c| c.set(rs as usize));
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.CS = bytecode(&dxil);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    // A program built again gets the driver's own result of its first build: a retail title
+    // made 14 big compute pipelines twice while loading, 13 - 30 s each the second time.
+    let key = compute_blob_key(&dxil, rs as usize, copy.Flags.0);
+    let mut cached = compute_blob(key);
+    // … and one built in an earlier run gets the blob kept on disk then (`driver_cache`)
+    let disk = driver_cache::path(&dxil, copy.Flags.0);
+    let from_disk = cached.is_none();
+    if from_disk {
+        cached = disk.as_deref().and_then(driver_cache::load).map(std::sync::Arc::new);
+    }
+    if let Some(b) = &cached {
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() };
+    }
+    let asked = std::time::Instant::now();
+    // preparing (`pso_async::preparing`): a big program's driver compile is made too, for the
+    // driver's disk cache (an NVIDIA driver: 46–131 s, the next time 0.07–0.13 s), and the
+    // pipeline is released at once; one with a blob kept already needs no driver now
+    let warm = super::pso_async::preparing();
+    if warm && !(big && cached.is_none()) {
+        return Some(Err(()));
+    }
+    // in the background, within the memory left (`DRIVER_COMPILES`)
+    let _slot = match (big && cached.is_none()).then(|| driver_slot(dxil.len(), warm, || format!("CS {:016x}", crate::gpu::shader::fnv64(cs)))) {
+        Some(Err(_)) => return Some(Err(())),
+        Some(Ok(slot)) => Some(slot),
+        None => None,
+    };
+    // the driver's time, without the wait for a slot
+    let (started, waited) = (std::time::Instant::now(), asked.elapsed());
+    if warm {
+        if super::pso_async::with_driver(|| finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)) >= 0 && !(*ppv).is_null() {
+            keep_compute_blob(key, *ppv, dxil.len());
+            if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+                driver_cache::keep(p, &b, started.elapsed());
+            }
+            driver_cache::note_miss(dxil.len(), started.elapsed());
+            super::pso_async::release(std::mem::replace(&mut *ppv, std::ptr::null_mut()) as usize);
+        }
+        return Some(Err(()));
+    }
+    // an NVIDIA driver aborted the process reading a bad module ("Invalid record"): a create from
+    // a blob is named on stderr before and after, so an abort names its blob
+    let crumb = cached.as_ref().map(|b| {
+        let at = if from_disk { disk.as_deref().map_or_else(|| "?".into(), |p| p.display().to_string()) } else { "kept in memory".into() };
+        let crumb = format!("driver blob {:016x} ({} B, {at})", crate::gpu::shader::fnv64(b), b.len());
+        eprintln!("xcl: {crumb}: creating the pipeline");
+        crumb
+    });
+    let mut hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if let Some(c) = &crumb {
+        eprintln!("xcl: {c}: {hr:#x}");
+    }
+    if hr < 0 && cached.is_some() {
+        // a blob the driver does not take (another root signature at the same address…): compiled
+        forget_compute_blob(key);
+        if from_disk {
+            driver_cache::note(false, disk.as_deref());
+        }
+        copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+        hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    }
+    let reused = hr >= 0 && cached.is_some() && copy.CachedPSO.CachedBlobSizeInBytes != 0;
+    if hr >= 0 && !reused {
+        keep_compute_blob(key, *ppv, dxil.len());
+        if let (Some(p), Some(b)) = (disk.as_deref(), compute_blob(key)) {
+            driver_cache::keep(p, &b, started.elapsed());
+        }
+        driver_cache::note_miss(dxil.len(), started.elapsed());
+    } else if reused && from_disk {
+        driver_cache::note(true, None);
+    }
     if hr < 0 {
-        note_translation_error(format!("the driver rejected the compute PSO with the translated CS ({hr:#x})"));
+        note_translation_error(format!("CS {:016x}: the driver rejected the compute PSO ({hr:#x})", crate::gpu::shader::fnv64(cs)));
         return Some(Err(()));
     }
     TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
     note_pso_rs(*ppv, rs);
+    if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
+        PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
+    }
     note_translated_compute(hr, ppv);
-    crate::xlog_info!("D3D12.X: compute PSO with the translated console CS ({} B DXIL)", dxil.len());
+    super::pso_async::note_build(|| {
+        format!(
+            "CS {:016x} {} B of DXIL; slot wait {} ms, driver {} ms{}",
+            crate::gpu::shader::fnv64(cs),
+            dxil.len(),
+            waited.as_millis(),
+            started.elapsed().as_millis(),
+            if reused { " (the driver's blob of an earlier build)" } else { "" }
+        )
+    });
+    crate::xlog_info!(
+        "D3D12.X: compute PSO with the translated console CS {:016x} ({} B DXIL, {} ms in the driver, {} ms waiting for a slot{})",
+        crate::gpu::shader::fnv64(cs),
+        dxil.len(),
+        started.elapsed().as_millis(),
+        waited.as_millis(),
+        if reused { ", the driver's blob of an earlier build" } else { "" }
+    );
     Some(Ok(hr))
 }
 
+/// A slot for a big driver compile (`what`: its stage and hash, for the log) within the memory
+/// left (`DRIVER_COMPILES`): on XCL's build threads (`xcl-pso*`, the warm-up's within
+/// `WARM_UP_COMMIT`) or while preparing (`warm`) as background compiles, on the title's own
+/// threads as compiles it waits for. Err: not built, logged (`Governor::acquire`).
+fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Result<GovGuard, Refused> {
+    if dxil_len >= GIANT_DXIL && LEAVE_GIANTS.with(|l| l.get()) {
+        REFUSED.with(|r| r.set(Some(Refused::Giant)));
+        return Err(Refused::Giant);
+    }
+    let background = warm || std::thread::current().name().is_some_and(|n| n.starts_with("xcl-pso"));
+    let warming = WARMING_UP.with(|w| w.get());
+    let in_game = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(TITLE_THREADS);
+    let (most, cap) = warming.map_or((in_game.clamp(1, SMALL_AT_ONCE), None), |n| (n.min(SMALL_AT_ONCE), Some(WARM_UP_COMMIT)));
+    let r = DRIVER_COMPILES.acquire(dxil_len, most, cap, warming.is_some(), || !background || super::pso_async::waited_on());
+    if let Err(e) = &r {
+        REFUSED.with(|c| c.set(Some(*e)));
+    }
+    match r {
+        Err(Refused::TooBig) => crate::xlog_warn!("D3D12.X: {}: {dxil_len} B of DXIL – too big to build within the memory limits, left for its first bind", what()),
+        Err(Refused::Later) => eprintln!("  {}: {dxil_len} B of DXIL – no room now ({} MB available), tried again at the end of the phase", what(), available_physical() >> 20),
+        Err(Refused::Giant) => {}
+        Err(Refused::NoMemory) => {
+            COMPILE_FAILURES.fetch_add(1, Ordering::Relaxed);
+            crate::xlog_error!(
+                "D3D12.X: cannot build within memory: {}: {dxil_len} B of DXIL, ~{} MB expected peak with {} MB available – its stand-in stays bound",
+                what(),
+                peak(dxil_len) >> 20,
+                available_physical() >> 20
+            );
+        }
+        Ok(_) => {}
+    }
+    r
+}
+
+thread_local! {
+    /// a warm-up thread, of this many
+    static WARMING_UP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// a warm-up thread leaving the giants' driver compiles for later (`driver_slot` refuses them)
+    static LEAVE_GIANTS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// why `driver_slot` last refused this thread a slot (a warm-up's build clears it first)
+    static REFUSED: std::cell::Cell<Option<Refused>> = const { std::cell::Cell::new(None) };
+}
+
+/// The private memory `xcl warm-up` keeps within (`DRIVER_COMPILES`).
+const WARM_UP_COMMIT: u64 = 12 << 30;
+
+#[derive(Default)]
+pub struct WarmMesh {
+    pub kept: usize,
+    pub built: usize,
+    pub failed: usize,
+    pub too_big: usize,
+    pub threads: usize,
+    pub took: std::time::Duration,
+}
+
+type MeshBlobLocks = Mutex<HashMap<std::path::PathBuf, Arc<Mutex<()>>>>;
+
+struct MeshWarmBuild<'a> {
+    locks: &'a MeshBlobLocks,
+    built: bool,
+    blobs: Vec<std::path::PathBuf>,
+}
+
+impl MeshWarmBuild<'_> {
+    unsafe fn blob(&mut self, path: Option<&std::path::Path>, len: usize, what: &'static str, create: impl FnOnce(*mut *mut c_void) -> HRESULT) -> Result<HRESULT, ()> {
+        let Some(path) = path else {
+            note_translation_error(format!("{what} has no driver cache key"));
+            return Err(());
+        };
+        let lock = self.locks.lock().unwrap().entry(path.to_owned()).or_default().clone();
+        let _lock = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if driver_cache::load(path).is_some() {
+            self.blobs.push(path.to_owned());
+            return Ok(S_OK);
+        }
+        let slot = driver_slot(len, true, || what.into()).map_err(|_| ())?;
+        let mut pso = std::ptr::null_mut();
+        let hr = create(&mut pso);
+        let blob = (hr >= 0 && !pso.is_null()).then(|| pso_blob(pso)).flatten();
+        super::pso_async::release(pso as usize);
+        drop(slot);
+        if hr < 0 {
+            return Ok(hr);
+        }
+        if !blob.is_some_and(|b| driver_cache::write(path, &b)) {
+            note_translation_error(format!("{what} did not yield a usable driver blob"));
+            return Err(());
+        }
+        self.built = true;
+        self.blobs.push(path.to_owned());
+        Ok(S_OK)
+    }
+}
+
+pub fn warm_up_mesh(recent_used: Option<std::num::NonZeroU32>) -> Result<WarmMesh, String> {
+    use super::pso_manifest::Store;
+    use super::pso_manifest::Kind::MeshStream;
+    let started = std::time::Instant::now();
+    let dir = super::pso_manifest::dir();
+    let recent = if let Some(n) = recent_used {
+        let (runs, created) = Store::recently_created(&dir, n).map_err(|e| format!("cannot read recent mesh pipeline history: {e}"))?;
+        let mut used = super::pso_async::used_earlier();
+        used.extend(super::pso_async::skipped_earlier());
+        eprintln!("warm-up --mesh-only: scope is counted runs {}–{} and shaders previously bound or skipped", runs.start(), runs.end());
+        Some((created, used))
+    } else {
+        None
+    };
+    let mut startup = None;
+    let mut kept = 0;
+    let loaded = Store::load_kind(&dir, MeshStream, |key, shader_key| {
+        if let Some((created, used)) = &recent {
+            if !created.contains(&key) || !shader_key.is_some_and(|key| used.contains(&key)) {
+                return false;
+            }
+        }
+        let result = startup.get_or_insert_with(|| {
+            if !driver_cache::on() {
+                return Err("the driver cache is disabled by XCL_PSO_DISK_CACHE".to_string());
+            }
+            init()?;
+            if crate::gpu::recomp::pso::mem_windows() as usize != crate::gpu::uma::MAX_WINDOWS {
+                return Err("could not initialize the runtime shader memory windows".to_string());
+            }
+            let dev = device_raw();
+            Ok((dev as usize, driver_cache::mesh_coverage_dir(dev)))
+        });
+        let Ok((_, coverage)) = result else { return false };
+        let hit = coverage.as_deref().is_some_and(|dir| driver_cache::mesh_covered(dir, key));
+        kept += usize::from(hit);
+        !hit
+    });
+    let Some(startup) = startup else {
+        return Ok(WarmMesh { took: started.elapsed(), ..Default::default() });
+    };
+    let (dev, coverage) = startup?;
+    let mut queue: Vec<_> = loaded.records.iter().map(|r| (r, false)).collect();
+    let total = kept + loaded.broken + queue.len();
+    eprintln!("warm-up --mesh-only: {total} selected pipelines, {kept} already covered, {} to check or build, {} unreadable", queue.len(), loaded.broken);
+    if queue.is_empty() {
+        return Ok(WarmMesh { kept, failed: loaded.broken, took: started.elapsed(), ..Default::default() });
+    }
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).min(queue.len());
+    let results = Mutex::new(WarmMesh { kept, failed: loaded.broken, threads, ..Default::default() });
+    let locks = MeshBlobLocks::default();
+    queue.sort_unstable_by_key(|(r, _)| std::cmp::Reverse(r.size()));
+    let ready = kept + loaded.broken;
+    std::thread::scope(|s| -> Result<(), String> {
+        let (_finish, stop) = std::sync::mpsc::channel::<()>();
+        let results = &results;
+        let compiling = std::time::Instant::now();
+        s.spawn(move || {
+            while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(std::time::Duration::from_secs(10)) {
+                let w = results.lock().unwrap();
+                let done = w.kept + w.built + w.failed + w.too_big;
+                let checked = done.saturating_sub(ready);
+                let eta = if checked == 0 {
+                    "estimating".into()
+                } else {
+                    format!("{:.0} s", compiling.elapsed().as_secs_f64() * total.saturating_sub(done) as f64 / checked as f64)
+                };
+                eprintln!("warm-up --mesh-only: {done}/{total} pipelines checked, {} warmed, {} cached, {} failed or refused, ETA {eta}", w.built, w.kept, w.failed + w.too_big);
+            }
+        });
+        for round in 0..=RETRY_ROUNDS {
+            let (next, later) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
+            std::thread::scope(|scope| -> Result<(), String> {
+                for k in 0..threads.min(queue.len()) {
+                    let (next, later, queue, locks, results) = (&next, &later, &queue, &locks, &results);
+                    let coverage = coverage.as_deref();
+                    std::thread::Builder::new().name(format!("xcl-pso-warm-mesh-{k}")).stack_size(64 << 20).spawn_scoped(scope, move || {
+                        WARMING_UP.with(|c| c.set(Some(threads)));
+                        while let Some(&(r, built)) = queue.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            let mut warm = MeshWarmBuild { locks, built, blobs: Vec::new() };
+                            REFUSED.with(|c| c.set(None));
+                            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                                let Some(owned) = OwnedDesc::from_record(r) else { return false };
+                                let mut out = std::ptr::null_mut();
+                                matches!(translated_mesh_stream(dev as *mut c_void, owned.ptr(), &pc_iid(Kind::PipelineState), &mut out, Some(&mut warm)), Some(hr) if hr >= 0)
+                            })).unwrap_or_else(|p| {
+                                eprintln!("  mesh pipeline {:016x} panicked: {}", r.key(), panic_text(&*p));
+                                false
+                            });
+                            match REFUSED.with(|c| c.get()) {
+                                Some(Refused::Later) if round < RETRY_ROUNDS => later.lock().unwrap().push((r, warm.built)),
+                                Some(_) => results.lock().unwrap().too_big += 1,
+                                None => {
+                                    if let (true, Some(dir)) = (ok, coverage) {
+                                        driver_cache::note_mesh_coverage(dir, r.key(), &warm.blobs);
+                                    }
+                                    let mut w = results.lock().unwrap();
+                                    if !ok {
+                                        w.failed += 1;
+                                    } else if warm.built {
+                                        w.built += 1;
+                                    } else {
+                                        w.kept += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }).map_err(|e| format!("could not start a mesh warm-up worker: {e}"))?;
+                }
+                Ok(())
+            })?;
+            queue = later.into_inner().unwrap();
+            if queue.is_empty() {
+                break;
+            }
+        }
+        Ok(())
+    })?;
+    let mut w = results.into_inner().unwrap();
+    w.took = started.elapsed();
+    Ok(w)
+}
+
+/// One phase of `xcl warm-up`.
+pub struct WarmPhase {
+    pub name: &'static str,
+    /// pipelines (or programs) it had
+    pub of: usize,
+    pub built: usize,
+    pub failed: usize,
+    /// giants (`GIANT_DXIL`) with no driver blob kept, left for `--full` and the run's own builds
+    pub giants_left: usize,
+    /// too big to build within the memory limits: at once (`Refused::TooBig`), or with no room
+    /// still after `RETRY_ROUNDS` retries
+    pub too_big: usize,
+    /// not started when the budget ran out
+    pub not_started: usize,
+    pub took: std::time::Duration,
+}
+
+/// One giant of `warm_up_giants`: its DXIL (hash, length), what became of it, the seconds it took
+pub struct GiantBuild {
+    pub hash: u64,
+    pub len: usize,
+    pub outcome: &'static str,
+    pub took: std::time::Duration,
+}
+
+/// `xcl warm-up --giants-only --floor-mb N`: the driver blobs of every giant compute program on
+/// disk (`GIANT_DXIL` or more of DXIL, no blob kept), built one at a time keeping `floor`
+/// available instead of the normal floor (`KEEP_FREE`). The game launches without a warm-up, and
+/// a giant cannot build within the game's memory, so none is left for later. Only this explicit
+/// command lowers the floor: never a run of the title or the normal warm-up. Returns each
+/// giant's outcome and the process's peak commit.
+pub fn warm_up_giants(floor: u64) -> Result<(Vec<GiantBuild>, u64), String> {
+    init()?;
+    let dev = device_raw() as usize;
+    let programs = giants_without_blob();
+    let mut out = Vec::new();
+    for c in &programs {
+        let (hash, len, t0) = (crate::gpu::shader::fnv64(&c.dxil), c.dxil.len(), std::time::Instant::now());
+        KEEP_FREE_NOW.store(floor, Ordering::Relaxed);
+        let outcome = match DRIVER_COMPILES.acquire(len, 1, None, true, || false) {
+            Err(Refused::TooBig) => "too big even for the lowered floor",
+            Err(_) => "no room within the lowered floor now",
+            Ok(slot) => {
+                let ok = std::panic::catch_unwind(|| unsafe { warm_one(dev as *mut c_void, c) }).unwrap_or(false);
+                drop(slot);
+                match (ok, driver_cache::path(&c.dxil, 0).and_then(|p| driver_cache::load(&p)).is_some()) {
+                    (true, true) => "built, its driver blob kept",
+                    (true, false) => "built, but no driver blob kept",
+                    (false, _) => "the driver build failed",
+                }
+            }
+        };
+        KEEP_FREE_NOW.store(KEEP_FREE, Ordering::Relaxed);
+        out.push(GiantBuild { hash, len, outcome, took: t0.elapsed() });
+    }
+    let peak_commit = unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        let mut m: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        m.cb = std::mem::size_of_val(&m) as u32;
+        if K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut m, m.cb) != 0 { m.PeakPagefileUsage as u64 } else { 0 }
+    };
+    Ok((out, peak_commit))
+}
+
+/// The giant compute programs translated on disk (`GIANT_DXIL` or more of DXIL) with no driver
+/// blob kept, largest first; their counts logged.
+fn giants_without_blob() -> Vec<crate::gpu::recomp::pso::Compiled> {
+    let mut seen = HashSet::new();
+    let mut programs = crate::gpu::recomp::pso::translated_on_disk(crate::gpu::recomp::pso::Stage::Compute);
+    let on_disk = programs.len();
+    programs.retain(|c| c.dxil.len() >= GIANT_DXIL && seen.insert(driver_cache::name(&c.dxil, 0)));
+    let giants = programs.len();
+    programs.retain(|c| driver_cache::path(&c.dxil, 0).is_some_and(|p| driver_cache::load(&p).is_none()));
+    eprintln!("  {on_disk} compute programs translated on disk (translation {:016x}), {giants} giants, {} of them with a driver blob kept", crate::gpu::recomp::pso::translation_era(), giants - programs.len());
+    programs.sort_by_key(|c| std::cmp::Reverse(c.dxil.len()));
+    programs
+}
+
+pub struct WarmUp {
+    /// `--full`: every pipeline and giant, no budget
+    pub full: bool,
+    /// pipelines earlier runs made (`pso_manifest`) and kept entries dropped (unreadable, a shader
+    /// missing, or kept twice)
+    pub pipelines: usize,
+    pub dropped: usize,
+    /// of them: last made in this translation era; left out as stale (no run of the last
+    /// `STALE_AFTER_RUNS` made them), of the runs counted
+    pub this_era: usize,
+    pub stale_left: usize,
+    pub runs: u32,
+    /// `--full`: pipelines an earlier pass of this era went through, not built again; and whether
+    /// this pass went through the rest (the next one starts again)
+    pub resumed: usize,
+    pub complete: bool,
+    pub phases: Vec<WarmPhase>,
+    /// translated compute programs on disk, their blobs kept already
+    pub programs: usize,
+    pub kept: usize,
+    /// driver blobs of DXIL no translation on disk has any more, deleted (count, bytes)
+    pub pruned: (usize, u64),
+    pub threads: usize,
+    pub took: std::time::Duration,
+    pub peak_commit: u64,
+}
+
+impl WarmUp {
+    pub fn failed(&self) -> usize {
+        self.phases.iter().map(|p| p.failed).sum()
+    }
+
+    pub fn too_big(&self) -> usize {
+        self.phases.iter().map(|p| p.too_big).sum()
+    }
+}
+
+/// Rounds a warm-up phase tries again the builds it had no room for (`Refused::Later`).
+const RETRY_ROUNDS: usize = 3;
+
+/// The budgeted warm-up's last phase starts no build after this long (`XCL_WARMUP_BUDGET_S`).
+const WARM_UP_BUDGET: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// `xcl warm-up`: the pipelines runs of the title made (`pso_manifest`), built as the title's
+/// pipelines are – translated, compiled, the driver's compile – so their DXIL and the driver's
+/// results are in the disk caches (an NVIDIA driver: 15 – 180 s for each big compute program,
+/// 0.1 s the next time), in phases: (1) those an earlier run bound (`pso_async::used_earlier`); (2)
+/// every compute pipeline, then the driver's blob of every translated compute program on disk
+/// not kept yet (`driver_cache`; blobs of DXIL no translation has any more are deleted); (3) the
+/// rest, within `WARM_UP_BUDGET` and without the stale ones, those a counted run made first. Each
+/// phase largest first; the giants
+/// (`GIANT_DXIL`) with no blob kept are left out of (2). `full` (`xcl warm-up --full`): every
+/// pipeline and giant with no budget, going on where a pass of this translation era stopped.
+/// Builds run on every core within the memory left (`DRIVER_COMPILES`, the private memory within
+/// `WARM_UP_COMMIT`); the memory available and the builds running are logged every 10 s.
+/// `progress` is told of each one built (done, of, bytes, how long, its key or DXIL hash).
+pub fn warm_up(full: bool, progress: impl Fn(usize, usize, usize, std::time::Duration, u64) + Sync) -> Result<WarmUp, String> {
+    use super::pso_manifest::{Kind, Record};
+    let started = std::time::Instant::now();
+    init()?;
+    let dev = device_raw() as usize;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).max(GIANTS_AT_ONCE + 1);
+    let done = std::sync::atomic::AtomicBool::new(false);
+    let (built, failed, left, big) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+    let (phase, phase_total) = (std::sync::Mutex::new("pipelines"), AtomicUsize::new(0));
+    let store = super::pso_manifest::Store::open(super::pso_manifest::dir());
+    let loaded = store.load();
+    let dropped = loaded.broken + loaded.repeated;
+    if dropped > 0 {
+        let _ = store.rewrite(&loaded.records);
+    }
+    let era = crate::gpu::recomp::pso::translation_era();
+    let creations = store.creations();
+    let mut pipelines: Vec<(Record, u64)> = loaded.records.into_iter().map(|r| {
+        let key = r.key();
+        (r, key)
+    }).collect();
+    let _ = store.compact_creations(&creations, &pipelines.iter().map(|p| p.1).collect());
+    pipelines.sort_by_key(|p| std::cmp::Reverse(p.0.size()));
+    let kept_pipelines = pipelines.len();
+    let this_era = pipelines.iter().filter(|p| creations.era(p.1) == Some(era)).count();
+    let record = full.then(|| store.progress(era).map_err(|e| eprintln!("  no --full progress record ({e}): this pass cannot be resumed")).ok()).flatten();
+    let resumed = record.as_ref().map_or(0, |p| pipelines.iter().filter(|x| p.done.contains(&x.1)).count());
+    if let Some(p) = &record {
+        pipelines.retain(|x| !p.done.contains(&x.1));
+    }
+    let (used, skipped) = (super::pso_async::used_earlier(), super::pso_async::skipped_earlier());
+    let (mut bound, mut later, mut compute, mut rest, mut stale_left) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0);
+    for p in &pipelines {
+        let shaders = unsafe { OwnedDesc::from_record(&p.0) }.map_or(0, |o| o.shaders_key());
+        if skipped.contains(&shaders) {
+            bound.push(p);
+        } else if used.contains(&shaders) {
+            later.push(p);
+        } else if p.0.kind == Kind::Compute {
+            compute.push(p);
+        } else if full || !creations.stale(p.1) {
+            rest.push(p);
+        } else {
+            stale_left += 1;
+        }
+    }
+    // the pipelines a draw was skipped for first, then the others an earlier run bound
+    bound.append(&mut later);
+    // those a counted run made (graphics pipelines its boot and loading made) before those none did
+    rest.sort_by_key(|p| creations.era(p.1).is_none());
+    let budget = (!full).then(|| std::env::var("XCL_WARMUP_BUDGET_S").ok().and_then(|v| v.trim().parse().ok()).map_or(WARM_UP_BUDGET, std::time::Duration::from_secs));
+    let mut phases = Vec::new();
+    let (mut programs_found, mut kept, mut pruned) = (0, 0, (0, 0));
+    std::thread::scope(|s| {
+        let (done, built, failed, left, big, phase, phase_total) = (&done, &built, &failed, &left, &big, &phase, &phase_total);
+        // the logger ends with the builds, however they end (a panic unwinding out of here waited
+        // for it for ever)
+        struct Done<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _done = Done(done);
+        // `XCL_WARMUP_THREAD_DUMP_S`: where every thread is, each so many seconds of the last phase
+        let dump_every = std::env::var("XCL_WARMUP_THREAD_DUMP_S").ok().and_then(|v| v.trim().parse().ok()).map(std::time::Duration::from_secs);
+        s.spawn(move || {
+            let mut last = std::time::Instant::now();
+            let mut last_dump = std::time::Instant::now();
+            while !done.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if dump_every.is_some_and(|n| last_dump.elapsed() >= n) && *phase.lock().unwrap() == "the rest" {
+                    last_dump = std::time::Instant::now();
+                    crate::eh::dump_threads();
+                }
+                if last.elapsed() >= std::time::Duration::from_secs(10) {
+                    last = std::time::Instant::now();
+                    let (n, g, _) = DRIVER_COMPILES.in_flight();
+                    eprintln!(
+                        "  {:.0} s: {}: {} of {} done; {n} compute driver compiles ({g} giants), {} graphics pipelines building; {} MB available, {} MB private",
+                        started.elapsed().as_secs_f64(),
+                        phase.lock().unwrap(),
+                        built.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + left.load(Ordering::Relaxed) + big.load(Ordering::Relaxed),
+                        phase_total.load(Ordering::Relaxed),
+                        WARM_GRAPHICS.load(Ordering::Relaxed),
+                        available_physical() >> 20,
+                        crate::util::process_commit_bytes() >> 20
+                    );
+                }
+            }
+        });
+        let finish = |name: &'static str, of: usize, not_started: usize, t0: std::time::Instant| WarmPhase {
+            name,
+            of,
+            built: built.swap(0, Ordering::Relaxed),
+            failed: failed.swap(0, Ordering::Relaxed),
+            giants_left: left.swap(0, Ordering::Relaxed),
+            too_big: big.swap(0, Ordering::Relaxed),
+            not_started,
+            took: t0.elapsed(),
+        };
+        // kept pipelines, on threads XCL's governor knows (`driver_slot`); those it had no room for
+        // (`Refused::Later`) go again at the end, `RETRY_ROUNDS` times at most
+        let run = |name: &'static str, list: &[&(Record, u64)], leave_giants: bool, budget: Option<std::time::Duration>| {
+            let t0 = std::time::Instant::now();
+            let deadline = budget.map(|b| t0 + b);
+            *phase.lock().unwrap() = name;
+            phase_total.store(list.len(), Ordering::Relaxed);
+            let (mut queue, mut not_started) = (list.to_vec(), 0);
+            for round in 0..=RETRY_ROUNDS {
+                let (next, later) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
+                std::thread::scope(|w| {
+                    for k in 0..threads {
+                        let (next, later, queue, progress, record) = (&next, &later, &queue, &progress, &record);
+                        let _ = std::thread::Builder::new().name(format!("xcl-pso-warm-{k}")).stack_size(64 << 20).spawn_scoped(w, move || {
+                            WARMING_UP.with(|c| c.set(Some(threads)));
+                            LEAVE_GIANTS.with(|c| c.set(leave_giants));
+                            while deadline.is_none_or(|d| std::time::Instant::now() < d) {
+                                let Some(&p) = queue.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                                let (r, key) = (&p.0, p.1);
+                                let t0 = std::time::Instant::now();
+                                REFUSED.with(|c| c.set(None));
+                                let ok = std::panic::catch_unwind(|| unsafe { warm_pipeline(dev as *mut c_void, r) }).unwrap_or_else(|p| {
+                                    eprintln!("  a pipeline build panicked ({:?} {key:016x}, {} B of shaders): {}", r.kind, r.size(), panic_text(&*p));
+                                    false
+                                });
+                                if t0.elapsed() >= std::time::Duration::from_secs(30) {
+                                    eprintln!(
+                                        "  slow, {name}: {:?} pipeline {key:016x}, {}: {:.0} s",
+                                        r.kind,
+                                        r.shaders.iter().map(|(at, s)| format!("{} {} B", super::pso_manifest::stage_at(r, *at), s.len())).collect::<Vec<_>>().join(", "),
+                                        t0.elapsed().as_secs_f64()
+                                    );
+                                }
+                                match REFUSED.with(|c| c.get()) {
+                                    Some(Refused::Giant) => drop(left.fetch_add(1, Ordering::Relaxed)),
+                                    Some(Refused::Later) => later.lock().unwrap().push(p),
+                                    Some(Refused::TooBig) => drop(big.fetch_add(1, Ordering::Relaxed)),
+                                    _ => {
+                                        (if ok { built } else { failed }).fetch_add(1, Ordering::Relaxed);
+                                        if let Some(p) = record {
+                                            p.note(key);
+                                        }
+                                    }
+                                }
+                                progress(built.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + left.load(Ordering::Relaxed) + big.load(Ordering::Relaxed), list.len(), r.size(), t0.elapsed(), key);
+                            }
+                        });
+                    }
+                });
+                not_started += queue.len().saturating_sub(next.into_inner());
+                queue = later.into_inner().unwrap();
+                if queue.is_empty() {
+                    break;
+                }
+                if round < RETRY_ROUNDS {
+                    eprintln!("  {name}: {} had no room for their driver compile, tried again (round {} of {RETRY_ROUNDS})", queue.len(), round + 1);
+                }
+            }
+            for p in &queue {
+                eprintln!("  {name}: {:?} pipeline {:016x} still had no room after {RETRY_ROUNDS} retries: too big for now", p.0.kind, p.1);
+            }
+            big.fetch_add(queue.len(), Ordering::Relaxed);
+            finish(name, list.len(), not_started, t0)
+        };
+        // the giants with no driver blob, one at a time, first: the PC's memory is at its freest
+        // now (the driver's mapped shader cache trimmed, nothing else compiling)
+        {
+            let t0 = std::time::Instant::now();
+            *phase.lock().unwrap() = "giants first";
+            trim_mapped_files();
+            let giants = giants_without_blob();
+            phase_total.store(giants.len(), Ordering::Relaxed);
+            for c in &giants {
+                let (hash, len) = (crate::gpu::shader::fnv64(&c.dxil), c.dxil.len());
+                let Ok(slot) = DRIVER_COMPILES.acquire(len, 1, None, true, || false) else {
+                    eprintln!("  giants first: DXIL {hash:016x} ({len} B, ~{} MB expected peak) does not fit with {} MB available: for `xcl warm-up --giants-only`", peak(len) >> 20, available_physical() >> 20);
+                    big.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                };
+                let t1 = std::time::Instant::now();
+                let ok = std::panic::catch_unwind(|| unsafe { warm_one(dev as *mut c_void, c) }).unwrap_or(false);
+                drop(slot);
+                eprintln!("  giants first: DXIL {hash:016x} ({len} B): {} in {:.0} s", if ok { "built" } else { "the driver build failed" }, t1.elapsed().as_secs_f64());
+                (if ok { built } else { failed }).fetch_add(1, Ordering::Relaxed);
+            }
+            phases.push(finish("giants first", giants.len(), 0, t0));
+        }
+        phases.push(run("bound by an earlier run", &bound, false, None));
+        phases.push(run("compute pipelines", &compute, !full, None));
+        // the compute programs on disk: the blobs not kept yet; those no program has any more go
+        let t0 = std::time::Instant::now();
+        *phase.lock().unwrap() = "compute blobs";
+        let mut seen = HashSet::new();
+        let mut programs = crate::gpu::recomp::pso::translated_on_disk(crate::gpu::recomp::pso::Stage::Compute);
+        pruned = driver_cache::prune(&programs.iter().map(|c| (crate::gpu::shader::fnv64(&c.dxil), c.dxil.len())).collect());
+        programs.retain(|c| c.dxil.len() >= COMPUTE_BLOB_MIN_DXIL && seen.insert((driver_cache::name(&c.dxil, 0), c.samplers.clone())));
+        programs.sort_by_key(|c| std::cmp::Reverse(c.dxil.len()));
+        programs_found = programs.len();
+        programs.retain(|c| driver_cache::path(&c.dxil, 0).is_some_and(|p| driver_cache::load(&p).is_none()));
+        kept = programs_found - programs.len();
+        let total = programs.len();
+        phase_total.store(total, Ordering::Relaxed);
+        let giants = programs.partition_point(|c| c.dxil.len() >= GIANT_DXIL);
+        let mut queue: Vec<&crate::gpu::recomp::pso::Compiled> = if full {
+            programs.iter().collect()
+        } else {
+            left.fetch_add(giants, Ordering::Relaxed);
+            programs[giants..].iter().collect()
+        };
+        for round in 0..=RETRY_ROUNDS {
+            let (next, later) = (AtomicUsize::new(0), Mutex::new(Vec::new()));
+            let build = |c: &'_ crate::gpu::recomp::pso::Compiled| {
+                let hash = crate::gpu::shader::fnv64(&c.dxil);
+                let slot = match DRIVER_COMPILES.acquire(c.dxil.len(), threads.min(SMALL_AT_ONCE), Some(WARM_UP_COMMIT), true, || false) {
+                    Ok(slot) => slot,
+                    Err(Refused::Later) => return false,
+                    Err(_) => {
+                        eprintln!("  too big to build within the memory limits: DXIL {hash:016x} ({} B)", c.dxil.len());
+                        big.fetch_add(1, Ordering::Relaxed);
+                        return true;
+                    }
+                };
+                let t0 = std::time::Instant::now();
+                let ok = std::panic::catch_unwind(|| unsafe { warm_one(dev as *mut c_void, c) }).unwrap_or_else(|p| {
+                    eprintln!("  a compute blob build panicked (DXIL {hash:016x}, {} B): {}", c.dxil.len(), panic_text(&*p));
+                    false
+                });
+                drop(slot);
+                (if ok { built } else { failed }).fetch_add(1, Ordering::Relaxed);
+                progress(built.load(Ordering::Relaxed) + failed.load(Ordering::Relaxed) + left.load(Ordering::Relaxed) + big.load(Ordering::Relaxed), total, c.dxil.len(), t0.elapsed(), hash);
+                true
+            };
+            std::thread::scope(|w| {
+                for _ in 0..threads {
+                    let (build, next, later, queue) = (&build, &next, &later, &queue);
+                    w.spawn(move || {
+                        while let Some(&c) = queue.get(next.fetch_add(1, Ordering::Relaxed)) {
+                            if !build(c) {
+                                later.lock().unwrap().push(c);
+                            }
+                        }
+                    });
+                }
+            });
+            queue = later.into_inner().unwrap();
+            if queue.is_empty() {
+                break;
+            }
+            if round < RETRY_ROUNDS {
+                eprintln!("  compute blobs: {} had no room for their driver compile, tried again (round {} of {RETRY_ROUNDS})", queue.len(), round + 1);
+            }
+        }
+        for c in &queue {
+            eprintln!("  compute blobs: DXIL {:016x} ({} B) still had no room after {RETRY_ROUNDS} retries: too big for now", crate::gpu::shader::fnv64(&c.dxil), c.dxil.len());
+        }
+        big.fetch_add(queue.len(), Ordering::Relaxed);
+        phases.push(finish("compute blobs", total, 0, t0));
+        phases.push(run("the rest", &rest, false, budget));
+    });
+    let complete = record.is_some() && phases.iter().all(|p| p.not_started == 0);
+    if complete {
+        store.progress_complete();
+    }
+    let peak_commit = unsafe {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+        let mut m: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        m.cb = std::mem::size_of_val(&m) as u32;
+        if K32GetProcessMemoryInfo(windows_sys::Win32::System::Threading::GetCurrentProcess(), &mut m, m.cb) != 0 { m.PeakPagefileUsage as u64 } else { 0 }
+    };
+    Ok(WarmUp {
+        full,
+        pipelines: kept_pipelines,
+        dropped,
+        this_era,
+        stale_left,
+        runs: creations.runs,
+        resumed,
+        complete,
+        phases,
+        programs: programs_found,
+        kept,
+        pruned,
+        threads,
+        took: started.elapsed(),
+        peak_commit,
+    })
+}
+
+/// The message of a caught panic.
+fn panic_text(p: &(dyn std::any::Any + Send)) -> &str {
+    p.downcast_ref::<&str>().copied().or_else(|| p.downcast_ref::<String>().map(String::as_str)).unwrap_or("(no message)")
+}
+
+/// Build kept pipeline `r` as the title's own is built (`go_background`'s builds, on this thread)
+/// and release it: its translation and the driver's result stay in the disk caches.
+/// Graphics and stream pipelines the warm-up is building now: their driver compiles take no
+/// governor slot (`DRIVER_COMPILES` counts compute programs), so the progress line counts them here.
+static WARM_GRAPHICS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe fn warm_pipeline(dev: *mut c_void, r: &super::pso_manifest::Record) -> bool {
+    use super::pso_manifest::Kind;
+    struct InFlight(bool);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            if self.0 {
+                WARM_GRAPHICS.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+    let graphics = !matches!(r.kind, Kind::Compute);
+    if graphics {
+        WARM_GRAPHICS.fetch_add(1, Ordering::Relaxed);
+    }
+    let _in_flight = InFlight(graphics);
+    let Some(owned) = OwnedDesc::from_record(r) else { return false };
+    let (method, build): (&str, unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool) = match r.kind {
+        Kind::Compute => ("CreateComputePipelineState", build_compute),
+        Kind::Graphics => ("CreateGraphicsPipelineState", build_graphics),
+        Kind::MeshStream => ("CreatePipelineState", build_stream),
+        Kind::VertexStream => ("CreatePipelineState", build_vertex_stream),
+    };
+    let mut out: *mut c_void = std::ptr::null_mut();
+    let ok = build(Dev(dev as usize, orig_fn(dev, slot_of(dev, method))), &owned, &mut out) && !out.is_null();
+    super::pso_async::release(out as usize);
+    ok
+}
+
+/// Build `c` as `translated_compute_pso` does (its ABI root signature, no flags) and keep the
+/// driver's blob.
+unsafe fn warm_one(dev: *mut c_void, c: &crate::gpu::recomp::pso::Compiled) -> bool {
+    let (Some(rs), Some(path), Some(device)) = (abi_rs_for(dev, &c.samplers), driver_cache::path(&c.dxil, 0), ID3D12Device::from_raw_borrowed(&dev)) else { return false };
+    let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+    desc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+    desc.CS = bytecode(&c.dxil);
+    let pso = match device.CreateComputePipelineState::<ID3D12PipelineState>(&desc) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("  the driver refused compute program DXIL {:016x} ({} B): {:#x}", crate::gpu::shader::fnv64(&c.dxil), c.dxil.len(), e.code().0);
+            return false;
+        }
+    };
+    let Ok(blob) = pso.GetCachedBlob() else { return false };
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize());
+    driver_cache::write(&path, bytes)
+}
+
+/// The blobs of `COMPUTE_BLOBS`, and of translated graphics pipelines, kept on disk between runs.
+///
+/// `COMPUTE_BLOBS` saves the second build of a program in one run; the first build of every
+/// run still goes through the driver's compiler. On an NVIDIA GPU that is 5 – 27 s for each of
+/// a retail title's larger compute programs when its world loads: the title dispatches without
+/// them meanwhile and is ended before all are built, so the next run starts the same compiles
+/// again. A blob whose build took `KEEP` or longer is written under the hash of its DXIL and
+/// its flags (`<DXIL cache>\driver\`) and read when a later run has none in memory; the
+/// driver refuses the blob of another driver, adapter or root signature (the file is dropped
+/// and the program compiled as before). A graphics pipeline's blob goes under the hash of all
+/// the driver compiles it from (`graphics_name`): an NVIDIA driver takes 10 – 17 s for one big
+/// translated pixel shader, and a draw waits for its pipeline. `XCL_PSO_DISK_CACHE=0`: off.
+mod driver_cache {
+    use super::{D3D12_GRAPHICS_PIPELINE_STATE_DESC, D3D12_INPUT_LAYOUT_DESC, D3D12_SHADER_BYTECODE, HRESULT};
+    use crate::gpu::recomp::pso::StaticSampler;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// builds shorter than this are not worth a file
+    const KEEP: std::time::Duration = std::time::Duration::from_millis(250);
+    static HITS: AtomicU64 = AtomicU64::new(0);
+    static STALE: AtomicU64 = AtomicU64::new(0);
+    static STORED: AtomicU64 = AtomicU64::new(0);
+    static MISSES: AtomicU64 = AtomicU64::new(0);
+
+    /// The run's hits, misses, refused blobs and blobs kept, for the logs.
+    pub fn summary() -> String {
+        let n = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        format!("warm driver cache {} hits, {} misses, {} refused, {} failed their check, {} kept", n(&HITS), n(&MISSES), n(&STALE), n(&CORRUPT), n(&STORED))
+    }
+
+    /// The file of the pipeline made from `dxil` with `flags`.
+    pub fn name(dxil: &[u8], flags: i32) -> String {
+        format!("{:016x}-{:x}-{:x}.pso", crate::gpu::shader::fnv64(dxil), dxil.len(), flags)
+    }
+
+    pub(super) fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("XCL_PSO_DISK_CACHE").map_or(true, |v| v.trim() != "0"))
+    }
+
+    pub fn path(dxil: &[u8], flags: i32) -> Option<PathBuf> {
+        on().then(|| dir().join(name(dxil, flags)))
+    }
+
+    pub fn mesh_compute_path(dxil: &[u8], samplers: &[StaticSampler]) -> Option<PathBuf> {
+        if !on() {
+            return None;
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        h.samplers(samplers);
+        Some(dir().join(format!("m{:016x}-{}", h.0, name(dxil, 0))))
+    }
+
+    pub(super) fn mesh_coverage_dir(device: *mut std::ffi::c_void) -> Option<PathBuf> {
+        use crate::gpu::{agility, recomp::pso};
+        let era = pso::translation_era();
+        if era == 0 {
+            return None;
+        }
+        super::DRIVER.get()?;
+        let native = unsafe { windows::core::Interface::from_raw_borrowed(&device) }.and_then(pso::mesh_native_split);
+        let sdk = match agility::state() {
+            agility::State::Loaded { version, .. } => *version,
+            _ => 0,
+        };
+        let mut opts = Fnv(0xcbf2_9ce4_8422_2325);
+        for name in [
+            "XCL_SHADER_BACKEND", "XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_X64_ALL_MASKS",
+            "XCL_WAVE64_SPIN", "XCL_HLSL_COMMENTS", "XCL_DS_VALIDATE", "XCL_SAFE_BARRIER",
+            "XCL_DEBUG_MAGENTA", "XCL_DEBUG_LOD0", "XCL_DEBUG_PS_SUB", "XCL_DEBUG_PS_EXPR",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                opts.bytes(name.as_bytes());
+                opts.bytes(value.as_encoded_bytes());
+            }
+            opts.bytes(&[0]);
+        }
+        let (windows, cs, ps, opts) = (pso::mem_windows(), super::wave32_only(device) as u8, super::graphics_wave32(device) as u8, opts.0);
+        Some(dir().join(format!("mesh-v1-{}-{era:016x}-{opts:016x}-w{windows}-c{cs}-p{ps}-n{native:?}-a{sdk}", env!("CARGO_PKG_VERSION"))))
+    }
+
+    fn blob_stamp(path: &Path) -> Option<(u64, u128)> {
+        let m = std::fs::metadata(path).ok()?;
+        if !m.is_file() || m.len() == 0 {
+            return None;
+        }
+        let modified = m.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
+        Some((m.len(), modified))
+    }
+
+    pub(super) fn mesh_covered(dir: &Path, key: u64) -> bool {
+        let Some((note, cache)) = load(&dir.join(format!("{key:016x}.key"))).zip(dir.parent()) else { return false };
+        let Ok(note) = std::str::from_utf8(&note) else { return false };
+        let matches = |line: &str, prefix: char| {
+            let Some((name, rest)) = line.split_once(' ') else { return false };
+            let Some((len, modified)) = rest.split_once(' ') else { return false };
+            if !name.starts_with(prefix) || !name.ends_with(".pso") || Path::new(name).file_name().is_none_or(|f| f != name) {
+                return false;
+            }
+            blob_stamp(&cache.join(name)).is_some_and(|(n, m)| len.parse() == Ok(n) && modified.parse() == Ok(m))
+        };
+        let mut lines = note.lines();
+        lines.next().is_some_and(|line| matches(line, 's'))
+            && lines.next().is_none_or(|line| matches(line, 'm'))
+            && lines.next().is_none()
+    }
+
+    pub(super) fn note_mesh_coverage(dir: &Path, key: u64, blobs: &[PathBuf]) {
+        let mut note = String::new();
+        for b in blobs {
+            let Some((name, (len, modified))) = b.file_name().and_then(|n| n.to_str()).zip(blob_stamp(b)) else { return };
+            use std::fmt::Write;
+            let _ = writeln!(&mut note, "{name} {len} {modified}");
+        }
+        let _ = write(&dir.join(format!("{key:016x}.key")), note.as_bytes());
+    }
+
+    fn dir() -> PathBuf {
+        crate::gpu::recomp::dxc::cache_dir().join("driver").join(super::DRIVER.get().map_or("unknown", String::as_str))
+    }
+
+    /// FNV-1a 64, fed field by field (the padding of the title's structures is not read).
+    struct Fnv(u64);
+
+    impl Fnv {
+        fn bytes(&mut self, b: &[u8]) {
+            for &x in b {
+                self.0 = (self.0 ^ x as u64).wrapping_mul(0x100_0000_01b3);
+            }
+        }
+
+        fn n(&mut self, v: impl Into<i64>) {
+            self.bytes(&v.into().to_le_bytes());
+        }
+
+        unsafe fn shader(&mut self, b: &D3D12_SHADER_BYTECODE) {
+            let bytes = super::shader_bytes(b).unwrap_or_default();
+            self.n(bytes.len() as i64);
+            self.n(crate::gpu::shader::fnv64(bytes) as i64);
+        }
+
+        fn samplers(&mut self, samplers: &[StaticSampler]) {
+            self.n(samplers.len() as i64);
+            for (w, cmp) in samplers {
+                w.iter().for_each(|&v| self.n(v));
+                self.n(*cmp as i32);
+            }
+        }
+
+        unsafe fn input_layout(&mut self, il: &D3D12_INPUT_LAYOUT_DESC) {
+            let elems = if il.NumElements > 0 && !il.pInputElementDescs.is_null() { std::slice::from_raw_parts(il.pInputElementDescs, il.NumElements as usize) } else { &[] };
+            self.n(elems.len() as i64);
+            for e in elems {
+                if !e.SemanticName.is_null() {
+                    self.bytes(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_bytes());
+                }
+                self.bytes(&[0]);
+                for v in [e.SemanticIndex as i32, e.Format.0, e.InputSlot as i32, e.AlignedByteOffset as i32, e.InputSlotClass.0, e.InstanceDataStepRate as i32] {
+                    self.n(v);
+                }
+            }
+        }
+    }
+
+    /// The file of pipeline stream `stream` as the driver gets it – each shader by its bytes,
+    /// the input layout by its elements, the other state as it is – with the static samplers
+    /// `samplers` (its root signature). None: one with stream output or view instancing (state
+    /// behind pointers not kept in the name), or a stream that does not parse.
+    pub unsafe fn stream_path(stream: &[u8], samplers: &[StaticSampler]) -> Option<PathBuf> {
+        if !on() {
+            return None;
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        h.bytes(b"stream");
+        h.samplers(samplers);
+        for (ty, payload) in super::stream_subobjects(stream)? {
+            h.n(ty as i64);
+            match ty {
+                0 | 19 => {}
+                1..=6 | 24 | 25 => h.shader(&payload.as_ptr().cast::<D3D12_SHADER_BYTECODE>().read_unaligned()),
+                12 => h.input_layout(&payload.as_ptr().cast::<D3D12_INPUT_LAYOUT_DESC>().read_unaligned()),
+                7 | 22 => return None,
+                _ => h.bytes(payload),
+            }
+        }
+        Some(dir().join(format!("s{:016x}.pso", h.0)))
+    }
+
+    /// The file of graphics pipeline `d` as the driver gets it – its shaders, fixed-function
+    /// state, input layout, formats and flags – with the static samplers `samplers` (its root
+    /// signature). None: one with stream output (not kept).
+    pub unsafe fn graphics_name(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, samplers: &[StaticSampler]) -> Option<String> {
+        if d.StreamOutput.NumEntries != 0 {
+            return None;
+        }
+        let mut h = Fnv(0xcbf2_9ce4_8422_2325);
+        for s in [&d.VS, &d.PS, &d.DS, &d.HS, &d.GS] {
+            h.shader(s);
+        }
+        h.samplers(samplers);
+        let b = &d.BlendState;
+        h.n(b.AlphaToCoverageEnable.0);
+        h.n(b.IndependentBlendEnable.0);
+        for t in &b.RenderTarget {
+            for v in [t.BlendEnable.0, t.LogicOpEnable.0, t.SrcBlend.0, t.DestBlend.0, t.BlendOp.0, t.SrcBlendAlpha.0, t.DestBlendAlpha.0, t.BlendOpAlpha.0, t.LogicOp.0, t.RenderTargetWriteMask as i32] {
+                h.n(v);
+            }
+        }
+        h.n(d.SampleMask);
+        let r = &d.RasterizerState;
+        for v in [r.FillMode.0, r.CullMode.0, r.FrontCounterClockwise.0, r.DepthBias, r.DepthBiasClamp.to_bits() as i32, r.SlopeScaledDepthBias.to_bits() as i32, r.DepthClipEnable.0, r.MultisampleEnable.0, r.AntialiasedLineEnable.0, r.ForcedSampleCount as i32, r.ConservativeRaster.0] {
+            h.n(v);
+        }
+        let z = &d.DepthStencilState;
+        for v in [z.DepthEnable.0, z.DepthWriteMask.0, z.DepthFunc.0, z.StencilEnable.0, z.StencilReadMask as i32, z.StencilWriteMask as i32] {
+            h.n(v);
+        }
+        for f in [&z.FrontFace, &z.BackFace] {
+            for v in [f.StencilFailOp.0, f.StencilDepthFailOp.0, f.StencilPassOp.0, f.StencilFunc.0] {
+                h.n(v);
+            }
+        }
+        h.input_layout(&d.InputLayout);
+        for v in [d.IBStripCutValue.0, d.PrimitiveTopologyType.0, d.NumRenderTargets as i32] {
+            h.n(v);
+        }
+        d.RTVFormats.iter().for_each(|f| h.n(f.0));
+        for v in [d.DSVFormat.0, d.SampleDesc.Count as i32, d.SampleDesc.Quality as i32, d.NodeMask as i32, d.Flags.0] {
+            h.n(v);
+        }
+        Some(format!("g{:016x}.pso", h.0))
+    }
+
+    pub unsafe fn graphics_path(d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, samplers: &[StaticSampler]) -> Option<PathBuf> {
+        if !on() {
+            return None;
+        }
+        Some(dir().join(graphics_name(d, samplers)?))
+    }
+
+    /// Make a pipeline through the blob kept at `p`: `create(Some(blob))` when there is one
+    /// (a blob the driver refuses – another driver, adapter or root signature, a damaged file –
+    /// is dropped), else `create(None)`, the driver's own compile. The blob of a compile that
+    /// took `KEEP` or longer is kept for the next run (`blob_of`, asked only then).
+    /// Returns (the driver's result, made from the kept blob).
+    pub fn build(p: Option<&Path>, mut create: impl FnMut(Option<&[u8]>) -> HRESULT, blob_of: impl FnOnce() -> Option<Vec<u8>>) -> (HRESULT, bool) {
+        if let Some(blob) = p.and_then(load) {
+            let hr = create(Some(&blob));
+            note(hr >= 0, p);
+            if hr >= 0 {
+                return (hr, true);
+            }
+        }
+        let started = std::time::Instant::now();
+        let hr = create(None);
+        let took = started.elapsed();
+        if let (true, Some(p)) = (hr >= 0 && took >= KEEP, p) {
+            if let Some(b) = blob_of() {
+                keep(p, &b, took);
+            }
+        }
+        (hr, false)
+    }
+
+    /// What follows a blob in its file: its length, its hash, then this tag. A blob cut short or
+    /// changed on disk is not handed to the driver (an NVIDIA driver aborted the process reading
+    /// a bad module: "Invalid record").
+    const TAG: &[u8; 8] = b"xclblob1";
+
+    /// The blob kept at `p`, checked: one failing its length or hash is deleted (None, the
+    /// program is compiled again). A file without the tag, kept before it, is taken as it is.
+    pub fn load(p: &Path) -> Option<Vec<u8>> {
+        let mut b = std::fs::read(p).ok().filter(|b| !b.is_empty())?;
+        if !b.ends_with(TAG) {
+            return Some(b);
+        }
+        let at = b.len().checked_sub(24)?;
+        let word = |k: usize| u64::from_le_bytes(b[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
+        if word(0) != at as u64 || word(1) != crate::gpu::shader::fnv64(&b[..at]) {
+            let _ = std::fs::remove_file(p);
+            if CORRUPT.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_warn!("D3D12.X: a driver blob kept on disk failed its length / hash check (cut short?) – deleted, its program is compiled again");
+            }
+            return None;
+        }
+        b.truncate(at);
+        Some(b)
+    }
+
+    /// blobs on disk that failed their check (`load`)
+    static CORRUPT: AtomicU64 = AtomicU64::new(0);
+
+    /// Delete the blobs whose DXIL (hash, length) is not in `current`, the translations on disk:
+    /// a translator change left them. (count, bytes) deleted; none when `current` is empty.
+    pub fn prune(current: &std::collections::HashSet<(u64, usize)>) -> (usize, u64) {
+        let Some(dir) = path(&[], 0).and_then(|p| p.parent().map(Path::to_path_buf)) else { return (0, 0) };
+        if current.is_empty() {
+            return (0, 0);
+        }
+        let mut pruned = (0, 0);
+        for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let mut parts = name.strip_suffix(".pso").unwrap_or("").split('-');
+            let (Some(Ok(hash)), Some(Ok(len))) = (parts.next().map(|h| u64::from_str_radix(h, 16)), parts.next().map(|l| usize::from_str_radix(l, 16))) else { continue };
+            if !current.contains(&(hash, len)) {
+                let bytes = e.metadata().map_or(0, |m| m.len());
+                if std::fs::remove_file(e.path()).is_ok() {
+                    pruned = (pruned.0 + 1, pruned.1 + bytes);
+                }
+            }
+        }
+        pruned
+    }
+
+    /// A pipeline was made from a kept blob (`ok`), or the driver refused the blob: dropped.
+    pub fn note(ok: bool, p: Option<&Path>) {
+        if ok {
+            let n = HITS.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} pipelines made from the driver's blob of an earlier run (kept on disk)");
+            }
+        } else {
+            if let Some(p) = p {
+                let _ = std::fs::remove_file(p);
+            }
+            if STALE.fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("D3D12.X: a driver blob kept on disk was refused (another driver or adapter?) – such pipelines are compiled again");
+            }
+        }
+    }
+
+    /// `bytes` to `p`, under another name first: a run that is cut short leaves no half file.
+    pub fn write(p: &Path, bytes: &[u8]) -> bool {
+        if bytes.is_empty() {
+            return false;
+        }
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        static NEXT_TMP: AtomicU64 = AtomicU64::new(0);
+        let tmp = p.with_extension(format!("tmp{}-{}", std::process::id(), NEXT_TMP.fetch_add(1, Ordering::Relaxed)));
+        let mut file = Vec::with_capacity(bytes.len() + 24);
+        file.extend_from_slice(bytes);
+        file.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        file.extend_from_slice(&crate::gpu::shader::fnv64(bytes).to_le_bytes());
+        file.extend_from_slice(TAG);
+        let ok = std::fs::write(&tmp, &file).is_ok() && std::fs::rename(&tmp, p).is_ok();
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        ok
+    }
+
+    /// A compute pipeline went through the driver's compiler in the run: one `xcl warm-up`
+    /// did not build (or built for another driver), when it took the driver `KEEP` or more.
+    pub fn note_miss(dxil_len: usize, took: std::time::Duration) {
+        if took < KEEP {
+            return;
+        }
+        let n = MISSES.fetch_add(1, Ordering::Relaxed) + 1;
+        if n <= 20 || n.is_power_of_two() {
+            crate::xlog_warn!("D3D12.X: compute pipeline missed the warm driver cache ({dxil_len} B DXIL, {} ms in the driver; #{n})", took.as_millis());
+        }
+    }
+
+    /// Keep `blob`, of a build that took `took`, for the next run.
+    pub fn keep(p: &Path, blob: &[u8], took: std::time::Duration) {
+        if took >= KEEP && write(p, blob) {
+            let n = STORED.fetch_add(1, Ordering::Relaxed) + 1;
+            if n.is_power_of_two() {
+                crate::xlog_info!("D3D12.X: {n} driver blobs kept on disk for the next run (this one: {} ms, {} KB)", took.as_millis(), blob.len() >> 10);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_stream_is_named_after_its_shader_bytes_not_where_they_are() {
+            use super::super::{StreamOut, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE};
+            let named = |code: &[u8], samplers: &[StaticSampler]| {
+                let mut out = StreamOut::default();
+                out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, code);
+                out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+                unsafe { stream_path(&out.0, samplers) }.unwrap()
+            };
+            let (a, b, c) = (vec![1u8; 64], vec![1u8; 64], vec![2u8; 64]);
+            assert_eq!(named(&a, &[]), named(&b, &[]));
+            assert_ne!(named(&a, &[]), named(&c, &[]));
+            assert!(named(&a, &[]).file_name().unwrap().to_string_lossy().starts_with('s'));
+        }
+
+        #[test]
+        fn a_file_is_named_after_its_dxil_and_flags() {
+            assert_eq!(name(b"abc", 0), name(b"abc", 0));
+            assert_ne!(name(b"abc", 0), name(b"abd", 0));
+            assert_ne!(name(b"abc", 0), name(b"abc", 1));
+            // (the length is in the name: two programs of one hash and different lengths differ)
+            assert!(name(&[0u8; 0x1234], 2).ends_with("-1234-2.pso"));
+        }
+
+        #[test]
+        fn mesh_compute_blobs_are_keyed_by_dxil_and_samplers() {
+            let key = mesh_compute_path(b"cs", &[]).unwrap();
+            assert_eq!(mesh_compute_path(b"cs", &[]).as_ref(), Some(&key));
+            assert_ne!(path(b"cs", 0).as_ref(), Some(&key));
+            assert_ne!(mesh_compute_path(b"other cs", &[]).as_ref(), Some(&key));
+            assert_ne!(mesh_compute_path(b"cs", &[([1, 2, 3, 4], false)]).as_ref(), Some(&key));
+        }
+
+        #[test]
+        fn warm_mesh_blob_hits_never_call_the_driver() {
+            use super::super::{MeshBlobLocks, MeshWarmBuild, S_OK};
+            let dir = std::env::temp_dir().join(format!("xcl-warm-mesh-{}", std::process::id()));
+            let p = dir.join("mesh.pso");
+            assert!(write(&p, b"driver blob"));
+            let locks = MeshBlobLocks::default();
+            let mut warm = MeshWarmBuild { locks: &locks, built: false, blobs: Vec::new() };
+            let hr = unsafe { warm.blob(Some(&p), usize::MAX, "mesh", |_| panic!("called driver on a blob hit")) };
+            assert_eq!(hr, Ok(S_OK));
+            assert!(!warm.built);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn mesh_coverage_requires_every_unchanged_blob() {
+            let dir = std::env::temp_dir().join(format!("xcl-mesh-coverage-{}", std::process::id()));
+            let coverage = dir.join("coverage");
+            let (raster, compute) = (dir.join("sraster.pso"), dir.join("mcompute.pso"));
+            assert!(write(&raster, b"raster") && write(&compute, b"compute"));
+            note_mesh_coverage(&coverage, 1, &[raster.clone(), compute.clone()]);
+            note_mesh_coverage(&coverage, 2, &[raster.clone()]);
+            assert!(mesh_covered(&coverage, 1));
+            assert!(mesh_covered(&coverage, 2));
+            assert!(!mesh_covered(&coverage, 3));
+            assert!(write(&compute, b"changed compute"));
+            assert!(!mesh_covered(&coverage, 1));
+            assert!(mesh_covered(&coverage, 2));
+            note_mesh_coverage(&coverage, 1, &[raster.clone(), compute.clone()]);
+            std::fs::remove_file(&compute).unwrap();
+            assert!(!mesh_covered(&coverage, 1));
+            std::fs::remove_file(&raster).unwrap();
+            assert!(!mesh_covered(&coverage, 2));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_kept_blob_is_read_back_and_a_refused_one_is_dropped() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-test-{}", std::process::id()));
+            let p = dir.join("driver").join(name(b"program", 0));
+            assert_eq!(load(&p), None, "nothing kept yet");
+            assert!(!write(&p, &[]), "an empty blob is not kept");
+            keep(&p, &[1, 2, 3], std::time::Duration::from_millis(10));
+            assert_eq!(load(&p), None, "a build of milliseconds is not kept");
+            keep(&p, &[1, 2, 3], std::time::Duration::from_secs(1));
+            assert_eq!(load(&p).as_deref(), Some(&[1u8, 2, 3][..]));
+            // no half file under the temporary name
+            assert_eq!(std::fs::read_dir(p.parent().unwrap()).unwrap().count(), 1);
+            // the driver took the blob: it stays; it refused it: gone, the program is compiled again
+            note(true, Some(&p));
+            assert!(p.exists());
+            note(false, Some(&p));
+            assert_eq!(load(&p), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn a_blob_cut_short_or_changed_on_disk_is_not_used_and_one_kept_before_the_check_is() {
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-check-{}", std::process::id()));
+            let p = dir.join(name(b"program", 0));
+            let blob: Vec<u8> = (0..64u8).collect();
+            assert!(write(&p, &blob));
+            let kept = std::fs::read(&p).unwrap();
+            assert_eq!(load(&p).as_deref(), Some(&blob[..]));
+            std::fs::write(&p, &kept[..kept.len() - 1]).unwrap();
+            assert_eq!(load(&p).as_deref(), Some(&kept[..kept.len() - 1]), "no tag: a file kept before the check");
+            let mut changed = kept.clone();
+            changed[3] ^= 1;
+            std::fs::write(&p, &changed).unwrap();
+            assert_eq!(load(&p), None, "a changed blob");
+            assert!(!p.exists(), "deleted");
+            std::fs::write(&p, &kept[blob.len() / 2..]).unwrap();
+            assert_eq!(load(&p), None, "a blob cut short at its start");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        fn bytecode(b: &[u8]) -> D3D12_SHADER_BYTECODE {
+            D3D12_SHADER_BYTECODE { pShaderBytecode: b.as_ptr() as *const std::ffi::c_void, BytecodeLength: b.len() }
+        }
+
+        /// A graphics pipeline's file follows everything the driver compiles it from, and only that.
+        #[test]
+        fn a_graphics_file_is_named_after_the_shaders_state_layout_and_samplers() {
+            use windows::Win32::Graphics::Direct3D12::*;
+            use windows::Win32::Graphics::Dxgi::Common::*;
+            let (vs, ps, ps2) = (vec![1u8, 2, 3], vec![4u8, 5, 6], vec![4u8, 5, 7]);
+            let (pos, nrm) = (c"POSITION", c"NORMAL");
+            let elem = |name: &std::ffi::CStr| D3D12_INPUT_ELEMENT_DESC { SemanticName: windows::core::PCSTR(name.as_ptr() as *const u8), Format: DXGI_FORMAT_R32G32B32_FLOAT, ..Default::default() };
+            let layout = [elem(pos)];
+            let desc = |ps: &[u8]| {
+                let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+                d.VS = bytecode(&vs);
+                d.PS = bytecode(ps);
+                d.NumRenderTargets = 1;
+                d.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+                d.SampleDesc.Count = 1;
+                d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: layout.as_ptr(), NumElements: 1 };
+                d
+            };
+            let samplers = [([1u32, 2, 3, 4], false)];
+            unsafe {
+                let name = |d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, s: &[StaticSampler]| graphics_name(d, s).unwrap();
+                let base = name(&desc(&ps), &samplers);
+                assert_eq!(base, name(&desc(&ps.clone()), &samplers), "the bytes count, not where they are");
+                assert!(base.starts_with('g') && base.ends_with(".pso"));
+                assert_ne!(base, name(&desc(&ps2), &samplers), "another PS");
+                let mut d = desc(&ps);
+                d.PS = D3D12_SHADER_BYTECODE::default();
+                assert_ne!(base, name(&d, &samplers), "no PS");
+                assert_ne!(base, name(&desc(&ps), &[]), "another root signature");
+                assert_ne!(base, name(&desc(&ps), &[([1, 2, 3, 4], true)]), "another static sampler");
+                let mut d = desc(&ps);
+                d.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+                assert_ne!(base, name(&d, &samplers), "another target format");
+                let mut d = desc(&ps);
+                d.BlendState.RenderTarget[0].BlendEnable = true.into();
+                assert_ne!(base, name(&d, &samplers), "another blend");
+                let mut d = desc(&ps);
+                d.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+                assert_ne!(base, name(&d, &samplers), "another cull mode");
+                let mut d = desc(&ps);
+                d.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_EQUAL;
+                assert_ne!(base, name(&d, &samplers), "another stencil test");
+                let other = [elem(nrm)];
+                let mut d = desc(&ps);
+                d.InputLayout.pInputElementDescs = other.as_ptr();
+                assert_ne!(base, name(&d, &samplers), "another semantic");
+                let mut d = desc(&ps);
+                d.StreamOutput.NumEntries = 1;
+                assert_eq!(graphics_name(&d, &samplers), None, "stream output is not kept");
+            }
+        }
+
+        /// The second build of a slow pipeline comes from the blob its first build kept; a blob the
+        /// driver refuses (a damaged file here) is dropped and the pipeline compiled again; a fast
+        /// build keeps nothing and its blob is not asked for.
+        #[test]
+        fn a_slow_build_is_made_from_its_kept_blob_the_next_time() {
+            use std::cell::Cell;
+            let dir = std::env::temp_dir().join(format!("xcl-driver-cache-build-test-{}", std::process::id()));
+            let p = dir.join("driver").join("g0000000000000001.pso");
+            let compiles = Cell::new(0);
+            let blob = vec![9u8, 8, 7];
+            let slow = |b: Option<&[u8]>| match b {
+                Some(b) if b == blob.as_slice() => 0,
+                Some(_) => super::super::E_INVALIDARG,
+                None => {
+                    compiles.set(compiles.get() + 1);
+                    std::thread::sleep(KEEP + std::time::Duration::from_millis(20));
+                    0
+                }
+            };
+            assert_eq!(build(Some(&p), slow, || Some(blob.clone())), (0, false), "the first build compiles");
+            assert_eq!(compiles.get(), 1);
+            assert_eq!(load(&p).as_deref(), Some(blob.as_slice()), "and keeps its blob");
+            assert_eq!(build(Some(&p), slow, || panic!("a build from the blob keeps nothing")), (0, true), "the second is made from it");
+            assert_eq!(compiles.get(), 1, "without a compile");
+            std::fs::write(&p, b"damaged").unwrap();
+            assert_eq!(build(Some(&p), slow, || Some(blob.clone())), (0, false), "a refused blob: compiled");
+            assert_eq!(compiles.get(), 2);
+            assert_eq!(load(&p).as_deref(), Some(blob.as_slice()), "and the good blob kept in its place");
+            // a build of milliseconds: nothing kept, its blob not asked for
+            let q = dir.join("driver").join("g0000000000000002.pso");
+            assert_eq!(build(Some(&q), |_| 0, || panic!("not asked for a fast build")), (0, false));
+            assert_eq!(load(&q), None);
+            // a failed build keeps nothing; no file: as before
+            assert_eq!(build(Some(&q), |_| super::super::E_INVALIDARG, || panic!("not asked for a failed build")).0, super::super::E_INVALIDARG);
+            assert_eq!(build(None, |b| if b.is_none() { 0 } else { -1 }, || None), (0, false));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+}
+
+/// The driver's compiled form of translated compute programs (`GetCachedBlob`),
+/// by (DXIL hash, root signature, flags), up to `COMPUTE_BLOBS_MAX` bytes in all.
+static COMPUTE_BLOBS: Mutex<Option<(HashMap<(u64, usize, i32), std::sync::Arc<Vec<u8>>>, usize)>> = Mutex::new(None);
+const COMPUTE_BLOBS_MAX: usize = 512 << 20;
+/// smaller programs compile in milliseconds: not kept
+const COMPUTE_BLOB_MIN_DXIL: usize = 16 << 10;
+
+fn compute_blob_key(dxil: &[u8], rs: usize, flags: i32) -> (u64, usize, i32) {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    dxil.hash(&mut h);
+    (h.finish(), rs, flags)
+}
+
+fn compute_blob(key: (u64, usize, i32)) -> Option<std::sync::Arc<Vec<u8>>> {
+    COMPUTE_BLOBS.lock().unwrap().as_ref().and_then(|(m, _)| m.get(&key).cloned())
+}
+
+fn forget_compute_blob(key: (u64, usize, i32)) {
+    if let Some((m, total)) = COMPUTE_BLOBS.lock().unwrap().as_mut() {
+        if let Some(b) = m.remove(&key) {
+            *total -= b.len();
+        }
+    }
+}
+
+#[cfg(test)]
+mod compute_blob_tests {
+    #[test]
+    fn duplicate_results_do_not_consume_the_compute_blob_budget() {
+        let mut cache = (super::HashMap::new(), 0);
+        let key = (7, 1, 0);
+        super::insert_compute_blob(&mut cache, key, vec![1, 2]);
+        super::insert_compute_blob(&mut cache, key, vec![3, 4, 5]);
+        assert_eq!(cache.1, 2);
+        assert_eq!(cache.0[&key].as_slice(), &[1, 2]);
+    }
+
+    #[test]
+    fn a_blob_is_found_only_for_the_same_program_root_signature_and_flags_and_is_forgotten() {
+        let dxil = vec![7u8; 1000];
+        let key = super::compute_blob_key(&dxil, 0x1000, 0);
+        assert_eq!(key, super::compute_blob_key(&dxil.clone(), 0x1000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x2000, 0));
+        assert_ne!(key, super::compute_blob_key(&dxil, 0x1000, 1));
+        let mut other = dxil.clone();
+        other[999] = 8;
+        assert_ne!(key, super::compute_blob_key(&other, 0x1000, 0));
+        {
+            let mut g = super::COMPUTE_BLOBS.lock().unwrap();
+            let (m, total) = g.get_or_insert_with(|| (super::HashMap::new(), 0));
+            m.insert(key, std::sync::Arc::new(vec![1, 2, 3]));
+            *total += 3;
+        }
+        assert_eq!(super::compute_blob(key).as_deref().map(|v| v.len()), Some(3));
+        let before = super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1;
+        super::forget_compute_blob(key);
+        assert!(super::compute_blob(key).is_none());
+        assert_eq!(super::COMPUTE_BLOBS.lock().unwrap().as_ref().unwrap().1, before - 3);
+    }
+}
+
+/// The driver's blob of the adopted pipeline state `pso` (its PC `GetCachedBlob` through
+/// `orig_fn`); None: none, or empty.
+unsafe fn pso_blob(pso: *mut c_void) -> Option<Vec<u8>> {
+    if pso.is_null() || !is_adopted(pso) {
+        return None;
+    }
+    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+    let mut raw = std::ptr::null_mut();
+    if get(pso, &mut raw) < 0 || raw.is_null() {
+        return None;
+    }
+    let blob = ID3DBlob::from_raw(raw);
+    let bytes = std::slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()).to_vec();
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+/// The driver's blob of the PSO just built (adopted: its PC `GetCachedBlob` through `orig_fn`).
+unsafe fn keep_compute_blob(key: (u64, usize, i32), pso: *mut c_void, dxil_len: usize) {
+    if dxil_len < COMPUTE_BLOB_MIN_DXIL || pso.is_null() || !is_adopted(pso) || compute_blob(key).is_some() {
+        return;
+    }
+    type GetBlob = unsafe extern "system" fn(*mut c_void, *mut *mut c_void) -> HRESULT;
+    let get: GetBlob = std::mem::transmute(orig_fn(pso, slot_of(pso, "GetCachedBlob")));
+    let mut raw = std::ptr::null_mut();
+    if get(pso, &mut raw) < 0 || raw.is_null() {
+        return;
+    }
+    let blob = ID3DBlob::from_raw(raw);
+    let len = blob.GetBufferSize();
+    let ptr = blob.GetBufferPointer() as *const u8;
+    if len == 0 || len > COMPUTE_BLOBS_MAX || ptr.is_null() {
+        return;
+    }
+    let bytes = std::slice::from_raw_parts(ptr, len).to_vec();
+    let mut g = COMPUTE_BLOBS.lock().unwrap();
+    insert_compute_blob(g.get_or_insert_with(|| (HashMap::new(), 0)), key, bytes);
+}
+
+fn insert_compute_blob(
+    (entries, total): &mut (HashMap<(u64, usize, i32), Arc<Vec<u8>>>, usize),
+    key: (u64, usize, i32),
+    bytes: Vec<u8>,
+) {
+    if bytes.is_empty() || bytes.len() > COMPUTE_BLOBS_MAX.saturating_sub(*total) {
+        return;
+    }
+    if let std::collections::hash_map::Entry::Vacant(entry) = entries.entry(key) {
+        *total += bytes.len();
+        entry.insert(Arc::new(bytes));
+    }
+}
+
+struct GraphicsShaders {
+    vs: Vec<u8>,
+    ps: Option<Vec<u8>>,
+    samplers: Vec<crate::gpu::recomp::pso::StaticSampler>,
+}
+
+unsafe fn translate_graphics_stages(this: *mut c_void, vs: &[u8], ps: Option<&[u8]>) -> Option<GraphicsShaders> {
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
+    // a GPU that can run 32-lane waves may run a wave64 VS / PS in waves of 32 (the driver
+    // picks; RDNA2 does for pixel shaders): the lanes 32..63 it reads come from `upper_lanes`
+    // (split_wave64)
+    let split = graphics_wave32(this);
+    let _translating = crate::progress::TRANSLATIONS.begin();
+    let vs_c = match console_to_dxil_for(vs, Stage::Vertex, 0, split) {
+        Ok(b) => b,
+        Err(e) => {
+            note_translation_error(format!("VS {:016x}: {e}", crate::gpu::shader::fnv64(vs)));
+            return None;
+        }
+    };
+    let mut samplers = vs_c.samplers;
+    let vs_dxil = vs_c.dxil;
+    let ps_dxil = match ps {
+        Some(p) if is_console(p) => match console_to_dxil_for(p, Stage::Pixel, samplers.len() as u32, split) {
+            Ok(b) => {
+                samplers.extend(b.samplers);
+                Some(b.dxil)
+            }
+            Err(e) => {
+                note_translation_error(format!("PS {:016x}: {e}", crate::gpu::shader::fnv64(p)));
+                return None;
+            }
+        },
+        Some(p) => Some(p.to_vec()),
+        None => None,
+    };
+    Some(GraphicsShaders { vs: vs_dxil, ps: ps_dxil, samplers })
+}
+
+fn note_translated_graphics(pso: *mut c_void, rs: *mut c_void) -> u64 {
+    note_pso_rs(pso, rs);
+    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso as usize);
+    TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed)
+}
+
 unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+    use crate::gpu::recomp::pso::is_console;
     if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
         return None;
     }
@@ -2780,35 +5690,30 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
         let _ = f;
         return Some(translated_gs_pso(this, d, vs, gs, riid, ppv));
     }
-    let vs_c = match console_to_dxil(vs, Stage::Vertex, 0) {
-        Ok(b) => b,
-        Err(e) => {
-            note_translation_error(format!("VS: {e}"));
-            return None;
-        }
-    };
-    let mut samplers = vs_c.samplers;
-    let vs_dxil = vs_c.dxil;
-    let ps_dxil = match shader_bytes(&d.PS) {
-        Some(p) if is_console(p) => match console_to_dxil(p, Stage::Pixel, samplers.len() as u32) {
-            Ok(b) => {
-                samplers.extend(b.samplers);
-                Some(b.dxil)
-            }
-            Err(e) => {
-                note_translation_error(format!("PS: {e}"));
-                return None;
-            }
-        },
-        Some(p) => Some(p.to_vec()),
-        None => None,
-    };
+    // made when first used (`pso_async::lazy`): not even translated now
+    if super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
+        return None;
+    }
+    let translating = std::time::Instant::now();
+    let GraphicsShaders { vs: vs_dxil, ps: ps_dxil, samplers } = translate_graphics_stages(this, vs, shader_bytes(&d.PS))?;
+    let translated = translating.elapsed();
     let rs = abi_rs_for(this, &samplers)?;
     let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(d);
     copy.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
     copy.VS = bytecode(&vs_dxil);
-    copy.PS = ps_dxil.as_deref().map(bytecode).unwrap_or_default();
+    copy.PS = ps_dxil.as_ref().map(|ps| bytecode(ps)).unwrap_or_default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    // a rect list pipeline: the fourth corner of each rect comes from a generated GS; without
+    // it each rect is drawn as the triangle of its three vertices
+    let rect_gs = if d.PrimitiveTopologyType.0 == RECT_LIST_TYPE && copy.GS.pShaderBytecode.is_null() {
+        rect_list_gs(vs, shader_bytes(&d.PS)).map_err(|e| note_translation_error(format!("PS {:016x}: rect list drawn as triangles: {e}", shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64)))).ok()
+    } else {
+        None
+    };
+    if let Some(gs) = &rect_gs {
+        copy.GS = bytecode(gs);
+    }
+    pc_topology_type(&mut copy);
     let ps_hash = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
     if debug_pso_switch("XCL_DEBUG_NO_STENCIL", ps_hash) {
         copy.DepthStencilState.StencilEnable = false.into();
@@ -2816,14 +5721,62 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     if debug_pso_switch("XCL_DEBUG_NO_CULL", ps_hash) {
         copy.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
     }
-    let hr = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let dxil_len = vs_dxil.len() + ps_dxil.as_ref().map_or(0, |ps| ps.len());
+    // the driver's blob of an earlier run's build, when one is kept (`driver_cache`); a blob is
+    // kept only of a build that kept its rect list GS (one made again without it is another
+    // pipeline than its name says)
+    let disk = driver_cache::graphics_path(&copy, &samplers);
+    let from_blob = disk.as_deref().is_some_and(std::path::Path::is_file);
+    let asked = std::time::Instant::now();
+    let slot = match (dxil_len >= BIG_DRIVER_COMPILE && !from_blob).then(|| driver_slot(dxil_len, false, || format!("PS {ps_hash:016x}"))) {
+        Some(Err(_)) => return None,
+        Some(Ok(slot)) => Some(slot),
+        None => None,
+    };
+    let (driving, waited) = (std::time::Instant::now(), asked.elapsed());
+    let gs = copy.GS.pShaderBytecode;
+    let kept_gs = std::cell::Cell::new(true);
+    let (hr, _) = driver_cache::build(
+        disk.as_deref(),
+        |blob| {
+            copy.CachedPSO = blob.map_or_else(D3D12_CACHED_PIPELINE_STATE::default, |b| D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
+            let hr = retry_without_rect_gs(&mut copy, rect_gs.is_some() && blob.is_none(), (crate::gpu::shader::fnv64(vs), ps_hash), |c| finish_pso(this, f, c as *const _ as *const c_void, riid, ppv));
+            copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+            kept_gs.set(copy.GS.pShaderBytecode == gs);
+            hr
+        },
+        || if kept_gs.get() && !ppv.is_null() { pso_blob(*ppv) } else { None },
+    );
+    drop(slot);
+    super::pso_async::note_build(|| {
+        format!(
+            "VS {:016x} {} B, PS {ps_hash:016x} {} B of DXIL; translation {} ms, slot wait {} ms, driver {} ms{}",
+            crate::gpu::shader::fnv64(vs),
+            vs_dxil.len(),
+            ps_dxil.as_ref().map_or(0, |ps| ps.len()),
+            translated.as_millis(),
+            waited.as_millis(),
+            driving.elapsed().as_millis(),
+            if from_blob { " (a driver blob kept on disk)" } else { "" }
+        )
+    });
     if hr < 0 {
-        note_translation_error(format!("the driver rejected the PSO with the translated shaders ({hr:#x})"));
+        note_translation_error(format!(
+            "PS {ps_hash:016x}: the driver rejected the PSO with the translated shaders ({hr:#x}; topology type {}, {} render targets, DSV format {}, HS {}, GS {})",
+            copy.PrimitiveTopologyType.0,
+            copy.NumRenderTargets,
+            copy.DSVFormat.0,
+            !copy.HS.pShaderBytecode.is_null(),
+            !copy.GS.pShaderBytecode.is_null()
+        ));
         return None;
     }
-    let n = TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
-    note_pso_rs(*ppv, rs);
-    TRANSLATED_GRAPHICS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    if ppv.is_null() || (*ppv).is_null() {
+        return Some(hr);
+    }
+    let n = note_translated_graphics(*ppv, rs);
+    note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
+    super::markers::note_graphics(*ppv as usize, crate::gpu::shader::fnv64(vs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64));
     if super::present::trace_frame() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
@@ -2892,14 +5845,45 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
 /// The root signature pointer is kept as is (the translated paths replace it).
 #[allow(dead_code)] // the vectors only keep the copies alive
 enum OwnedDesc {
-    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Vec<u8>>),
-    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Vec<u8>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
-    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Vec<u8>>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>, Vec<Arc<Vec<u8>>>),
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>, Vec<Arc<Vec<u8>>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
+    Stream(Box<[usize; 2]>, Vec<u8>, Vec<Arc<Vec<u8>>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
 }
 
 unsafe impl Send for OwnedDesc {}
+// read only once made: a fast-tier and a full build of one pipeline may read it at once
+unsafe impl Sync for OwnedDesc {}
+
+/// A hash of a pipeline's shaders in their order (never 0): what `pso_async` knows a used
+/// pipeline by in the next run.
+fn shaders_key(blobs: &[Arc<Vec<u8>>]) -> u64 {
+    super::pso_manifest::shaders_key(blobs.iter().map(|b| crate::gpu::shader::fnv64(b)))
+}
+
+#[cfg(test)]
+mod shaders_key_tests {
+    #[test]
+    fn a_key_follows_the_shaders_and_their_order_and_is_never_zero() {
+        use std::sync::Arc;
+        let (a, b) = (Arc::new(vec![1u8, 2, 3]), Arc::new(vec![4u8, 5]));
+        let key = super::shaders_key(&[a.clone(), b.clone()]);
+        assert_eq!(key, super::shaders_key(&[a.clone(), b.clone()]));
+        assert_ne!(key, super::shaders_key(&[b.clone(), a.clone()]));
+        assert_ne!(key, super::shaders_key(&[a.clone()]));
+        assert_ne!(key, super::shaders_key(&[a, Arc::new(vec![4u8, 6])]));
+        assert_ne!(super::shaders_key(&[]), 0);
+    }
+}
 
 impl OwnedDesc {
+    fn shaders_key(&self) -> u64 {
+        shaders_key(match self {
+            OwnedDesc::Compute(_, b) => b,
+            OwnedDesc::Graphics(_, b, ..) => b,
+            OwnedDesc::Stream(_, _, b, ..) => b,
+        })
+    }
+
     fn ptr(&self) -> *const c_void {
         match self {
             OwnedDesc::Compute(d, _) => &**d as *const _ as *const c_void,
@@ -2907,14 +5891,153 @@ impl OwnedDesc {
             OwnedDesc::Stream(d, ..) => &**d as *const _ as *const c_void,
         }
     }
+
+    /// What `pso_manifest` keeps of it: the description with its pointers taken out, each console
+    /// shader with where it is pointed at, the input layout's elements and names.
+    fn record(&self, kind: super::pso_manifest::Kind) -> super::pso_manifest::Record {
+        use std::mem::offset_of;
+        fn bytes_of<T>(v: &T) -> Vec<u8> {
+            unsafe { std::slice::from_raw_parts(v as *const T as *const u8, std::mem::size_of::<T>()) }.to_vec()
+        }
+        fn zero(desc: &mut [u8], at: usize) {
+            desc[at..at + 8].fill(0);
+        }
+        let layout = |at: usize, elems: &[D3D12_INPUT_ELEMENT_DESC], names: &[std::ffi::CString]| {
+            (!elems.is_empty()).then(|| {
+                let elems = elems.iter().zip(names).map(|(e, n)| {
+                    let mut e = *e;
+                    e.SemanticName = PCSTR::null();
+                    (n.as_bytes().to_vec(), bytes_of(&e).try_into().unwrap())
+                });
+                (at as u32, elems.collect())
+            })
+        };
+        let shader_at = |offset: usize| offset + offset_of!(D3D12_SHADER_BYTECODE, pShaderBytecode);
+        match self {
+            OwnedDesc::Compute(d, blobs) => {
+                let mut desc = bytes_of(&**d);
+                let cs = shader_at(offset_of!(D3D12_COMPUTE_PIPELINE_STATE_DESC, CS));
+                zero(&mut desc, offset_of!(D3D12_COMPUTE_PIPELINE_STATE_DESC, pRootSignature));
+                zero(&mut desc, cs);
+                super::pso_manifest::Record { kind, desc, shaders: blobs.iter().map(|b| (cs as u32, b.clone())).take(1).collect(), layout: None }
+            }
+            OwnedDesc::Graphics(d, blobs, elems, names) => {
+                let mut desc = bytes_of(&**d);
+                zero(&mut desc, offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, pRootSignature));
+                let stages = [
+                    (offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, VS), &d.VS),
+                    (offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, PS), &d.PS),
+                    (offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, DS), &d.DS),
+                    (offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, HS), &d.HS),
+                    (offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, GS), &d.GS),
+                ];
+                let mut next = blobs.iter();
+                let mut shaders = Vec::new();
+                for (offset, stage) in stages {
+                    if !stage.pShaderBytecode.is_null() {
+                        if let Some(b) = next.next() {
+                            shaders.push((shader_at(offset) as u32, b.clone()));
+                        }
+                    }
+                    zero(&mut desc, shader_at(offset));
+                }
+                let elems_at = offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, InputLayout) + offset_of!(D3D12_INPUT_LAYOUT_DESC, pInputElementDescs);
+                zero(&mut desc, elems_at);
+                let so = offset_of!(D3D12_GRAPHICS_PIPELINE_STATE_DESC, StreamOutput);
+                zero(&mut desc, so + offset_of!(D3D12_STREAM_OUTPUT_DESC, pSODeclaration));
+                zero(&mut desc, so + offset_of!(D3D12_STREAM_OUTPUT_DESC, pBufferStrides));
+                super::pso_manifest::Record { kind, desc, shaders, layout: layout(elems_at, elems, names) }
+            }
+            OwnedDesc::Stream(_, buf, blobs, elems, names) => {
+                let mut desc = buf.clone();
+                let (mut shaders, mut elems_at) = (Vec::new(), None);
+                for (ty, at, _) in stream_fields(buf).unwrap_or_default() {
+                    // the stream's last payload may be 4 bytes at its very end (a sample mask)
+                    let Some(p) = buf.get(at..at + 8).map(|b| u64::from_le_bytes(b.try_into().unwrap()) as usize) else { continue };
+                    match ty {
+                        1..=6 | 24 | 25 => {
+                            if let Some(b) = blobs.iter().find(|b| b.as_ptr() as usize == p) {
+                                shaders.push((at as u32, b.clone()));
+                            }
+                            zero(&mut desc, at);
+                        }
+                        12 => {
+                            elems_at = Some(at);
+                            zero(&mut desc, at);
+                        }
+                        0 => zero(&mut desc, at),
+                        _ => {}
+                    }
+                }
+                let layout = elems_at.and_then(|at| layout(at, elems, names));
+                super::pso_manifest::Record { kind, desc, shaders, layout }
+            }
+        }
+    }
+
+    /// The description again from what `pso_manifest` kept (None: not one this XCL can read). Its
+    /// root signature is none: the translated paths give it theirs.
+    unsafe fn from_record(r: &super::pso_manifest::Record) -> Option<OwnedDesc> {
+        use super::pso_manifest::Kind;
+        fn put(desc: &mut [u8], at: u32, p: usize) -> Option<()> {
+            desc.get_mut(at as usize..at as usize + 8)?.copy_from_slice(&(p as u64).to_le_bytes());
+            Some(())
+        }
+        let mut desc = r.desc.clone();
+        let blobs: Vec<Arc<Vec<u8>>> = r.shaders.iter().map(|(_, b)| b.clone()).collect();
+        for (at, b) in &r.shaders {
+            put(&mut desc, *at, b.as_ptr() as usize)?;
+        }
+        let (mut elems, mut names) = (Vec::new(), Vec::new());
+        if let Some((_, kept)) = &r.layout {
+            for (name, e) in kept {
+                names.push(std::ffi::CString::new(name.clone()).ok()?);
+                let mut e: D3D12_INPUT_ELEMENT_DESC = std::ptr::read_unaligned(e.as_ptr() as *const D3D12_INPUT_ELEMENT_DESC);
+                e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
+                elems.push(e);
+            }
+            put(&mut desc, r.layout.as_ref().unwrap().0, elems.as_ptr() as usize)?;
+        }
+        fn read<T>(desc: &[u8]) -> Option<Box<T>> {
+            (desc.len() == std::mem::size_of::<T>()).then(|| Box::new(unsafe { std::ptr::read_unaligned(desc.as_ptr() as *const T) }))
+        }
+        Some(match r.kind {
+            Kind::Compute => OwnedDesc::Compute(read(&desc)?, blobs),
+            Kind::Graphics => OwnedDesc::Graphics(read(&desc)?, blobs, elems, names),
+            Kind::MeshStream | Kind::VertexStream => OwnedDesc::Stream(Box::new([desc.len(), desc.as_ptr() as usize]), desc, blobs, elems, names),
+        })
+    }
 }
 
-/// Copy a shader blob into `blobs` and point `b` at the copy.
-unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Vec<u8>>) {
+fn intern_shader_blob(bytes: &[u8]) -> Arc<Vec<u8>> {
+    #[derive(Default)]
+    struct Cache {
+        blobs: HashMap<(u64, usize), Weak<Vec<u8>>>,
+        inserts: u8,
+    }
+
+    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+    let key = (crate::gpu::shader::fnv64(bytes), bytes.len());
+    let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
+    if let Some(blob) = cache.blobs.get(&key).and_then(Weak::upgrade) {
+        if blob.as_slice() == bytes {
+            return blob;
+        }
+    }
+    cache.inserts = cache.inserts.wrapping_add(1);
+    if cache.inserts == 0 {
+        cache.blobs.retain(|_, blob| blob.strong_count() != 0);
+    }
+    let blob = Arc::new(bytes.to_vec());
+    cache.blobs.insert(key, Arc::downgrade(&blob));
+    blob
+}
+
+unsafe fn own_shader(b: &mut D3D12_SHADER_BYTECODE, blobs: &mut Vec<Arc<Vec<u8>>>) {
     if let Some(bytes) = shader_bytes(b) {
-        blobs.push(bytes.to_vec());
-        let v = blobs.last().unwrap();
-        *b = bytecode(v);
+        let blob = intern_shader_blob(bytes);
+        *b = bytecode(blob.as_slice());
+        blobs.push(blob);
     } else {
         *b = D3D12_SHADER_BYTECODE::default();
     }
@@ -2953,37 +6076,82 @@ unsafe fn own_graphics(desc: *const c_void) -> Option<OwnedDesc> {
     Some(OwnedDesc::Graphics(d, blobs, elems, names))
 }
 
-/// A pipeline state stream with its shaders copied. None when another subobject points at
-/// title memory (input layout, stream output, view instancing).
+/// A pipeline state stream with its shaders and input layout copied. None when another
+/// subobject points at title memory (stream output, view instancing).
 unsafe fn own_stream(desc: *const c_void) -> Option<OwnedDesc> {
     let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
     if !crate::gpu::shader::readable(base, size) {
         return None;
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
-    let mut blobs: Vec<Vec<u8>> = Vec::new();
-    let mut off = 0usize;
-    while off + 8 <= size {
-        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
-        let (psize, palign) = super::null::subobject_payload(ty)?;
-        let at = off + if palign == 8 { 8 } else { 4 };
+    let mut blobs = Vec::new();
+    let (mut elems, mut names) = (Vec::<D3D12_INPUT_ELEMENT_DESC>::new(), Vec::new());
+    for (ty, at, psize) in stream_fields(&buf)? {
         let word = |buf: &[u8], k: usize| u64::from_le_bytes(buf[at + 8 * k..at + 8 * k + 8].try_into().unwrap());
         match ty {
             1..=6 | 24 | 25 => {
                 let (p, n) = (word(&buf, 0) as usize, word(&buf, 1) as usize);
                 if p != 0 && n != 0 && crate::gpu::shader::readable(p, n) {
-                    blobs.push(std::slice::from_raw_parts(p as *const u8, n).to_vec());
-                    buf[at..at + 8].copy_from_slice(&(blobs.last().unwrap().as_ptr() as u64).to_le_bytes());
+                    let blob = intern_shader_blob(std::slice::from_raw_parts(p as *const u8, n));
+                    buf[at..at + 8].copy_from_slice(&(blob.as_ptr() as u64).to_le_bytes());
+                    blobs.push(blob);
                 }
             }
-            7 | 12 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
+            12 => {
+                let (p, n) = (word(&buf, 0) as usize, u32::from_le_bytes(buf[at + 8..at + 12].try_into().unwrap()) as usize);
+                if n != 0 {
+                    if !crate::gpu::shader::readable(p, n * std::mem::size_of::<D3D12_INPUT_ELEMENT_DESC>()) {
+                        return None;
+                    }
+                    elems = std::slice::from_raw_parts(p as *const D3D12_INPUT_ELEMENT_DESC, n).to_vec();
+                    for e in &mut elems {
+                        names.push(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char).to_owned());
+                        e.SemanticName = PCSTR(names.last().unwrap().as_ptr() as *const u8);
+                    }
+                    buf[at..at + 8].copy_from_slice(&(elems.as_ptr() as u64).to_le_bytes());
+                }
+            }
+            7 | 22 if buf[at..at + psize].iter().any(|&b| b != 0) => return None,
             19 => buf[at..at + 16].fill(0),
             _ => {}
         }
-        off += ((at - off) + psize + 7) & !7;
     }
     let d = Box::new([buf.len(), buf.as_ptr() as usize]);
-    Some(OwnedDesc::Stream(d, buf, blobs))
+    Some(OwnedDesc::Stream(d, buf, blobs, elems, names))
+}
+
+/// The subobjects of a pipeline state stream: (type, offset of its payload, payload size). None:
+/// a type this XCL does not know.
+fn stream_fields(buf: &[u8]) -> Option<Vec<(u32, usize, usize)>> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
+        let (psize, palign) = super::null::subobject_payload(ty)?;
+        let at = off + if palign == 8 { 8 } else { 4 };
+        if at + psize > buf.len() {
+            break;
+        }
+        out.push((ty, at, psize));
+        off += ((at - off) + psize + 7) & !7;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+#[test]
+fn owned_pipeline_shader_bytes_share_only_while_live() {
+    let a = intern_shader_blob(b"shared shader");
+    let b = intern_shader_blob(b"shared shader");
+    let c = intern_shader_blob(b"unique shader");
+    assert!(Arc::ptr_eq(&a, &b));
+    assert!(!Arc::ptr_eq(&a, &c));
+    let weak = Arc::downgrade(&a);
+    drop(a);
+    assert_eq!(b.as_slice(), b"shared shader");
+    drop(b);
+    assert!(weak.upgrade().is_none());
+    assert_eq!(intern_shader_blob(b"shared shader").as_slice(), b"shared shader");
 }
 
 /// Raw pointers a worker needs (the device lives for the process).
@@ -3003,6 +6171,7 @@ unsafe fn standin_graphics(this: *mut c_void, f: PsoFn, desc: *const c_void, rii
     copy.StreamOutput = std::mem::zeroed();
     copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
+    pc_topology_type(&mut copy);
     finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv)
 }
 
@@ -3014,7 +6183,13 @@ unsafe fn standin_compute(this: *mut c_void, f: PsoFn, desc: *const c_void, riid
 }
 
 unsafe fn standin_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    let Some((buf, _)) = fallback_stream(desc as *const u8) else { return E_INVALIDARG };
+    let Some((buf, _)) = fallback_stream(desc as *const u8) else {
+        static N: AtomicU64 = AtomicU64::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 3 {
+            crate::xlog_warn!("D3D12.X: a stand-in stream could not be made from the title's stream");
+        }
+        return E_INVALIDARG;
+    };
     let new_desc: [usize; 2] = [buf.len(), buf.as_ptr() as usize];
     finish_pso(this, f, new_desc.as_ptr() as *const c_void, riid, ppv)
 }
@@ -3026,11 +6201,12 @@ unsafe fn go_background(
     desc: *const c_void,
     riid: *const GUID,
     ppv: *mut *mut c_void,
-    compute: bool,
+    kind: super::pso_manifest::Kind,
     owned: OwnedDesc,
     standin: unsafe fn(*mut c_void, PsoFn, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT,
     build: unsafe fn(Dev, &OwnedDesc, *mut *mut c_void) -> bool,
 ) -> Option<HRESULT> {
+    let compute = kind == super::pso_manifest::Kind::Compute;
     let hr = standin(this, f, desc, riid, ppv);
     if hr < 0 || ppv.is_null() || (*ppv).is_null() {
         static ONCE: AtomicU64 = AtomicU64::new(0);
@@ -3040,18 +6216,34 @@ unsafe fn go_background(
         return None;
     }
     let dev = Dev(this as usize, f as usize);
-    super::pso_async::submit(
-        *ppv as usize,
-        compute,
-        Box::new(move || {
-            let mut out: *mut c_void = std::ptr::null_mut();
-            if unsafe { build(dev, &owned, &mut out) } && !out.is_null() {
-                out as usize
-            } else {
-                0
-            }
-        }),
-    );
+    let key = owned.shaders_key();
+    let kept = owned.record(kind);
+    let what = kept.shaders.iter().map(|(at, s)| format!("{} {:016x}", super::pso_manifest::stage_at(&kept, *at), crate::gpu::shader::fnv64(s))).collect::<Vec<_>>().join(" ");
+    super::pso_manifest::record(kept);
+    let (standin, built_from) = (*ppv as usize, what.clone());
+    let job: super::pso_async::Job = Box::new(move || {
+        let mut out: *mut c_void = std::ptr::null_mut();
+        take_last_note();
+        let started = std::time::Instant::now();
+        let built = unsafe { build(dev, &owned, &mut out) } && !out.is_null();
+        if !built {
+            note_untranslated(standin, format!("{built_from}: the background build failed: {}", take_last_note().unwrap_or_else(|| "no error noted".into())));
+        }
+        if let Some(name) = traced_pso(standin) {
+            let how = if built { "built".to_string() } else { why_untranslated(standin).unwrap_or_default() };
+            crate::xlog_info!("named pipeline '{name}' ({standin:#x}, {built_from}): {how} in {} ms", started.elapsed().as_millis());
+        }
+        if built {
+            out as usize
+        } else {
+            0
+        }
+    });
+    if super::pso_async::lazy() {
+        super::pso_async::submit_lazy_described(*ppv as usize, compute, job, key, what);
+    } else {
+        super::pso_async::submit_described(*ppv as usize, compute, job, what);
+    }
     Some(hr)
 }
 
@@ -3065,17 +6257,31 @@ unsafe fn build_compute(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool 
     matches!(translated_compute_pso(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), d.ptr(), &iid, out), Some(Ok(hr)) if hr >= 0)
 }
 
+unsafe fn build_vertex_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
+    let [size, base] = *d.ptr().cast::<[usize; 2]>();
+    let Some(subs) = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)) else { return false };
+    let shader = |ty: u32| subs.iter().find(|e| e.0 == ty && e.1[8..16] != [0; 8]).and_then(|e| payload_shader(e.1));
+    let Some(vs) = shader(1).filter(|vs| crate::gpu::recomp::pso::is_console(vs)) else { return false };
+    let iid = pc_iid(Kind::PipelineState);
+    translated_vertex_stream(dev.0 as *mut c_void, std::mem::transmute::<usize, PsoFn>(dev.1), &subs, vs, shader(2), &iid, out) >= 0
+}
+
 unsafe fn build_stream(dev: Dev, d: &OwnedDesc, out: *mut *mut c_void) -> bool {
     let iid = pc_iid(Kind::PipelineState);
-    matches!(translated_mesh_stream(dev.0 as *mut c_void, d.ptr(), &iid, out), Some(hr) if hr >= 0)
+    matches!(translated_mesh_stream(dev.0 as *mut c_void, d.ptr(), &iid, out, None), Some(hr) if hr >= 0)
 }
 
 pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    graphics_pso(this, desc, riid, ppv, false)
+}
+
+/// `dev_create_graphics_pso`; `stream`: the desc is a pipeline stream's (`stream_pipeline`).
+unsafe fn graphics_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, stream: bool) -> HRESULT {
     super::null::capture_graphics_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateGraphicsPipelineState")));
     let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_graphics_pso(this, f, desc, riid, ppv)) } else { (translated_graphics_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_graphics, build_graphics)) {
+        if let Some(hr) = own_graphics(desc).and_then(|o| go_background(this, f, desc, riid, ppv, super::pso_manifest::Kind::Graphics, o, standin_graphics, build_graphics)) {
             return hr;
         }
         if let Some(hr) = translated_graphics_pso(this, f, desc, riid, ppv) {
@@ -3084,21 +6290,23 @@ pub(super) unsafe extern "system" fn dev_create_graphics_pso(this: *mut c_void, 
     } else if let Some(hr) = translated {
         return hr;
     }
-    let hr = finish_pso(this, f, desc, riid, ppv);
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+    if !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return E_INVALIDARG;
+    }
+    let g = &*desc.cast::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>();
+    let console = [&g.VS, &g.PS, &g.DS, &g.HS, &g.GS].into_iter().any(|stage| {
+        shader_bytes(stage).is_some_and(crate::gpu::recomp::pso::is_console)
+    });
+    let hr = if console {
+        E_INVALIDARG
+    } else {
+        let pc = untranslated_stream_desc(desc, stream);
+        finish_pso(this, f, pc.as_ref().map_or(desc, |g| g as *const _ as *const c_void), riid, ppv)
+    };
+    if hr >= 0 {
         return hr;
     }
-    let d = dummy();
-    let mut copy: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
-    copy.VS = bytecode(&d.vs);
-    copy.PS = bytecode(&d.ps);
-    copy.DS = D3D12_SHADER_BYTECODE::default();
-    copy.HS = D3D12_SHADER_BYTECODE::default();
-    copy.GS = D3D12_SHADER_BYTECODE::default();
-    copy.StreamOutput = std::mem::zeroed();
-    copy.InputLayout = D3D12_INPUT_LAYOUT_DESC::default();
-    copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
-    let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    let hr2 = standin_graphics(this, f, desc, riid, ppv);
     note_fallback("graphics PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
@@ -3116,9 +6324,10 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    take_last_note();
     let (mut console, missed) = if super::pso_async::enabled() { attempt(|| translated_compute_pso(this, f, desc, riid, ppv)) } else { (translated_compute_pso(this, f, desc, riid, ppv), false) };
     if missed {
-        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, true, o, standin_compute, build_compute)) {
+        if let Some(hr) = own_compute(desc).and_then(|o| go_background(this, f, desc, riid, ppv, super::pso_manifest::Kind::Compute, o, standin_compute, build_compute)) {
             // a console program the worker is translating (its root signature comes with it);
             // the real PSO registers itself in TRANSLATED_COMPUTE once build_compute succeeds
             // (if build_compute fails, the stand-in stays unregistered so Dispatch /
@@ -3136,13 +6345,20 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     // a console shader the recompiler could not take must not reach the driver: AMD's shader
     // compiler crashes on the stripped DXIL (NOBC bitcode) instead of rejecting it
     let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
+    if hr >= 0 && !ppv.is_null() {
+        note_untranslated(*ppv as usize, "a PC compute shader (no console code to translate)".into());
+    }
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
     }
     let mut copy: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::ptr::read(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC);
+    let cs = shader_bytes(&copy.CS).map_or(0, crate::gpu::shader::fnv64);
     copy.CS = bytecode(&dummy().cs);
     copy.CachedPSO = D3D12_CACHED_PIPELINE_STATE::default();
     let hr2 = finish_pso(this, f, &copy as *const _ as *const c_void, riid, ppv);
+    if hr2 >= 0 && !ppv.is_null() {
+        note_untranslated(*ppv as usize, format!("CS {cs:016x}: {}", take_last_note().unwrap_or_else(|| format!("the driver rejected it ({hr:#x}), no translation error noted"))));
+    }
     note_fallback("compute PSO", hr, hr2 >= 0);
     if hr2 >= 0 {
         hr2
@@ -3190,6 +6406,26 @@ pub fn two_pass_count() -> usize {
     TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
 }
 
+/// Mesh pipelines whose mesh stage is the console program itself, as a host mesh shader
+/// (`pso::console_mesh_native`): translated graphics pipelines (`is_translated_graphics`) that a
+/// DispatchMesh or a mesh ExecuteIndirect runs as one PC call.
+static NATIVE_MESH: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+pub fn is_native_mesh(pso: usize) -> bool {
+    let pso = super::pso_async::resolve(pso);
+    pso != 0 && NATIVE_MESH.lock().unwrap().as_ref().is_some_and(|s| s.contains(&pso))
+}
+
+#[cfg(test)]
+pub(super) fn register_native_mesh_for_test(pso: usize) {
+    NATIVE_MESH.lock().unwrap().get_or_insert_with(HashSet::new).insert(pso);
+}
+
+/// (native, two-pass) mesh pipelines made so far, for the caches line
+pub fn mesh_pipeline_counts() -> (usize, usize) {
+    (NATIVE_MESH.lock().unwrap().as_ref().map_or(0, |s| s.len()), two_pass_count())
+}
+
 /// A pipeline state stream being written: subobjects aligned as D3D12 expects
 /// (type, payload at 4 or 8, size rounded to 8).
 #[derive(Default)]
@@ -3215,9 +6451,12 @@ impl StreamOut {
 
 /// The subobjects of a stream: (type, payload).
 fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
+    if buf.len() % 8 != 0 {
+        return None;
+    }
     let mut out = Vec::new();
     let mut off = 0usize;
-    while off + 8 <= buf.len() {
+    while off < buf.len() {
         let ty = u32::from_le_bytes(buf[off..off + 4].try_into().ok()?);
         let (psize, palign) = super::null::subobject_payload(ty)?;
         let poff = if palign == 8 { 8 } else { 4 };
@@ -3227,17 +6466,158 @@ fn stream_subobjects(buf: &[u8]) -> Option<Vec<(u32, &[u8])>> {
     Some(out)
 }
 
+/// The stream's subobjects up to the first of a type XCL does not know (logged): a console
+/// shader in front of it must still be found.
+fn known_subobjects(buf: &[u8]) -> Vec<(u32, &[u8])> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= buf.len() {
+        let ty = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        let Some((psize, palign)) = super::null::subobject_payload(ty) else {
+            static N: AtomicU64 = AtomicU64::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                crate::xlog_warn!("D3D12.X: pipeline stream: unknown subobject type {ty} at {off:#x} of {:#x} - the rest is not read", buf.len());
+            }
+            break;
+        };
+        let poff = if palign == 8 { 8 } else { 4 };
+        let Some(p) = buf.get(off + poff..off + poff + psize) else { break };
+        out.push((ty, p));
+        off += (poff + psize + 7) & !7;
+    }
+    out
+}
+
 unsafe fn payload_shader<'a>(p: &[u8]) -> Option<&'a [u8]> {
     let b = D3D12_SHADER_BYTECODE { pShaderBytecode: u64::from_le_bytes(p[0..8].try_into().ok()?) as usize as *const c_void, BytecodeLength: u64::from_le_bytes(p[8..16].try_into().ok()?) as usize };
     shader_bytes(&b)
 }
 
+unsafe fn translated_vertex_stream(this: *mut c_void, f: PsoFn, subs: &[(u32, &[u8])], vs: &[u8], ps: Option<&[u8]>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    const TOPOLOGY: u32 = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32;
+    let topology = subs.iter().find(|e| e.0 == TOPOLOGY).map(|e| i32::from_le_bytes(e.1[..4].try_into().unwrap()));
+    // as `translated_graphics_pso` does for a desc: a rect list's fourth corners come from the
+    // generated GS, and the topology type is one the PC has (`pc_topology_type`) – the console's
+    // rect list type (19) or none made the driver refuse the stream, and the title then skipped
+    // every draw with the pipeline (its full-screen passes and its UI)
+    let rect_gs = if topology == Some(RECT_LIST_TYPE) {
+        rect_list_gs(vs, ps).map_err(|e| note_translation_error(format!("PS {:016x}: rect list drawn as triangles: {e}", ps.map_or(0, crate::gpu::shader::fnv64)))).ok()
+    } else {
+        None
+    };
+    let pc_type = match topology {
+        Some(t @ 1..=4) => D3D12_PRIMITIVE_TOPOLOGY_TYPE(t),
+        _ => D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
+    };
+    let hashes = (crate::gpu::shader::fnv64(vs), ps.map_or(0, crate::gpu::shader::fnv64));
+    let translating = std::time::Instant::now();
+    let Some(GraphicsShaders { vs, ps, samplers }) = translate_graphics_stages(this, vs, ps) else { return E_INVALIDARG };
+    let translated = translating.elapsed();
+    let Some(rs) = abi_rs_for(this, &samplers) else { return E_INVALIDARG };
+    let stream = |gs: Option<&Vec<u8>>| {
+        let mut out = StreamOut::default();
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
+        out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+        if let Some(ps) = &ps {
+            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+        }
+        if let Some(gs) = gs {
+            out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, gs);
+        }
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &pc_type);
+        for &(ty, payload) in subs {
+            if !matches!(ty, 0 | 1 | 2 | TOPOLOGY | 19) {
+                let (_, align) = super::null::subobject_payload(ty).unwrap();
+                out.raw(ty, payload, align == 8);
+            }
+        }
+        out
+    };
+    let first = stream(rect_gs.as_ref());
+    // the driver's blob of an earlier run's build, when one is kept (`driver_cache`); the
+    // stream made again without the rect list GS is another pipeline: built without a blob
+    let disk = driver_cache::stream_path(&first.0, &samplers);
+    let from_blob = disk.as_deref().is_some_and(std::path::Path::is_file);
+    let driving = std::time::Instant::now();
+    let (mut hr, _) = driver_cache::build(disk.as_deref(), |blob| finish_stream(this, f, &first, blob, riid, ppv), || if ppv.is_null() { None } else { pso_blob(*ppv) });
+    let mut kept_gs = rect_gs.is_some();
+    if hr < 0 && kept_gs {
+        note_translation_error(format!("VS {:016x} PS {:016x}: the driver rejected the PSO with the rect list GS ({hr:#x}): rect list drawn as triangles", hashes.0, hashes.1));
+        hr = finish_stream(this, f, &stream(None), None, riid, ppv);
+        kept_gs = false;
+    }
+    super::pso_async::note_build(|| {
+        format!(
+            "stream VS {:016x} {} B, PS {:016x} {} B of DXIL; translation {} ms, driver {} ms{}",
+            hashes.0,
+            vs.len(),
+            hashes.1,
+            ps.as_ref().map_or(0, Vec::len),
+            translated.as_millis(),
+            driving.elapsed().as_millis(),
+            if from_blob { " (a driver blob kept on disk)" } else { "" }
+        )
+    });
+    if hr < 0 {
+        note_translation_error(format!("the driver rejected the graphics stream with translated shaders ({hr:#x}; console topology type {topology:?})"));
+    } else if !ppv.is_null() && !(*ppv).is_null() {
+        if kept_gs {
+            RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+        }
+        if super::present::trace_frame() {
+            PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, hashes);
+        }
+        super::markers::note_graphics(*ppv as usize, hashes.0, hashes.1);
+        let n = note_translated_graphics(*ppv, rs);
+        if n < 5 || n % 1000 == 0 {
+            crate::xlog_info!("D3D12.X: graphics PSO stream from translated console shaders (#{})", n + 1);
+        }
+    }
+    hr
+}
+
+/// Create the pipeline of `stream` (its RS and shaders in it), from the driver's blob `blob`
+/// when there is one.
+unsafe fn finish_stream(this: *mut c_void, f: PsoFn, stream: &StreamOut, blob: Option<&[u8]>, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let mut out = StreamOut(stream.0.clone());
+    if let Some(b) = blob {
+        out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr() as *const c_void, CachedBlobSizeInBytes: b.len() });
+    }
+    let desc = [out.0.len(), out.0.as_ptr() as usize];
+    finish_pso(this, f, desc.as_ptr().cast(), riid, ppv)
+}
+
+fn build_live_mesh_blob(path: Option<&std::path::Path>, len: usize, what: &'static str, mut create: impl FnMut(Option<&[u8]>) -> HRESULT, blob_of: impl FnOnce() -> Option<Vec<u8>>) -> Option<HRESULT> {
+    if super::pso_async::preparing() {
+        return None;
+    }
+    let mut deferred = false;
+    let (hr, _) = driver_cache::build(path, |blob| {
+        if blob.is_some() || len < BIG_DRIVER_COMPILE {
+            return create(blob);
+        }
+        if crate::gpu::recomp::dxc::defer() {
+            deferred = true;
+            return E_INVALIDARG;
+        }
+        let Ok(_slot) = driver_slot(len, false, || what.into()) else {
+            deferred = true;
+            return E_INVALIDARG;
+        };
+        create(None)
+    }, blob_of);
+    (!deferred).then_some(hr)
+}
+
 /// The console PS of a two-pass pipeline (a PC PS passes as it is).
 /// The PS of a two-pass pipeline (DXIL, static samplers – a PC PS passes as it is).
-fn two_pass_ps(ps: Option<&[u8]>) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
-    use crate::gpu::recomp::pso::{console_to_dxil, is_console, Stage};
+fn two_pass_ps(ps: Option<&[u8]>, split_wave64: bool) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::recomp::pso::StaticSampler>), String> {
+    use crate::gpu::recomp::pso::{console_to_dxil_for, is_console, Stage};
     match ps {
-        Some(p) if is_console(p) => console_to_dxil(p, Stage::Pixel, 0).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}")),
+        Some(p) if is_console(p) => {
+            let _translating = crate::progress::TRANSLATIONS.begin();
+            console_to_dxil_for(p, Stage::Pixel, 0, split_wave64).map(|c| (Some(c.dxil), c.samplers)).map_err(|e| format!("PS: {e}"))
+        }
         Some(p) => Ok((Some(p.to_vec()), Vec::new())),
         None => Ok((None, Vec::new())),
     }
@@ -3246,24 +6626,85 @@ fn two_pass_ps(ps: Option<&[u8]>) -> Result<(Option<Vec<u8>>, Vec<crate::gpu::re
 /// Create the mesh pipeline (`stream`, RS and shaders already in it) and the compute pass;
 /// the title gets the mesh pipeline state.
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+/// `mesh_samplers`: the static samplers of `mesh_rs`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu::recomp::pso::TwoPass, mesh_rs: *mut c_void, mesh_samplers: &[crate::gpu::recomp::pso::StaticSampler], kind: &'static str, riid: *const GUID, ppv: *mut *mut c_void, warm: Option<&mut MeshWarmBuild<'_>>) -> HRESULT {
     let Some(rs) = abi_rs_for(this, &tp.samplers) else { return E_INVALIDARG };
     let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let desc: [usize; 2] = [stream.0.len(), stream.0.as_ptr() as usize];
-    let hr = finish_pso(this, fs, desc.as_ptr() as *const c_void, riid, ppv);
+    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
+    let disk = driver_cache::stream_path(&stream.0, mesh_samplers);
+    let raster_len = tp.ms.len() + stream_subobjects(&stream.0).unwrap_or_default().into_iter()
+        .find(|e| e.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32)
+        .and_then(|e| payload_shader(e.1)).map_or(0, <[u8]>::len);
+    let compute_disk = (kind == "MS").then(|| driver_cache::mesh_compute_path(&tp.cs, &tp.samplers)).flatten();
+    let iid = pc_iid(Kind::PipelineState);
+    let create_compute = |blob: Option<&[u8]>, out| {
+        let mut desc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+        desc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
+        desc.CS = bytecode(&tp.cs);
+        if let Some(b) = blob {
+            desc.CachedPSO = D3D12_CACHED_PIPELINE_STATE { pCachedBlob: b.as_ptr().cast(), CachedBlobSizeInBytes: b.len() };
+        }
+        if kind == "MS" {
+            finish_pso(this, fc, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, out)
+        } else {
+            fc(this, (&desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC).cast(), &iid, out)
+        }
+    };
+    if let Some(warm) = warm {
+        match warm.blob(disk.as_deref(), raster_len, "MS raster pass", |out| finish_stream(this, fs, stream, None, riid, out)) {
+            Ok(hr) if hr >= 0 => {}
+            Ok(hr) => {
+                note_translation_error(format!("the driver rejected the raster pass of the console MS ({hr:#x})"));
+                return hr;
+            }
+            Err(()) => return E_INVALIDARG,
+        }
+        return match warm.blob(compute_disk.as_deref(), tp.cs.len(), "MS compute pass", |out| create_compute(None, out)) {
+            Ok(hr) => {
+                if hr < 0 {
+                    note_translation_error(format!("the driver rejected the compute pass of the console MS ({hr:#x})"));
+                }
+                hr
+            }
+            Err(()) => E_INVALIDARG,
+        };
+    }
+    let from_blob = disk.as_deref().is_some_and(std::path::Path::is_file);
+    let driving = std::time::Instant::now();
+    let create = |blob: Option<&[u8]>| finish_stream(this, fs, stream, blob, riid, ppv);
+    let blob_of = || if ppv.is_null() { None } else { pso_blob(*ppv) };
+    let hr = if kind == "MS" {
+        let Some(hr) = build_live_mesh_blob(disk.as_deref(), raster_len, "MS raster pass", create, blob_of) else { return E_INVALIDARG };
+        hr
+    } else {
+        driver_cache::build(disk.as_deref(), create, blob_of).0
+    };
+    super::pso_async::note_build(|| {
+        format!(
+            "{kind} in two passes: mesh {} B, compute {} B of DXIL; mesh pipeline driver {} ms{}",
+            tp.ms.len(),
+            tp.cs.len(),
+            driving.elapsed().as_millis(),
+            if from_blob { " (a driver blob kept on disk)" } else { "" }
+        )
+    });
     if hr < 0 {
         note_translation_error(format!("the driver rejected the mesh pipeline from the console {kind} ({hr:#x})"));
         return E_INVALIDARG;
     }
-    let fc: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
-    let mut cdesc = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
-    cdesc.pRootSignature = std::mem::transmute::<*mut c_void, std::mem::ManuallyDrop<Option<ID3D12RootSignature>>>(rs);
-    cdesc.CS = bytecode(&tp.cs);
-    let iid = pc_iid(Kind::PipelineState);
-    let mut compute: *mut c_void = std::ptr::null_mut();
-    let hc = fc(this, &cdesc as *const _ as *const c_void, &iid, &mut compute);
-    if hc < 0 || compute.is_null() {
-        note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
+    let compute = std::cell::Cell::new(std::ptr::null_mut());
+    let hc = if kind == "MS" {
+        build_live_mesh_blob(compute_disk.as_deref(), tp.cs.len(), "MS compute pass", |blob| create_compute(blob, compute.as_ptr()), || pso_blob(compute.get()))
+    } else {
+        Some(create_compute(None, compute.as_ptr()))
+    };
+    let compute = compute.into_inner();
+    if hc.is_none_or(|hc| hc < 0) || compute.is_null() {
+        if let Some(hc) = hc {
+            note_translation_error(format!("the driver rejected the compute pass of the console {kind} ({hc:#x})"));
+        }
+        super::pso_async::release(compute as usize);
         let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(*ppv as *const *const usize)).add(2));
         release(*ppv);
         *ppv = std::ptr::null_mut();
@@ -3278,9 +6719,131 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     hr
 }
 
+fn mesh_shader_slots<'a>(ms_slot: Option<&'a [u8]>, as_slot: Option<&'a [u8]>) -> (Option<&'a [u8]>, Option<&'a [u8]>) {
+    use crate::gpu::recomp::pso::is_console;
+    match (ms_slot, as_slot) {
+        (None, Some(a)) if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") => {
+            (Some(a), None)
+        }
+        (ms, a) => (ms, a),
+    }
+}
+
+#[cfg(test)]
+mod mesh_slot_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_stream_uses_host_target_formats() {
+        let mut stream = StreamOut::default();
+        let rt = [115u32, 86, 67, 28, 0, 0, 0, 0, 4];
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, &118u32);
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        let (out, _) = unsafe { fallback_stream(desc.as_ptr().cast()) }.unwrap();
+        let subs = stream_subobjects(&out).unwrap();
+        let words = |bytes: &[u8]| {
+            bytes.chunks_exact(4).map(|word| u32::from_le_bytes(word.try_into().unwrap())).collect::<Vec<_>>()
+        };
+        assert_eq!(words(subs[0].1), [28, 28, 10, 28, 0, 0, 0, 0, 4]);
+        assert_eq!(words(subs[1].1), [45]);
+    }
+
+    /// A title's stream may end without padding its last subobject to 8 bytes.
+    #[test]
+    fn fallback_stream_takes_a_stream_without_trailing_padding() {
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"console-vs");
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, &D3D12_BLEND_DESC::default());
+        let desc = [stream.0.len() - 4, stream.0.as_ptr() as usize];
+        let (out, _) = unsafe { fallback_stream(desc.as_ptr().cast()) }.unwrap();
+        let vs = known_subobjects(&out)[0];
+        assert_eq!(unsafe { payload_shader(vs.1) }, Some(dummy().vs.as_slice()));
+    }
+
+    #[test]
+    fn a_stand_in_stream_has_a_topology_type_the_pc_takes() {
+        for (console, pc) in [(19u32, 3u32), (0, 3), (4, 3), (2, 2)] {
+            let mut stream = StreamOut::default();
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"console-vs");
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &console);
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let (out, _) = unsafe { fallback_stream(desc.as_ptr().cast()) }.unwrap();
+            let topology = known_subobjects(&out)[1];
+            assert_eq!(u32::from_le_bytes(topology.1[..4].try_into().unwrap()), pc, "console type {console}");
+        }
+    }
+
+    #[test]
+    fn an_owned_stream_keeps_its_own_input_layout() {
+        let name = std::ffi::CString::new("TEXCOORD").unwrap();
+        let elems = [D3D12_INPUT_ELEMENT_DESC { SemanticName: PCSTR(name.as_ptr().cast()), SemanticIndex: 3, ..Default::default() }];
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, b"console-vs");
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT, &D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: 1 });
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        let owned = unsafe { own_stream(desc.as_ptr().cast()) }.unwrap();
+        drop((stream, name));
+        let [size, base] = unsafe { *owned.ptr().cast::<[usize; 2]>() };
+        let subs = known_subobjects(unsafe { std::slice::from_raw_parts(base as *const u8, size) });
+        let layout = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT.0 as u32).unwrap();
+        let copy = unsafe { &*(u64::from_le_bytes(layout.1[0..8].try_into().unwrap()) as *const D3D12_INPUT_ELEMENT_DESC) };
+        assert_ne!(copy as *const D3D12_INPUT_ELEMENT_DESC, elems.as_ptr());
+        assert_eq!((unsafe { std::ffi::CStr::from_ptr(copy.SemanticName.0.cast()) }.to_str().unwrap(), copy.SemanticIndex), ("TEXCOORD", 3));
+    }
+    use crate::gpu::xbox::tests::{sample, fssm, CODE};
+
+    #[test]
+    fn a_console_ms_in_the_as_slot_is_the_mesh_shader() {
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        let as_ = sample(14, &[fssm(&CODE, &[(8, 14)])]);
+        let pc = b"DXBC-not-a-console-container".to_vec();
+        let (m, a) = mesh_shader_slots(None, Some(&ms));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_none());
+        let (m, a) = mesh_shader_slots(Some(&ms), Some(&as_));
+        assert!(m.is_some_and(|m| std::ptr::eq(m, ms.as_slice())) && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        let (m, a) = mesh_shader_slots(None, Some(&as_));
+        assert!(m.is_none() && a.is_some_and(|a| std::ptr::eq(a, as_.as_slice())));
+        let (m, a) = mesh_shader_slots(None, Some(&pc));
+        assert!(m.is_none() && a.is_some());
+        assert!(mesh_shader_slots(None, None) == (None, None));
+    }
+
+    #[test]
+    fn standin_uses_one_mesh_slot_for_moved_mesh_bytecode() {
+        let Some((dummy_ms, dummy_ps)) = dummy_mesh() else {
+            crate::gpu::recomp::runner::skip_test("no stand-in mesh shaders");
+            return;
+        };
+        let (as_type, ms_type, ps_type) = (
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS,
+            D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS,
+        );
+        let ms = sample(13, &[fssm(&CODE, &[(8, 13)])]);
+        for explicit_ms in [false, true] {
+            let mut stream = StreamOut::default();
+            stream.shader(as_type, &ms);
+            stream.shader(ps_type, b"DXBC-test");
+            if explicit_ms {
+                stream.put(ms_type, &D3D12_SHADER_BYTECODE::default());
+            }
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            let (out, _) = unsafe { fallback_stream(desc.as_ptr().cast()) }.unwrap();
+            let subs = stream_subobjects(&out).unwrap();
+            let mut mesh = subs.iter().filter(|s| s.0 == ms_type.0 as u32);
+            let pixel = subs.iter().find(|s| s.0 == ps_type.0 as u32).unwrap();
+            assert_eq!(unsafe { payload_shader(mesh.next().unwrap().1) }, Some(dummy_ms.as_slice()));
+            assert!(mesh.next().is_none());
+            assert_eq!(unsafe { payload_shader(pixel.1) }, Some(dummy_ps.as_slice()));
+            assert!(subs.iter().filter(|s| s.0 == as_type.0 as u32).all(|s| s.1.iter().all(|&b| b == 0)));
+        }
+    }
+}
+
 /// CreatePipelineState with a console MS: Some(hr) when it was a console mesh pipeline
 /// (translated, or E_INVALIDARG – console bytecode must not reach the driver).
-unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
+unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void, mut warm: Option<&mut MeshWarmBuild<'_>>) -> Option<HRESULT> {
     use crate::gpu::recomp::pso::{console_mesh, is_console};
     if !crate::gpu::shader::readable(desc as usize, 16) {
         return None;
@@ -3290,16 +6853,31 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         return None;
     }
     let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size))?;
-    let ms = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1))?;
+    let as_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32).and_then(|s| payload_shader(s.1));
+    let ms_slot = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).and_then(|s| payload_shader(s.1));
+    let (ms, as_slot) = mesh_shader_slots(ms_slot, as_slot);
+    let Some(ms) = ms else { return None };
     if !is_console(ms) {
         return None;
     }
-    if subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32 && payload_shader(s.1).is_some()) {
-        note_translation_error("mesh pipeline with AS – not supported yet".into());
+    if let Some(a) = as_slot {
+        let types: Vec<u32> = subs.iter().map(|s| s.0).collect();
+        note_translation_error(format!(
+            "mesh pipeline with AS {:016x} (MS {:016x}) – not supported yet; subobjects {types:?}",
+            crate::gpu::shader::fnv64(a),
+            crate::gpu::shader::fnv64(ms)
+        ));
+        return Some(E_INVALIDARG);
+    }
+    if ms_slot.is_none() && super::pso_async::lazy() && crate::gpu::recomp::dxc::defer() {
         return Some(E_INVALIDARG);
     }
     let ps = subs.iter().find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS.0 as u32).and_then(|s| payload_shader(s.1));
-    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps)) {
+    // the console program as a host mesh shader where it can be one; else in two passes
+    if let Some(hr) = native_mesh_stream(this, &subs, ms, ps, riid, ppv, warm.as_deref_mut()) {
+        return Some(hr);
+    }
+    let (tp, (ps, ps_samplers)) = match (console_mesh(ms, ps, wave32_only(this)), two_pass_ps(ps, graphics_wave32(this))) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
             note_translation_error(format!("MS: {e}"));
@@ -3311,21 +6889,112 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
         }
     };
     let Some(rs) = abi_rs_for(this, &ps_samplers) else { return Some(E_INVALIDARG) };
-    // the title's state (blend, rasteriser, depth, formats …) with XCL's RS and shaders
+    let out = mesh_state_stream(rs, &tp.ms, ps.as_deref(), &subs);
+    Some(finish_two_pass(this, &out, tp, rs, &ps_samplers, "MS", riid, ppv, warm))
+}
+
+/// A mesh pipeline's stream: the title's state (blend, rasteriser, depth, formats …) from its
+/// subobjects `subs` with XCL's root signature and shaders.
+unsafe fn mesh_state_stream(rs: *mut c_void, ms: &[u8], ps: Option<&[u8]>, subs: &[(u32, &[u8])]) -> StreamOut {
     let mut out = StreamOut::default();
     out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &rs);
-    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, &tp.ms);
-    if let Some(p) = &ps {
+    out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms);
+    if let Some(p) = ps {
         out.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, p);
     }
-    for (ty, payload) in &subs {
+    for (ty, payload) in subs {
         let skip = [0, 2, 19, 24, 25].contains(ty); // RS, PS, cached PSO, AS, MS
         if !skip {
             let (_, palign) = super::null::subobject_payload(*ty).unwrap_or((0, 4));
+            // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
+            if (*ty == 15 && payload.len() >= 32) || (*ty == 16 && payload.len() >= 4) {
+                let mut p = payload.to_vec();
+                for k in 0..if *ty == 15 { 8 } else { 1 } {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+                    p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+                }
+                out.raw(*ty, &p, palign == 8);
+                continue;
+            }
             out.raw(*ty, payload, palign == 8);
         }
     }
-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
+    out
+}
+
+/// A console mesh pipeline with the mesh program as a host mesh shader (`pso::NativeMesh`): one
+/// translated graphics pipeline, nothing else to run at the draw. None: this pipeline cannot be
+/// one here – the adapter's wave size is not fixed at 32 lanes, the program is over a limit of
+/// the host's mesh stage (`emit::Em::mesh_native_blocker`), or DXC or the driver refused it –
+/// and the caller makes it in two passes. Some(E_INVALIDARG): a shader DXC has not compiled yet
+/// inside `attempt` (the build goes to the background), or a failure two passes would share.
+unsafe fn native_mesh_stream(this: *mut c_void, subs: &[(u32, &[u8])], ms: &[u8], ps: Option<&[u8]>, riid: *const GUID, ppv: *mut *mut c_void, warm: Option<&mut MeshWarmBuild<'_>>) -> Option<HRESULT> {
+    use crate::gpu::recomp::pso::{console_mesh_native, console_to_dxil_for, is_console, mesh_native_split, Stage};
+    let split = mesh_native_split(ID3D12Device::from_raw_borrowed(&this)?)?;
+    static WHY: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let fall_back = |why: String| {
+        // each different reason once: the pipeline is made in two passes instead
+        if WHY.lock().unwrap().get_or_insert_with(HashSet::new).insert(why.clone()) {
+            crate::xlog_info!("D3D12.X: a console mesh program runs in two passes, not as a host mesh shader: {why}");
+        }
+    };
+    let native = {
+        let _translating = crate::progress::TRANSLATIONS.begin();
+        match console_mesh_native(ms, ps, split) {
+            Ok(n) => n,
+            Err(_) if crate::gpu::recomp::dxc::missed() => return Some(E_INVALIDARG),
+            Err(e) => {
+                fall_back(e);
+                return None;
+            }
+        }
+    };
+    // the pixel shader's static samplers follow the mesh shader's in the root signature
+    let (ps, ps_samplers) = match ps {
+        Some(p) if is_console(p) => {
+            let _translating = crate::progress::TRANSLATIONS.begin();
+            match console_to_dxil_for(p, Stage::Pixel, native.samplers.len() as u32, graphics_wave32(this)) {
+                Ok(c) => (Some(c.dxil), c.samplers),
+                Err(e) => {
+                    note_translation_error(format!("PS: {e}"));
+                    return Some(E_INVALIDARG);
+                }
+            }
+        }
+        Some(p) => (Some(p.to_vec()), Vec::new()),
+        None => (None, Vec::new()),
+    };
+    let samplers = [native.samplers.as_slice(), ps_samplers.as_slice()].concat();
+    let Some(rs) = abi_rs_for(this, &samplers) else { return Some(E_INVALIDARG) };
+    let out = mesh_state_stream(rs, &native.ms, ps.as_deref(), subs);
+    let fs: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+    let disk = driver_cache::stream_path(&out.0, &samplers);
+    let len = native.ms.len() + ps.as_ref().map_or(0, Vec::len);
+    if let Some(warm) = warm {
+        return match warm.blob(disk.as_deref(), len, "host MS", |out_pso| finish_stream(this, fs, &out, None, riid, out_pso)) {
+            Ok(hr) if hr < 0 => {
+                fall_back(format!("the driver rejected the host mesh shader ({hr:#x})"));
+                None
+            }
+            result => Some(result.unwrap_or(E_INVALIDARG)),
+        };
+    }
+    let from_blob = disk.as_deref().is_some_and(std::path::Path::is_file);
+    let driving = std::time::Instant::now();
+    let Some(hr) = build_live_mesh_blob(disk.as_deref(), len, "host MS", |blob| finish_stream(this, fs, &out, blob, riid, ppv), || if ppv.is_null() { None } else { pso_blob(*ppv) }) else {
+        return Some(E_INVALIDARG);
+    };
+    super::pso_async::note_build(|| format!("MS as a host mesh shader: {} B of DXIL; driver {} ms{}", native.ms.len(), driving.elapsed().as_millis(), if from_blob { " (a driver blob kept on disk)" } else { "" }));
+    if hr < 0 || ppv.is_null() || (*ppv).is_null() {
+        fall_back(format!("the driver rejected the host mesh shader ({hr:#x})"));
+        return None;
+    }
+    let n = note_translated_graphics(*ppv, rs);
+    NATIVE_MESH.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
+    if n < 5 || n % 1000 == 0 {
+        crate::xlog_info!("D3D12.X: mesh pipeline from the console MS as a host mesh shader ({} B DXIL, #{})", native.ms.len(), n + 1);
+    }
+    Some(hr)
 }
 
 /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
@@ -3333,7 +7002,7 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
 unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE_DESC, vs: &[u8], gs: &[u8], riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     let (tp, (ps, ps_samplers)) = match (
         crate::gpu::recomp::pso::console_geometry(vs, gs, shader_bytes(&d.PS), wave32_only(this)),
-        two_pass_ps(shader_bytes(&d.PS)),
+        two_pass_ps(shader_bytes(&d.PS), graphics_wave32(this)),
     ) {
         (Ok(tp), Ok(ps)) => (tp, ps),
         (Err(e), _) => {
@@ -3396,8 +7065,10 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
     if d.Flags.0 != 0 {
         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
     }
-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
+    finish_two_pass(this, &out, tp, rs, &ps_samplers, "GS", riid, ppv, None)
 }
+
+const STANDIN_TOPOLOGY: u32 = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY.0 as u32;
 
 /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
 unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
@@ -3408,7 +7079,15 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     }
     let mut buf = std::slice::from_raw_parts(base as *const u8, size).to_vec();
     let d = dummy();
-    let mesh = stream_subobjects(&buf).is_some_and(|subs| subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32));
+    let subs = known_subobjects(&buf);
+    let has_ms = subs.iter().any(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32);
+    let move_ms = !has_ms && {
+        let as_slot = subs.iter()
+            .find(|s| s.0 == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32)
+            .and_then(|s| payload_shader(s.1));
+        mesh_shader_slots(None, as_slot).0.is_some()
+    };
+    let mesh = has_ms || move_ms;
     let dm = if mesh { Some(dummy_mesh()?) } else { None };
     let mut off = 0usize;
     while off + 8 <= size {
@@ -3417,17 +7096,36 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
         let poff = if palign == 8 { 8 } else { 4 };
         let at = off + poff;
         let put = |buf: &mut Vec<u8>, b: &[u8]| {
-            buf[at..at + 8].copy_from_slice(&(b.as_ptr() as u64).to_le_bytes());
+            // no shader: a null pointer – an empty slice's is dangling (0x1), which the driver
+            // refused (a retail game's mesh stand-ins, E_INVALIDARG)
+            let ptr = if b.is_empty() { 0 } else { b.as_ptr() as u64 };
+            buf[at..at + 8].copy_from_slice(&ptr.to_le_bytes());
             buf[at + 8..at + 16].copy_from_slice(&(b.len() as u64).to_le_bytes());
         };
         match ty {
             1 => put(&mut buf, &d.vs),
             2 => put(&mut buf, dm.map_or(&d.ps[..], |m| &m.1[..])),
             6 => put(&mut buf, &d.cs),
+            24 if move_ms => {
+                buf[off..off + 4].copy_from_slice(&(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32).to_le_bytes());
+                put(&mut buf, &dm?.0);
+            }
             3 | 4 | 5 | 24 => put(&mut buf, &[]),
             25 => put(&mut buf, &dm?.0),
+            15 | 16 => {
+                let len = if ty == 15 { 32 } else { 4 };
+                for format in buf.get_mut(at..at + len)?.chunks_exact_mut(4) {
+                    let f = super::device_x::pc_target_format(u32::from_le_bytes(format.try_into().ok()?));
+                    format.copy_from_slice(&f.to_le_bytes());
+                }
+            }
             12 | 19 => buf[at..at + 16].fill(0), // input layout, cached PSO
             7 => buf[at..at + 32].fill(0),        // stream output
+            // with no HS, GS or DS left: a point, line or triangle type (the console's rect list
+            // type 19, none, or PATCH made the driver refuse the stand-in)
+            STANDIN_TOPOLOGY if !(1..=3).contains(&u32::from_le_bytes(buf[at..at + 4].try_into().ok()?)) => {
+                buf[at..at + 4].copy_from_slice(&(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE.0 as u32).to_le_bytes());
+            }
             _ => {}
         }
         off += (poff + psize + 7) & !7;
@@ -3435,22 +7133,332 @@ unsafe fn fallback_stream(desc: *const u8) -> Option<(Vec<u8>, [usize; 2])> {
     Some((buf, [size, 0]))
 }
 
+/// The console's pipeline topology type of rect lists (draws of topology 17, `list_x::RECT_LIST`).
+const RECT_LIST_TYPE: i32 = 19;
+
+/// `create(copy)`, and once more without the generated rect list GS (`rect_gs`) when the driver
+/// refuses the pipeline with it: each rect is then drawn as the triangle of its three vertices,
+/// as without the GS, rather than not at all (the untranslated fallback's dummy shaders).
+fn retry_without_rect_gs(copy: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC, rect_gs: bool, (vs_hash, ps_hash): (u64, u64), mut create: impl FnMut(&D3D12_GRAPHICS_PIPELINE_STATE_DESC) -> HRESULT) -> HRESULT {
+    let hr = create(copy);
+    if hr >= 0 || !rect_gs {
+        return hr;
+    }
+    note_translation_error(format!("VS {vs_hash:016x} PS {ps_hash:016x}: the driver rejected the PSO with the rect list GS ({hr:#x}): rect list drawn as triangles"));
+    copy.GS = D3D12_SHADER_BYTECODE::default();
+    create(copy)
+}
+
+/// What an untranslated pipeline from a stream is made from: a rect list's (type 19, which
+/// `stream_pipeline` keeps for `translated_graphics_pso`) with the PC's topology type, as the
+/// stream path made it before; None: `desc` as it is.
+unsafe fn untranslated_stream_desc(desc: *const c_void, stream: bool) -> Option<D3D12_GRAPHICS_PIPELINE_STATE_DESC> {
+    if !stream || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_GRAPHICS_PIPELINE_STATE_DESC>()) {
+        return None;
+    }
+    let mut g = std::ptr::read(desc as *const D3D12_GRAPHICS_PIPELINE_STATE_DESC);
+    if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        return None;
+    }
+    pc_topology_type(&mut g);
+    Some(g)
+}
+
+/// The GS that completes a rect list's rects behind the console VS `vs` and the PS `ps`; refused
+/// for a PS that is not a console one (its inputs' modes are not known).
+fn rect_list_gs(vs: &[u8], ps: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    use crate::gpu::recomp::pso;
+    if ps.is_some_and(|p| !pso::is_console(p)) {
+        return Err("a PC pixel shader".into());
+    }
+    pso::rect_list_gs(vs)
+}
+
+/// A topology type the PC has: the console's for rect lists (19, with draws of topology 17 –
+/// `list_x::RECT_LIST`) is TRIANGLE, as those draws become triangle lists (the rects' fourth
+/// corners come from `pso::rect_list_gs`, added by `translated_graphics_pso`); UNDEFINED (a stream
+/// without one) is TRIANGLE, or PATCH with a hull shader – the PC refuses both with a VS.
+fn pc_topology_type(g: &mut D3D12_GRAPHICS_PIPELINE_STATE_DESC) {
+    // (and the console's D16S8 depth format the PC's: `device_x::pc_view_format`)
+    g.DSVFormat = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_view_format(g.DSVFormat.0 as u32) as i32);
+    for f in g.RTVFormats.iter_mut() {
+        *f = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_target_format(f.0 as u32) as i32);
+    }
+    if !(1..=4).contains(&g.PrimitiveTopologyType.0) {
+        g.PrimitiveTopologyType = if g.HS.pShaderBytecode.is_null() { D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE } else { D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH };
+    }
+}
+
+enum StreamPipeline {
+    Graphics(Box<D3D12_GRAPHICS_PIPELINE_STATE_DESC>),
+    Compute(Box<D3D12_COMPUTE_PIPELINE_STATE_DESC>),
+    /// neither with console shaders (or not readable)
+    Unknown,
+}
+
+/// A pipeline stream with a console VS (+ PS / GS) or CS as the plain pipeline desc, which is
+/// translated like any other (`dev_create_graphics_pso`). The stream itself must not reach the
+/// driver: AMD's shader compiler fails on the console's stripped DXIL and takes the device with
+/// it (0x887A0020 at the retail game's first graphics pipeline). Depth bounds, view instancing and the
+/// float depth bias' fraction have no place in the plain desc.
+unsafe fn stream_pipeline(desc: *const c_void) -> StreamPipeline {
+    use crate::gpu::recomp::pso::is_console;
+    if !crate::gpu::shader::readable(desc as usize, 16) {
+        return StreamPipeline::Unknown;
+    }
+    let (size, base) = (*(desc as *const usize), *((desc as usize + 8) as *const usize));
+    if !crate::gpu::shader::readable(base, size) {
+        return StreamPipeline::Unknown;
+    }
+    let subs = known_subobjects(std::slice::from_raw_parts(base as *const u8, size));
+    let console = |ty: u32| subs.iter().find(|s| s.0 == ty).and_then(|s| payload_shader(s.1)).is_some_and(is_console);
+    if console(6) {
+        let mut c: D3D12_COMPUTE_PIPELINE_STATE_DESC = std::mem::zeroed();
+        for (ty, p) in &subs {
+            match ty {
+                0 => put(&mut c.pRootSignature, p),
+                6 => put(&mut c.CS, p),
+                18 => put(&mut c.NodeMask, p),
+                _ => {}
+            }
+        }
+        return StreamPipeline::Compute(Box::new(c));
+    }
+    if !console(1) {
+        return StreamPipeline::Unknown;
+    }
+    let mut g: D3D12_GRAPHICS_PIPELINE_STATE_DESC = std::mem::zeroed();
+    // what a stream leaves out has the PC's defaults
+    g.SampleMask = u32::MAX;
+    g.SampleDesc.Count = 1;
+    g.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    g.RasterizerState.CullMode = D3D12_CULL_MODE_BACK;
+    g.RasterizerState.DepthClipEnable = true.into();
+    for rt in &mut g.BlendState.RenderTarget {
+        rt.SrcBlend = D3D12_BLEND_ONE;
+        rt.DestBlend = D3D12_BLEND_ZERO;
+        rt.BlendOp = D3D12_BLEND_OP_ADD;
+        rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+        rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+        rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+        rt.RenderTargetWriteMask = 15;
+    }
+    let keep = D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: D3D12_STENCIL_OP_KEEP, StencilDepthFailOp: D3D12_STENCIL_OP_KEEP, StencilPassOp: D3D12_STENCIL_OP_KEEP, StencilFunc: D3D12_COMPARISON_FUNC_ALWAYS };
+    g.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+        DepthEnable: true.into(),
+        DepthWriteMask: D3D12_DEPTH_WRITE_MASK_ALL,
+        DepthFunc: D3D12_COMPARISON_FUNC_LESS,
+        StencilEnable: false.into(),
+        StencilReadMask: 0xFF,
+        StencilWriteMask: 0xFF,
+        FrontFace: keep,
+        BackFace: keep,
+    };
+    for (ty, p) in &subs {
+        match ty {
+            0 => put(&mut g.pRootSignature, p),
+            1 => put(&mut g.VS, p),
+            2 => put(&mut g.PS, p),
+            3 => put(&mut g.DS, p),
+            4 => put(&mut g.HS, p),
+            5 => put(&mut g.GS, p),
+            7 => put(&mut g.StreamOutput, p),
+            8 => put(&mut g.BlendState, p),
+            9 => put(&mut g.SampleMask, p),
+            10 => put(&mut g.RasterizerState, p),
+            // DEPTH_STENCIL; DEPTH_STENCIL1 is that and the depth bounds test
+            11 | 21 => put(&mut g.DepthStencilState, p),
+            12 => put(&mut g.InputLayout, p),
+            13 => put(&mut g.IBStripCutValue, p),
+            14 => put(&mut g.PrimitiveTopologyType, p),
+            15 => {
+                let mut rt: D3D12_RT_FORMAT_ARRAY = std::mem::zeroed();
+                put(&mut rt, p);
+                g.RTVFormats = rt.RTFormats;
+                g.NumRenderTargets = rt.NumRenderTargets;
+            }
+            16 => put(&mut g.DSVFormat, p),
+            17 => put(&mut g.SampleDesc, p),
+            18 => put(&mut g.NodeMask, p),
+            20 => put(&mut g.Flags, p),
+            26 => {
+                let mut d: D3D12_DEPTH_STENCIL_DESC2 = std::mem::zeroed();
+                put(&mut d, p);
+                let face = |f: &D3D12_DEPTH_STENCILOP_DESC1| D3D12_DEPTH_STENCILOP_DESC { StencilFailOp: f.StencilFailOp, StencilDepthFailOp: f.StencilDepthFailOp, StencilPassOp: f.StencilPassOp, StencilFunc: f.StencilFunc };
+                g.DepthStencilState = D3D12_DEPTH_STENCIL_DESC {
+                    DepthEnable: d.DepthEnable,
+                    DepthWriteMask: d.DepthWriteMask,
+                    DepthFunc: d.DepthFunc,
+                    StencilEnable: d.StencilEnable,
+                    StencilReadMask: d.FrontFace.StencilReadMask,
+                    StencilWriteMask: d.FrontFace.StencilWriteMask,
+                    FrontFace: face(&d.FrontFace),
+                    BackFace: face(&d.BackFace),
+                };
+            }
+            27 | 28 => {
+                // RASTERIZER1 / 2: fill, cull, winding, depth bias (float), clamp, slope, depth clip
+                let mut d: D3D12_RASTERIZER_DESC1 = std::mem::zeroed();
+                put(&mut d, p);
+                g.RasterizerState = D3D12_RASTERIZER_DESC {
+                    FillMode: d.FillMode,
+                    CullMode: d.CullMode,
+                    FrontCounterClockwise: d.FrontCounterClockwise,
+                    DepthBias: d.DepthBias as i32,
+                    DepthBiasClamp: d.DepthBiasClamp,
+                    SlopeScaledDepthBias: d.SlopeScaledDepthBias,
+                    DepthClipEnable: d.DepthClipEnable,
+                    ..Default::default()
+                };
+            }
+            _ => {}
+        }
+    }
+    // a rect list stays one for translated_graphics_pso, which gives it its GS (untranslated, it
+    // becomes the PC's in graphics_pso)
+    if g.PrimitiveTopologyType.0 != RECT_LIST_TYPE {
+        pc_topology_type(&mut g);
+    }
+    StreamPipeline::Graphics(Box::new(g))
+}
+
+/// The bytes of a stream payload as a desc field (no references counted: the desc only borrows).
+unsafe fn put<T>(to: &mut T, from: &[u8]) {
+    let n = std::mem::size_of::<T>().min(from.len());
+    std::ptr::copy_nonoverlapping(from.as_ptr(), to as *mut T as *mut u8, n);
+}
+
 pub(super) unsafe extern "system" fn dev_create_pipeline_state(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
-    super::null::capture_stream_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
-    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv)) } else { (translated_mesh_stream(this, desc, riid, ppv), false) };
-    if missed {
-        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, false, o, standin_stream, build_stream)) {
+    create_pipeline_stream(this, f, desc, riid, ppv)
+}
+
+unsafe fn create_pipeline_stream(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    use crate::gpu::recomp::pso::is_console;
+    if !ppv.is_null() {
+        *ppv = std::ptr::null_mut();
+    }
+    if desc as usize % 8 != 0 || !crate::gpu::shader::readable(desc as usize, 16) {
+        return E_INVALIDARG;
+    }
+    let [size, base] = *desc.cast::<[usize; 2]>();
+    if !crate::gpu::shader::readable(base, size) || base % 8 != 0 {
+        return E_INVALIDARG;
+    }
+    let Some(subs) = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)) else {
+        crate::xlog_warn!("D3D12.X: unknown or truncated pipeline stream subobject");
+        return E_INVALIDARG;
+    };
+    let mut shaders = [None; 26];
+    let mut mesh_tags = [24, 25];
+    let mut seen = 0u32;
+    for &(ty, payload) in &subs {
+        let bit = 1 << ty;
+        if seen & bit != 0 {
+            return E_INVALIDARG;
+        }
+        seen |= bit;
+        if matches!(ty, 1..=6 | 24 | 25) && payload[8..16] != [0; 8] {
+            let Some(shader) = payload_shader(payload) else { return E_INVALIDARG };
+            let tag = if matches!(ty, 24 | 25) {
+                let tag = match crate::gpu::xbox::program_kind(shader) {
+                    Some(13) => D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS.0 as u32,
+                    Some(14) => D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS.0 as u32,
+                    _ => ty,
+                };
+                mesh_tags[(ty - 24) as usize] = tag;
+                tag
+            } else {
+                ty
+            };
+            if shaders[tag as usize].replace(shader).is_some() {
+                return E_INVALIDARG;
+            }
+        }
+    }
+    // RENDER_TARGET_FORMATS, DEPTH_STENCIL_FORMAT: the console's formats as the PC's
+    let pc_formats = |ty: u32, payload: &[u8]| -> Option<Vec<u8>> {
+        let n = match ty {
+            15 if payload.len() >= 32 => 8,
+            16 if payload.len() >= 4 => 1,
+            _ => return None,
+        };
+        let mut p = payload.to_vec();
+        for k in 0..n {
+            let f = super::device_x::pc_target_format(u32::from_le_bytes(p[4 * k..4 * k + 4].try_into().unwrap()));
+            p[4 * k..4 * k + 4].copy_from_slice(&f.to_le_bytes());
+        }
+        (p != payload).then_some(p)
+    };
+    let normalized = (mesh_tags != [24, 25] || subs.iter().any(|&(ty, payload)| pc_formats(ty, payload).is_some())).then(|| {
+        let mut stream = StreamOut::default();
+        for &(ty, payload) in &subs {
+            let tag = if matches!(ty, 24 | 25) {
+                if payload[8..16] == [0; 8] {
+                    continue;
+                }
+                mesh_tags[(ty - 24) as usize]
+            } else {
+                ty
+            };
+            let (_, align) = super::null::subobject_payload(tag).unwrap();
+            match pc_formats(ty, payload) {
+                Some(p) => stream.raw(tag, &p, align == 8),
+                None => stream.raw(tag, payload, align == 8),
+            }
+        }
+        stream
+    });
+    let adjusted = normalized.as_ref().map(|s| [s.0.len(), s.0.as_ptr() as usize]);
+    let desc = adjusted.as_ref().map_or(desc, |d| d.as_ptr().cast());
+    super::null::capture_stream_desc(desc as *const u8);
+    if let Some(vs) = shaders[1].filter(|vs| is_console(vs)) {
+        if (3..=6).chain([24, 25]).any(|ty| shaders[ty].is_some()) {
+            note_translation_error("graphics stream with a console VS and additional shader stages – not supported yet".into());
+            return E_INVALIDARG;
+        }
+        let subs = normalized.as_ref().map_or(Some(subs), |s| stream_subobjects(&s.0)).unwrap();
+        if !super::pso_async::enabled() {
+            return translated_vertex_stream(this, f, &subs, vs, shaders[2], riid, ppv);
+        }
+        // as the other translated paths: a shader DXC has not compiled yet gives the title a
+        // stand-in now and the real pipeline from a worker (a retail game's loader made its
+        // pipelines this way, each call waiting a second for DXC, three loader threads at a time)
+        let (hr, missed) = attempt(|| translated_vertex_stream(this, f, &subs, vs, shaders[2], riid, ppv));
+        if !missed {
             return hr;
         }
-        if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv) {
+        if !ppv.is_null() && !(*ppv).is_null() {
+            super::pso_async::release(std::mem::replace(&mut *ppv, std::ptr::null_mut()) as usize);
+        }
+        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, super::pso_manifest::Kind::VertexStream, o, standin_stream, build_vertex_stream)) {
+            return hr;
+        }
+        return translated_vertex_stream(this, f, &subs, vs, shaders[2], riid, ppv);
+    }
+    let (translated, missed) = if super::pso_async::enabled() { attempt(|| translated_mesh_stream(this, desc, riid, ppv, None)) } else { (translated_mesh_stream(this, desc, riid, ppv, None), false) };
+    if missed {
+        if let Some(hr) = own_stream(desc).and_then(|o| go_background(this, f, desc, riid, ppv, super::pso_manifest::Kind::MeshStream, o, standin_stream, build_stream)) {
+            return hr;
+        }
+        if let Some(hr) = translated_mesh_stream(this, desc, riid, ppv, None) {
             return hr;
         }
     } else if let Some(hr) = translated {
         return hr;
     }
-    let hr = finish_pso(this, f, desc, riid, ppv);
-    if hr >= 0 || !crate::gpu::shader::readable(desc as usize, 16) {
+    match stream_pipeline(desc) {
+        StreamPipeline::Graphics(d) => return graphics_pso(this, &*d as *const _ as *const c_void, riid, ppv, true),
+        StreamPipeline::Compute(d) => return dev_create_compute_pso(this, &*d as *const _ as *const c_void, riid, ppv),
+        StreamPipeline::Unknown => {}
+    }
+    let hr = if shaders.into_iter().flatten().any(is_console) {
+        E_INVALIDARG
+    } else {
+        finish_pso(this, f, desc, riid, ppv)
+    };
+    if hr >= 0 {
         return hr;
     }
     let Some((buf, _)) = fallback_stream(desc as *const u8) else {
@@ -3510,6 +7518,13 @@ unsafe extern "system" fn dev_create_root_signature(this: *mut c_void, mask: u32
 unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, desc: *const c_void, handle: usize) {
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const c_void, usize);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CreateRenderTargetView")));
+    // a view in a console-only format, or of a target made R8G8B8A8 (`device_x::pc_resource_desc`)
+    let mut copy = (!desc.is_null()).then(|| (desc as *const D3D12_RENDER_TARGET_VIEW_DESC).read_unaligned());
+    if let Some(c) = copy.as_mut() {
+        let rf = ID3D12Resource::from_raw_borrowed(&res).map_or(0, |r| r.GetDesc().Format.0 as u32);
+        c.Format = windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT(super::device_x::pc_shader_view_format(rf, c.Format.0 as u32) as i32);
+    }
+    let desc = copy.as_ref().map_or(desc, |c| c as *const _ as *const c_void);
     f(this, res, desc, handle);
     super::present::note_rtv(handle, res);
     if super::present::trace_frame() {
@@ -3608,6 +7623,7 @@ unsafe extern "system" fn cl_execute_indirect(
     cnt_off: u64,
 ) {
     super::list_x::prepare_draw(this);
+    super::residency::note_list_resources(this as usize, [arg_buf as usize, cnt_buf as usize]);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
     f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
@@ -3617,6 +7633,7 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::residency::list_reset(this as usize);
         super::list_x::on_release(this as usize);
         super::bind::forget(this);
     }
@@ -3627,7 +7644,9 @@ unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::residency::queue_released(this as usize);
         super::list_x::on_queue_release(this as usize);
+        super::cpu_writes::forget_queue(this as usize);
     }
     n
 }
@@ -3648,6 +7667,7 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
     if hr >= 0 {
         // the GPU is done with what lists recorded from this allocator used
         super::console_list::allocator_reset(this);
+        super::list_x::on_allocator_reset(this as usize);
     }
     hr
 }
@@ -3672,18 +7692,61 @@ unsafe extern "system" fn alloc_reset(this: *mut c_void) -> HRESULT {
 // The same runtime moves the command list's console methods too: Unicorn Overlord records its
 // texture uploads with CopyTextureRegionX at #85 (the older layout's #83; its #85 is
 // SetPredicationBufferX, which dropped them – every texture stayed zero). From #85 on the
-// list's console methods sit two slots later (`NEWER_LIST_SLOTS`); where the shift starts
-// below #83 is not known (no title seen calling those slots on the newer layout).
+// list's console methods sit two slots later (`NEWER_LIST_SLOTS`), and from #72 on as well: a retail game
+// calls Write64BitValueBottomOfPipeX at #72 and Wait64BitValueX at #74, Write32BitValueBottomOfPipeX
+// at #71 (address, value, 0, 0) and ExecuteIndirect at #61 (signature, 1, argument buffer, offset,
+// NULL, 0) – sent to FillMemoryWith32BitValueX, the title's indirect draws and dispatches never ran.
+// So the shift starts at #59 or below; where is not known. The newer layout's #139 is a Reset with one argument more (the same
+// title: (allocator, NULL, 0) on each list it takes from its pool before recording – as a stub
+// the list stayed closed, the debug layer saw every call on it refused, and Close failed).
 
 /// the title's runtime has the newer layouts (queue: two methods before Signal; command list:
 /// console methods from CopyTextureRegionX on two slots later)
 pub(super) static QUEUE_SHIFTED: AtomicBool = AtomicBool::new(false);
 
+/// the title's runtime has the older queue layout: it signalled / waited on a fence at #14 / #15
+/// (on the newer layout those slots are other methods)
+static QUEUE_OLDER: AtomicBool = AtomicBool::new(false);
+
 /// command list slots of the newer layout → the older layout's slot of the same method
-const NEWER_LIST_SLOTS: [(usize, usize); 8] = [(85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94)];
+const NEWER_LIST_SLOTS: [(usize, usize); 21] = [(61, 59), (62, 60), (63, 61), (64, 62), (65, 63), (70, 68), (71, 69), (72, 70), (73, 71), (74, 72), (80, 78), (83, 81), (85, 83), (86, 84), (87, 85), (90, 88), (91, 89), (92, 90), (95, 93), (96, 94), (139, 10)];
+
+/// Mesh dispatches of the command list: (the older layout's slot, the newer layout's, the
+/// method). DispatchMesh(x, y, z) is the last method of the list's sixth version – #127, and two
+/// slots later on the newer layout (a retail game calls #129 with three group counts);
+/// DispatchMeshX(x, flags, indirect arguments, payload) is #98 / #100.
+const MESH_LIST_SLOTS: [(usize, usize, usize); 2] = [(127, 129, 0), (98, 100, 1)];
+
+/// The method of `MESH_LIST_SLOTS`' third field.
+fn mesh_list_method(k: usize) -> usize {
+    [super::bind::dispatch_mesh as usize, super::bind::dispatch_mesh_x as usize][k]
+}
+
+/// The title called device method `slot`, which only runtimes with the newer layouts have (a retail game
+/// records its first lists before any queue call could tell).
+pub(super) fn note_newer_device_method(slot: usize) {
+    if !QUEUE_OLDER.load(Ordering::Acquire) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+        crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (device method #{slot} called)");
+    }
+}
+
+/// The queue layout flags `queue_dispatch` reads and sets: (`QUEUE_SHIFTED`, `QUEUE_OLDER`), or
+/// (tests) this thread's own, so a test of the layout detection leaves the process's alone.
+fn queue_flags() -> (&'static AtomicBool, &'static AtomicBool) {
+    #[cfg(test)]
+    if let Some(flags) = TEST_QUEUE_FLAGS.with(|f| f.get()) {
+        return flags;
+    }
+    (&QUEUE_SHIFTED, &QUEUE_OLDER)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_QUEUE_FLAGS: std::cell::Cell<Option<(&'static AtomicBool, &'static AtomicBool)>> = const { std::cell::Cell::new(None) };
+}
 
 /// Whether `p` is a fence the title created.
-fn is_fence(p: usize) -> bool {
+pub(super) fn is_fence(p: usize) -> bool {
     p != 0 && FENCES.read().unwrap_or_else(|e| e.into_inner()).contains(&p)
 }
 
@@ -3698,18 +7761,61 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
     const PC_TIMESTAMP_FREQUENCY: usize = 16;
     const PC_CLOCK_CALIBRATION: usize = 17;
     const PC_GET_DESC: usize = 18;
-    if (slot == 16 || slot == 17) && is_fence(a1) && !QUEUE_SHIFTED.swap(true, Ordering::AcqRel) {
+    let (shifted_flag, older_flag) = queue_flags();
+    if (slot == 16 || slot == 17) && is_fence(a1) && !shifted_flag.swap(true, Ordering::AcqRel) {
         crate::xlog_info!("D3D12.X: the title's runtime has the newer console layouts (queue: Signal #16, PresentX #32; command list: CopyTextureRegionX #85 – a fence passed to queue #{slot})");
     }
-    let shifted = QUEUE_SHIFTED.load(Ordering::Acquire);
+    let shifted = shifted_flag.load(Ordering::Acquire);
+    if (slot == 14 || slot == 15) && !shifted && is_fence(a1) {
+        older_flag.store(true, Ordering::Release);
+    }
     // the method in the older layout's numbering
     let older = if shifted && slot >= 16 { slot - 2 } else if shifted { usize::MAX } else { slot };
+    // (`single`) the title's call on one of its queues: a Signal or Wait takes its place in
+    // the queue's held work, lists are held by ExecuteCommandLists itself, and anything else
+    // runs on the PC queue after the queue's held work
+    let this = match super::single::host_of(this) {
+        Some(_) if older == 33 && shifted => this,
+        Some(host) if super::single::running() => host,
+        Some(host) => match older {
+            14 | 23 if is_fence(a1) => {
+                let host = host as usize;
+                super::single::signal(this as usize, a1, a2 as u64, move || {
+                    queue_dispatch(slot, host as *mut c_void, a1, a2, a3, a4);
+                });
+                return 0;
+            }
+            15 if is_fence(a1) => {
+                super::single::wait(this as usize, a1, a2 as u64);
+                return 0;
+            }
+            _ => super::single::host_after_held(this, "a queue method that cannot be held"),
+        },
+        None => this,
+    };
     let pc = |s: usize| orig_fn(this, s);
     match older {
         // Signal / Wait take a fence: anything else is not one of them
         14 | 15 if is_fence(a1) => {
+            if older == 14 {
+                super::list_x::break_cycles_before_title_signal(this as usize, a1, a2 as u64);
+            }
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(if older == 14 { PC_SIGNAL } else { PC_WAIT }));
-            f(this, a1, a2) as u32 as usize
+            if older == 15 {
+                super::wait_trace::wait(a1, a2 as u64, "queue Wait");
+            }
+            let hr = f(this, a1, a2);
+            if hr >= 0 {
+                if older == 14 {
+                    super::fence_x::note_queue_signal(a1, a2 as u64);
+                    super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
+                    super::wait_trace::signal(a1, a2 as u64, "queue Signal");
+                } else {
+                    super::fence_x::note_queue_wait(a1, a2 as u64);
+                    super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                }
+            }
+            hr as u32 as usize
         }
         16 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> i32 = std::mem::transmute(pc(PC_TIMESTAMP_FREQUENCY));
@@ -3719,13 +7825,37 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
             let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> i32 = std::mem::transmute(pc(PC_CLOCK_CALIBRATION));
             f(this, a1, a2) as u32 as usize
         }
+        // #18 before either layout is known: the older layout's GetDesc (a 16-byte structure) or
+        // the newer one's GetTimestampFrequency (a UINT64). Only the first 8 bytes of the
+        // description are written (type and priority), so an 8-byte out-param is not overrun.
+        18 if !shifted && !older_flag.load(Ordering::Acquire) => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_warn!("D3D12.X: queue #18 before the title's first Signal / Wait: the queue layout is not known yet, GetDesc writes only its first 8 bytes"));
+            let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
+            let mut desc = [0u8; 16];
+            f(this, desc.as_mut_ptr() as usize);
+            if a1 != 0 {
+                std::ptr::copy_nonoverlapping(desc.as_ptr(), a1 as *mut u8, 8);
+            }
+            a1
+        }
         // GetDesc returns its structure through the hidden pointer, and that pointer
         18 => {
             let f: unsafe extern "system" fn(*mut c_void, usize) -> usize = std::mem::transmute(pc(PC_GET_DESC));
             f(this, a1)
         }
         23 => q_signal_x(this, a1 as *mut c_void, a2 as u64, a3 as u32) as u32 as usize,
+        29 => super::page_mappings::copy_batch(a1 as u32, a2 as *const super::page_mappings::Batch, a3, a4 as u32) as u32 as usize,
         30 => super::present::present_x(this, a1 as u32, a2 as *const u8, a3 as *const u8) as u32 as usize,
+        // the newer layout's #35: ExecuteCommandListsX(count, lists, a value, flags) – a retail
+        // game submits all its command lists this way (flags 3; 0 for the one it recorded at
+        // start); as a stub nothing the title recorded ran on the GPU but its first two frames
+        33 if shifted => {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::xlog_info!("D3D12.X: queue #35 ExecuteCommandListsX ({} lists, value {a3:#x}, flags {a4:#x})", a1));
+            q_execute_command_lists(this, a1 as u32, a2 as *const *mut c_void);
+            0
+        }
         _ => {
             // a console method not modelled: logged once, S_OK (as the stubs it replaces; frame
             // pacing on queue methods keeps working for titles without PresentX)
@@ -3760,7 +7890,7 @@ macro_rules! queue_slots {
         }),*];
     };
 }
-queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34);
+queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35);
 
 /// command queue #23 SignalX(fence, value, flush flags): Signal with the console's cache flush
 /// options – the PC's Signal makes the queue's writes visible itself. (A stub that signalled
@@ -3768,8 +7898,67 @@ queue_slots!(14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 /// never released, and the garbage collector ended the game after 10 s.)
 unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, value: u64, _flags: u32) -> HRESULT {
     const PC_SIGNAL: usize = 14;
+    super::list_x::break_cycles_before_title_signal(this as usize, fence as usize, value);
     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, PC_SIGNAL));
-    f(this, fence, value)
+    let hr = f(this, fence, value);
+    if hr >= 0 {
+        super::fence_x::note_queue_signal(fence as usize, value);
+        super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
+        super::wait_trace::signal(fence as usize, value, "queue SignalX");
+    }
+    hr
+}
+
+/// Fence::Signal (CPU)
+unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Signal")));
+    let hr = f(this, value);
+    super::fence_x::note_cpu_signal(this as usize);
+    super::wait_trace::signal(this as usize, value, "CPU Signal");
+    super::single::poke();
+    hr
+}
+
+/// Fence::SetEventOnCompletion (`XCL_TRACE_WAITS`: followed; without an event it blocks, timed)
+unsafe extern "system" fn fence_set_event(this: *mut c_void, value: u64, event: *mut c_void) -> HRESULT {
+    let f: unsafe extern "system" fn(*mut c_void, u64, *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetEventOnCompletion")));
+    if !super::wait_trace::enabled() {
+        return f(this, value, event);
+    }
+    if !event.is_null() {
+        super::wait_trace::wait(this as usize, value, "CPU event wait");
+        return f(this, value, event);
+    }
+    let t0 = std::time::Instant::now();
+    let hr = f(this, value, event);
+    super::wait_trace::waited(this as usize, value, "CPU blocking wait", t0.elapsed());
+    hr
+}
+
+unsafe extern "system" fn q_update_tile_mappings(
+    this: *mut c_void, resource: *mut c_void, n: u32, coordinates: *const D3D12_TILED_RESOURCE_COORDINATE,
+    regions: *const D3D12_TILE_REGION_SIZE, heap: *mut c_void, ranges: u32, range_flags: *const D3D12_TILE_RANGE_FLAGS,
+    offsets: *const u32, counts: *const u32, flags: D3D12_TILE_MAPPING_FLAGS,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *const D3D12_TILED_RESOURCE_COORDINATE,
+        *const D3D12_TILE_REGION_SIZE, *mut c_void, u32, *const D3D12_TILE_RANGE_FLAGS, *const u32, *const u32, D3D12_TILE_MAPPING_FLAGS);
+    let this = super::single::host_after_held(this, "UpdateTileMappings");
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "UpdateTileMappings")));
+    super::residency::link(resource as usize, heap as usize);
+    f(this, resource, n, coordinates, regions, heap, ranges, range_flags, offsets, counts, flags);
+}
+
+unsafe extern "system" fn q_copy_tile_mappings(
+    this: *mut c_void, dst: *mut c_void, dst_coord: *const D3D12_TILED_RESOURCE_COORDINATE,
+    src: *mut c_void, src_coord: *const D3D12_TILED_RESOURCE_COORDINATE, region: *const D3D12_TILE_REGION_SIZE,
+    flags: D3D12_TILE_MAPPING_FLAGS,
+) {
+    type F = unsafe extern "system" fn(*mut c_void, *mut c_void, *const D3D12_TILED_RESOURCE_COORDINATE,
+        *mut c_void, *const D3D12_TILED_RESOURCE_COORDINATE, *const D3D12_TILE_REGION_SIZE, D3D12_TILE_MAPPING_FLAGS);
+    let this = super::single::host_after_held(this, "CopyTileMappings");
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyTileMappings")));
+    super::residency::copy_links(dst as usize, src as usize);
+    f(this, dst, dst_coord, src, src_coord, region, flags);
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
@@ -3780,19 +7969,43 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
         stop_if_device_removed();
         return;
     }
+    // console-shaped lists run as the PC lists they were translated into (split title lists expand
+    // into all of their recorded PC segments in exact chronological order)
+    let mut mapped: Vec<*mut c_void> = Vec::with_capacity(n as usize);
+    for &l in std::slice::from_raw_parts(lists, n as usize) {
+        if let Some(pc) = super::console_list::pc_list(l) {
+            mapped.push(pc);
+        } else if !super::title_list::push_segments(l, &mut mapped) {
+            mapped.push(l);
+        }
+    }
+    // (`single`) the PC queue of every title queue gets them, when the queue's earlier work
+    // and what these lists wait for have been handed over
+    if super::single::host_of(this).is_some() {
+        return super::single::execute(this as usize, mapped.iter().map(|&l| l as usize).collect());
+    }
+    execute_mapped(this, &mapped);
+}
+
+/// Hand the PC lists `mapped` to the queue `this`, with all that goes with a submission.
+pub(super) unsafe fn execute_mapped(this: *mut c_void, mapped: &[*mut c_void]) {
+    type F = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+    let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteCommandLists")));
     // textures in title memory the CPU wrote since: uploaded again first
     super::title_textures::refresh(this);
-    // console-shaped lists run as the PC lists they were translated into
-    let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
-        .iter()
-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
-        .collect();
-    super::list_x::note_queue_for_lists(this as usize, &mapped);
-    super::list_x::execute_with_waits(&mapped, |chunk| {
+    super::list_x::note_queue_for_lists(this as usize, mapped);
+    let submission = super::residency::before_submit(this, mapped);
+    super::list_x::execute_with_waits_on(this, mapped, |chunk| {
+        super::markers::submitted(this as usize, chunk);
         f(this, chunk.len() as u32, chunk.as_ptr());
+        super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
+        super::list_x::cpu_writes_after(this, chunk);
     });
-    super::present::note_execute(this, &mapped);
+    super::residency::after_submit(this, submission);
+    // the next uploads into textures kept in step start from the states these lists leave
+    super::title_textures::submitted(mapped);
+    super::present::note_execute(this, mapped);
     stop_if_device_removed();
 }
 
@@ -3860,39 +8073,84 @@ pub fn log_device_removed() {
         return;
     }
     crate::xlog_error!("D3D12 device removed: {:#x} {}", e.code().0 as u32, e.message());
+    super::markers::snapshot("the device was removed");
+    super::bind::indirect_args_at_removal();
     unsafe {
-        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else { return };
-        if let Ok(pf) = dred.GetPageFaultAllocationOutput() {
-            let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
-                let mut v = Vec::new();
-                while !n.is_null() && v.len() < 8 {
-                    let a = &*n;
-                    let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
-                    v.push(format!("type {} {}", a.AllocationType.0, name));
-                    n = a.pNext;
-                }
-                v.join(", ")
-            };
-            let va = pf.PageFaultVA;
-            let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-            crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+        let Ok(dred) = dev.cast::<ID3D12DeviceRemovedExtendedData>() else {
+            crate::xlog_error!("DRED: the device has no ID3D12DeviceRemovedExtendedData");
+            return;
+        };
+        match dred.GetPageFaultAllocationOutput() {
+            Err(e) => crate::xlog_error!("DRED: no page-fault output ({e})"),
+            Ok(pf) => {
+                let names = |mut n: *const D3D12_DRED_ALLOCATION_NODE| {
+                    let mut v = Vec::new();
+                    while !n.is_null() && v.len() < 8 {
+                        let a = &*n;
+                        let name = if a.ObjectNameA.is_null() { String::new() } else { std::ffi::CStr::from_ptr(a.ObjectNameA as *const std::ffi::c_char).to_string_lossy().into_owned() };
+                        v.push(format!("type {} {}", a.AllocationType.0, name));
+                        n = a.pNext;
+                    }
+                    v.join(", ")
+                };
+                let va = pf.PageFaultVA;
+                let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
+                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+            }
         }
-        if let Ok(bc) = dred.GetAutoBreadcrumbsOutput() {
-            let mut n = bc.pHeadAutoBreadcrumbNode;
-            let mut k = 0;
-            while !n.is_null() && k < 64 {
-                let node = &*n;
-                let count = node.BreadcrumbCount as usize;
-                let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
-                if done < count {
+        let bc = match dred.GetAutoBreadcrumbsOutput() {
+            Ok(bc) => bc,
+            Err(e) => {
+                crate::xlog_error!("DRED: no breadcrumbs output ({e})");
+                return;
+            }
+        };
+        let mut n = bc.pHeadAutoBreadcrumbNode;
+        let (mut lists, mut unfinished) = (0, 0);
+        while !n.is_null() && lists < 4096 {
+            let node = &*n;
+            let count = node.BreadcrumbCount as usize;
+            let done = if node.pLastBreadcrumbValue.is_null() { 0 } else { *node.pLastBreadcrumbValue as usize };
+            lists += 1;
+            if done < count {
+                unfinished += 1;
+                if unfinished <= 64 {
                     let ops: Vec<String> = (done.saturating_sub(3)..(done + 3).min(count)).map(|i| format!("{}{}", if i == done { ">" } else { "" }, (*node.pCommandHistory.add(i)).0)).collect();
                     crate::xlog_error!("DRED: list {:p} on queue {:p}: {done} of {count} operations done, around: {}", node.pCommandList.as_ref().map_or(std::ptr::null_mut(), |l| l.as_raw()), node.pCommandQueue.as_ref().map_or(std::ptr::null_mut(), |q| q.as_raw()), ops.join(" "));
                 }
-                n = node.pNext;
-                k += 1;
             }
+            n = node.pNext;
         }
+        let why = if lists == 0 {
+            " – none recorded: breadcrumbs were not on for this device"
+        } else if unfinished == 0 {
+            " – every recorded list finished: the hang is in work without breadcrumbs"
+        } else {
+            ""
+        };
+        crate::xlog_error!("DRED: {lists} command lists with breadcrumbs, {unfinished} of them unfinished{why}");
     }
+}
+
+/// The device's removal (a GPU hang or reset) stops the title at once (`stop_if_device_removed`),
+/// whichever of its calls meets it first: a fence's event for `u64::MAX` is set when the device is
+/// removed. A title that goes on gets failing D3D12 calls, and code that does not check them
+/// crashes on them (FSR4 read through a null model after its CreateModel failed), which hides
+/// the hang behind a crash somewhere else.
+unsafe fn watch_device_removal() {
+    let raw = device_raw();
+    let Some(dev) = ID3D12Device::from_raw_borrowed(&raw) else { return };
+    let Ok(fence) = create_residency_fence(dev) else { return };
+    let Ok(event) = windows::Win32::System::Threading::CreateEventW(None, false, false, None) else { return };
+    if fence.SetEventOnCompletion(u64::MAX, event).is_err() {
+        return;
+    }
+    let (fence, event) = (fence.into_raw() as usize, event.0 as usize);
+    let _ = std::thread::Builder::new().name("xcl-device-removed".into()).spawn(move || {
+        let _kept = fence;
+        windows::Win32::System::Threading::WaitForSingleObject(windows::Win32::Foundation::HANDLE(event as *mut c_void), windows::Win32::System::Threading::INFINITE);
+        stop_if_device_removed();
+    });
 }
 
 /// The GPU hung or the device was removed: the title is stopped at once (a title that goes on
@@ -3909,6 +8167,162 @@ pub fn stop_if_device_removed() {
         crate::log::flush();
         unsafe {
             windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), e.code().0 as u32);
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_state_console_tests {
+    use super::*;
+
+    #[test]
+    fn console_pipeline_blob_query_gives_no_blob_and_clears_the_out_pointer() {
+        let mut out = 0x1234usize as *mut c_void;
+        let hr = unsafe { pso_console_blob_x(std::ptr::null_mut(), 0, 0, &mut out) };
+        assert_eq!(hr, E_NOTIMPL_HR);
+        assert!(out.is_null());
+        assert!(console_slots(Kind::PipelineState).contains(&(11, pso_console_blob_x as usize)));
+    }
+
+    #[test]
+    fn a_compute_pipeline_keeps_why_it_has_no_translation_until_it_is_released() {
+        let pso = 0x7654_3210usize;
+        note_untranslated(pso, "CS 0123456789abcdef: unsupported op".into());
+        assert_eq!(why_untranslated(pso).as_deref(), Some("CS 0123456789abcdef: unsupported op"));
+        forget_pso(pso);
+        assert_eq!(why_untranslated(pso), None);
+    }
+
+    #[test]
+    fn a_giant_program_is_expected_to_need_3_3_gb_for_each_mb() {
+        assert_eq!(peak(6 << 20), 6 * 3380 << 20);
+        assert_eq!(peak(GIANT_DXIL), 3380 << 20);
+        assert_eq!(peak(512 << 10), 768 << 20);
+        assert_eq!(peak(1000), 256 << 20);
+    }
+}
+
+#[cfg(test)]
+mod rect_list_pso_tests {
+    use super::*;
+
+    const REFUSED: HRESULT = 0x8007_0057u32 as i32;
+
+    fn with_gs(gs: &[u8]) -> D3D12_GRAPHICS_PIPELINE_STATE_DESC {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC { GS: D3D12_SHADER_BYTECODE { pShaderBytecode: gs.as_ptr() as _, BytecodeLength: gs.len() }, ..Default::default() }
+    }
+
+    /// A pipeline the driver refuses with the rect list GS is made again without it, once; one
+    /// it accepts keeps the GS, and a refused pipeline without a rect list GS is not retried.
+    #[test]
+    fn a_refused_rect_list_gs_is_retried_without_it() {
+        let gs = [0u8; 4];
+        let mut copy = with_gs(&gs);
+        let mut calls = Vec::new();
+        let hr = retry_without_rect_gs(&mut copy, true, (0, 0), |c| {
+            calls.push(c.GS.pShaderBytecode.is_null());
+            if c.GS.pShaderBytecode.is_null() {
+                0
+            } else {
+                REFUSED
+            }
+        });
+        assert_eq!((hr, calls), (0, vec![false, true]));
+        let mut copy = with_gs(&gs);
+        let mut n = 0;
+        assert_eq!(
+            retry_without_rect_gs(&mut copy, true, (0, 0), |_| {
+                n += 1;
+                0
+            }),
+            0
+        );
+        assert!(n == 1 && !copy.GS.pShaderBytecode.is_null());
+        let mut n = 0;
+        assert_eq!(
+            retry_without_rect_gs(&mut copy, false, (0, 0), |_| {
+                n += 1;
+                REFUSED
+            }),
+            REFUSED
+        );
+        assert!(n == 1 && !copy.GS.pShaderBytecode.is_null());
+    }
+
+    /// `has_rect_list_gs`: a pipeline made with the rect list GS, not one made again without it
+    /// (or never given it), and not once its address is forgotten.
+    #[test]
+    fn pipelines_with_the_rect_list_gs_are_known_until_forgotten() {
+        let gs = [0u8; 4];
+        let (kept, dropped, none) = (0x7E57_1000usize, 0x7E57_2000usize, 0x7E57_3000usize);
+        let mut copy = with_gs(&gs);
+        note_rect_list_gs(kept, &copy, true);
+        assert!(retry_without_rect_gs(&mut copy, true, (0, 0), |c| if c.GS.pShaderBytecode.is_null() { 0 } else { REFUSED }) == 0);
+        note_rect_list_gs(dropped, &copy, true);
+        note_rect_list_gs(none, &with_gs(&gs), false);
+        assert!(has_rect_list_gs(kept) && !has_rect_list_gs(dropped) && !has_rect_list_gs(none) && !has_rect_list_gs(0));
+        forget_pso(kept);
+        assert!(!has_rect_list_gs(kept));
+    }
+
+    /// An untranslated rect list pipeline from a stream gets the PC's topology type (TRIANGLE),
+    /// as at 956a476; other types, and a direct CreateGraphicsPipelineState, are left as they are.
+    #[test]
+    fn untranslated_stream_rect_lists_get_the_pcs_topology_type() {
+        let at = |t: i32| D3D12_GRAPHICS_PIPELINE_STATE_DESC { PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE(t), ..Default::default() };
+        let desc = |g: &D3D12_GRAPHICS_PIPELINE_STATE_DESC| g as *const _ as *const c_void;
+        let (rect, tri) = (at(RECT_LIST_TYPE), at(3));
+        unsafe {
+            let g = untranslated_stream_desc(desc(&rect), true).expect("a stream's rect list");
+            assert_eq!(g.PrimitiveTopologyType, D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+            assert!(untranslated_stream_desc(desc(&tri), true).is_none());
+            assert!(untranslated_stream_desc(desc(&rect), false).is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod this_first_tests {
+    use super::*;
+
+    /// `this_first`: either argument order, and a return buffer whose first word is a stale copy
+    /// of the object's vtable pointer (7a033c8: the retail game's C-way call wrote its result
+    /// over the device). Synthetic objects; no GPU and no title.
+    #[test]
+    fn a_return_buffer_with_a_stale_vtable_copy_is_not_the_object() {
+        let pc = [0usize; 32];
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        EXTS.lock().unwrap().get_or_insert_with(HashSet::new).insert(vtbl);
+        let plain = 0x1234_5678usize;
+        let p = &plain as *const usize as *mut c_void;
+        // an object off the stack (as a real device is), and a stack buffer holding a stale copy
+        // of its vtable pointer - the retail game's case
+        let obj = Box::into_raw(Box::new([vtbl])) as *mut c_void;
+        let buf = [vtbl];
+        let b = buf.as_ptr() as *mut c_void;
+        unsafe {
+            assert!(is_adopted(obj) && is_adopted(b), "both look adopted");
+            // one adopted: that one is the object, either position
+            assert!(this_first(obj, p));
+            assert!(!this_first(p, obj));
+            // neither adopted: unchanged (the C way is assumed)
+            assert!(!this_first(p, p) && !this_first(std::ptr::null_mut(), std::ptr::null_mut()));
+            // one null argument: the other is taken as `this`, either position
+            assert!(this_first(obj, std::ptr::null_mut()));
+            assert!(!this_first(std::ptr::null_mut(), obj));
+            // both adopted, one on this thread's stack: the stack one is the buffer, so the heap
+            // one is `this` in either order - what 7a033c8 fixed
+            assert!(this_first(obj, b));
+            assert!(!this_first(b, obj));
+            // both on the stack, neither the device: `a` (the C++ way)
+            let stale = [vtbl];
+            let s = stale.as_ptr() as *mut c_void;
+            assert!(this_first(b, s) && this_first(s, b));
+            drop(Box::from_raw(obj as *mut [usize; 1]));
+        }
+        if let Some(g) = EXTS.lock().unwrap().as_mut() {
+            g.remove(&vtbl);
         }
     }
 }
@@ -3932,6 +8346,801 @@ mod cache_report_tests {
 #[cfg(test)]
 mod device_abi_tests {
     use super::*;
+
+    #[test]
+    fn fence_slot_12_exposes_live_completed_value() {
+        use std::time::{Duration, Instant};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let method = console_slots(Kind::Fence).into_iter().find_map(|(slot, f)| (slot == 12).then_some(f))
+            .expect("console completed-value address at fence slot 12");
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let gate: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            let fence: ID3D12Fence = dev.CreateFence(7, D3D12_FENCE_FLAG_NONE).unwrap();
+            let address: unsafe extern "system" fn(*mut c_void) -> *const AtomicU64 = std::mem::transmute(method);
+            let word = address(fence.as_raw()).as_ref().expect("readable fence value");
+            assert_eq!(word.load(Ordering::Acquire), 7);
+            assert_eq!(address(fence.as_raw()), word as *const _);
+            assert_ne!(address(gate.as_raw()), word as *const _);
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            queue.Wait(&gate, 1).unwrap();
+            let signal = queue.Signal(&fence, 21);
+            let pending = word.load(Ordering::Acquire);
+            gate.Signal(1).unwrap();
+            signal.unwrap();
+            assert_eq!(pending, 7, "an enqueued signal is not a completed signal");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while word.load(Ordering::Acquire) == 7 && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(word.load(Ordering::Acquire), 21);
+            assert_eq!(fence.GetCompletedValue(), 21);
+        }
+    }
+
+    #[test]
+    fn slot_133_mirrors_a_write_combined_title_pool_buffer() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let raw = device_raw();
+        let mut desc = [0u8; 0x38];
+        let bytes = 0x70800;
+        for (offset, value) in [(0, 1u32), (0x10, bytes), (0x18, 1), (0x1c, 0x10001), (0x24, 1), (0x30, 0x20004)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let allocation = crate::hle::kernelx::XMemVirtualAlloc(std::ptr::null(), 0x100000,
+                MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, 0x283, 0x2404);
+            assert!(!allocation.is_null());
+            let title = allocation.byte_add(0x20000);
+            title.cast::<u8>().write(0x82);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            let hr = super::super::device_x::create_placed_resource_layout_x(raw, title as u64, desc.as_ptr(),
+                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut resource);
+            if hr < 0 {
+                crate::hle::kernelx::VirtualFree(allocation, 0, MEM_RELEASE);
+            }
+            assert_eq!(hr, S_OK, "write-combined title pool placement: {hr:#x}");
+            let resource = ID3D12Resource::from_raw(resource);
+            let (mirror, size) = console_buffer(resource.as_raw() as usize).expect("UMA-backed buffer");
+            assert_eq!(size, bytes as usize);
+            assert_eq!(resource.GetDesc().Flags, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+            assert_eq!((mirror as *const u8).read(), 0x82);
+            let view = buffer_view(resource.as_raw() as usize, Default::default(), 0, bytes / 4, 0, true);
+            assert_eq!(view[2], bytes);
+
+            let mut overlapping = std::ptr::null_mut();
+            assert_eq!(super::super::device_x::create_placed_resource_layout_x(raw, title as u64, desc.as_ptr(),
+                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut overlapping), crate::util::E_INVALIDARG);
+            assert!(overlapping.is_null());
+
+            let queue: ID3D12CommandQueue = ID3D12Device::from_raw_borrowed(&raw).unwrap()
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let offset = 0x70000;
+            title.byte_add(offset).cast::<u8>().write(0xc3);
+            super::super::title_textures::refresh(queue.as_raw());
+            let mirrored = (mirror + offset) as *mut u8;
+            assert_eq!(mirrored.read(), 0xc3);
+            mirrored.write(0);
+            super::super::sparse::readback_after_execute(&queue, &[(mirror + offset, 1)]);
+            assert_eq!(mirrored.read(), 0xc3, "the updated byte reached video memory");
+
+            drop(resource);
+            assert_eq!(crate::hle::kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
+            assert!(!crate::hle::kernelx::in_graphics_reservation(title as usize));
+        }
+    }
+
+    #[test]
+    fn slot_133_mirrors_a_remapped_buffer_in_a_host_reservation() {
+        use crate::{gpu::uma, hle::kernelx};
+        use super::super::{device_x, sparse, title_textures};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, PAGE_WRITECOMBINE};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let raw = device_raw();
+        let bytes = 50 << 20;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 1u32), (0x10, bytes), (0x18, 1), (0x1c, 0x10001), (0x24, 1), (0x30, 0x20004)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let allocation = kernelx::XMemVirtualAlloc(std::ptr::null(), uma::MAX_WINDOWS * uma::WINDOW + uma::GRAIN,
+                MEM_RESERVE | 0x2040_0000, 0x23, 0x2404);
+            assert!(!allocation.is_null());
+            assert!(!uma::get().unwrap().contains(allocation as usize));
+            let title = allocation.byte_add(2 * uma::GRAIN);
+            let mut count = bytes as usize / uma::GRAIN;
+            let mut pages = vec![0u64; count];
+            assert_eq!(kernelx::XMemAllocatePhysicalPages(0x380, &mut count, pages.as_mut_ptr()), 1);
+            assert_eq!(count, pages.len());
+            assert_eq!(kernelx::VirtualAlloc(title, bytes as usize, MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE), title);
+            assert_eq!(kernelx::XMemMapPhysicalPages(title, count, pages.as_mut_ptr()), title);
+            title.cast::<u8>().write(0x82);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            let hr = device_x::create_placed_resource_layout_x(raw, title as u64, desc.as_ptr(),
+                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut resource);
+            assert_eq!(hr, S_OK, "placement in the host fallback reservation: {hr:#x}");
+            let resource = ID3D12Resource::from_raw(resource);
+            let (mirror, size) = console_buffer(resource.as_raw() as usize).unwrap();
+            assert_eq!(size, bytes as usize);
+            assert_eq!((mirror as *const u8).read(), 0x82);
+            assert_eq!(res_gpu_va_x(resource.as_raw()), mirror as u64);
+
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let last = bytes as usize - 1;
+            title.cast::<u8>().add(last).write(0x5a);
+            title_textures::refresh(queue.as_raw());
+            let end = (mirror + last) as *mut u8;
+            end.write(0);
+            sparse::readback_after_execute(&queue, &[(mirror + last, 1)]);
+            assert_eq!(end.read(), 0x5a);
+
+            drop(resource);
+            assert_eq!(kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
+            assert!(!kernelx::in_graphics_reservation(title as usize));
+            assert_eq!(kernelx::XMemFreePhysicalPages(count, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    #[test]
+    fn slot_133_mirrors_subpage_buffers_without_copying_neighbors() {
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let raw = device_raw();
+        unsafe {
+            let allocation = crate::hle::kernelx::XMemVirtualAlloc(std::ptr::null(), 0x4000,
+                MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, 0x283, 0x2404);
+            assert!(!allocation.is_null());
+            let small_at = allocation.byte_add(0xc20);
+            let large_at = small_at.byte_add(0x10);
+            let resource = |at: *mut c_void, bytes: u32| {
+                let mut desc = [0u8; 0x38];
+                for (offset, value) in [(0, 1u32), (0x10, bytes), (0x18, 1), (0x1c, 0x10001), (0x24, 1), (0x30, 0x20004)] {
+                    desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+                let mut resource = std::ptr::null_mut();
+                let hr = super::super::device_x::create_placed_resource_layout_x(raw, at as u64, desc.as_ptr(),
+                    D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut resource);
+                assert_eq!(hr, S_OK, "subpage title pool placement: {hr:#x}");
+                ID3D12Resource::from_raw(resource)
+            };
+            small_at.byte_sub(1).cast::<u8>().write(0x55);
+            large_at.cast::<u8>().write(0x77);
+            let small = resource(small_at, 0x10);
+            let large = resource(large_at, 0x2000);
+            let small_mirror = console_buffer(small.as_raw() as usize).unwrap().0 as *mut u8;
+            let large_mirror = console_buffer(large.as_raw() as usize).unwrap().0 as *mut u8;
+            let queue: ID3D12CommandQueue = ID3D12Device::from_raw_borrowed(&raw).unwrap()
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            super::super::title_textures::refresh(queue.as_raw());
+            small_at.byte_add(7).cast::<u8>().write(0x31);
+            large_at.cast::<u8>().write(0x62);
+            large_at.byte_add(0x400).cast::<u8>().write(0x91);
+            large_at.byte_add(0x1100).cast::<u8>().write(0xb4);
+            super::super::title_textures::refresh(queue.as_raw());
+            assert_eq!(small_mirror.add(7).read(), 0x31);
+            assert_eq!(small_mirror.add(0x10).read(), 0);
+            assert_eq!(large_mirror.read(), 0x62);
+            large_mirror.add(0x400).write(0);
+            large_mirror.add(0x1100).write(0);
+            super::super::sparse::readback_after_execute(&queue, &[(large_mirror as usize + 0x400, 1), (large_mirror as usize + 0x1100, 1)]);
+            assert_eq!((large_mirror.add(0x400).read(), large_mirror.add(0x1100).read()), (0x91, 0xb4));
+            small_at.byte_add(7).cast::<u8>().write(0xe1);
+            let mut mapped = std::ptr::null_mut();
+            small.Map(0, Some(&D3D12_RANGE { Begin: 7, End: 8 }), Some(&mut mapped)).unwrap();
+            assert_eq!(mapped, small_at);
+            assert_eq!(mapped.byte_add(7).cast::<u8>().read(), 0xe1);
+            small.Unmap(0, None);
+            drop((small, large));
+            assert_eq!(crate::hle::kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
+        }
+    }
+
+    #[test]
+    fn placed_color_texture_exposes_the_guest_address() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32G32_FLOAT};
+        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_LARGE_PAGES, MEM_RELEASE, MEM_RESERVE};
+        use super::super::{device_x, title_textures, vram};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            for (format, bpe, layout, flags, offset) in [
+                (DXGI_FORMAT_R32G32_FLOAT, 8, 0x100, 0x10_0005, 0x2000),
+                (DXGI_FORMAT_R32_FLOAT, 4, 0, 0x30_0004, 0),
+                (DXGI_FORMAT_R32G32_FLOAT, 8, 0, 0x30_0005, 0),
+            ] {
+                let mut desc = [0u8; 0x38];
+                for (offset, value) in [(0, 3u32), (0x10, 256), (0x18, 256), (0x1c, 0x10001),
+                    (0x20, format.0 as u32), (0x24, 1), (0x2c, layout), (0x30, flags)] {
+                    desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                let tex = crate::hle::xg::Texture::new(&desc).unwrap();
+                let span = tex.size() as usize;
+                let allocation = crate::hle::kernelx::XMemVirtualAlloc(std::ptr::null(), span + offset,
+                    MEM_RESERVE | MEM_COMMIT | MEM_LARGE_PAGES, 0x283, 0x2404);
+                assert!(!allocation.is_null());
+                let guest = allocation.byte_add(offset);
+                assert_eq!(guest as u64 % tex.alignment(), 0, "valid console placement");
+                let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+                let mut out = std::ptr::null_mut();
+                let hr = device_x::create_placed_resource_layout_x(raw, guest as u64, desc.as_ptr(),
+                    D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS, std::ptr::null(), &iid, &mut out);
+                assert_eq!(hr, S_OK);
+                let resource = ID3D12Resource::from_raw(out);
+                assert_eq!(vram::is_placed_texture(out as usize), offset == 0);
+                assert_eq!(resource.GetGPUVirtualAddress(), 0, "PC textures have no buffer GPU VA");
+                assert_eq!(title_textures::address(out as usize), None);
+                let address = res_gpu_va_x(out);
+                assert_eq!(address, guest as u64, "the guest gets the storage it placed the texture in");
+                let tiled = std::slice::from_raw_parts_mut(address as *mut u8, span);
+                for phase in [21, 43] {
+                    let linear: Vec<u8> = (0usize..256 * 256 * bpe)
+                        .map(|i| (((i ^ (i >> 9)) * phase) & 127) as u8).collect();
+                    tex.texels().unwrap().chain.tile_level(tiled, 0, 0, &linear);
+                    title_textures::refresh(queue.as_raw());
+                    let read = title_textures::read_gpu_subresource(dev, &resource, 0, D3D12_RESOURCE_STATE_UNORDERED_ACCESS).unwrap();
+                    assert!(read == linear, "CPU-written texels must reach the native texture, format {format:?}, phase {phase}");
+                }
+                drop(resource);
+                assert_eq!(title_textures::address(out as usize), None);
+                assert_eq!(crate::hle::kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires D3D12 depth UAV support, such as Agility 1.722 Preview with app-local WARP"]
+    fn slot_133_creates_a_six_slice_depth_uav_texture() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_TYPELESS};
+
+        type Console = unsafe extern "system" fn(*mut c_void, u64, *const u8, D3D12_BARRIER_LAYOUT, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 133).then_some(f))
+            .expect("console placed resource adapter at slot 133");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 768), (0x18, 768), (0x1c, 0x10006), (0x20, DXGI_FORMAT_R16_TYPELESS.0 as u32), (0x24, 1), (0x30, 0x8030_0006)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D16_UNORM,
+            Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 1.0, Stencil: 0 } },
+        };
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            let hr = console(device_raw(), 0x4_2800_0000, desc.as_ptr(), D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                (&clear as *const D3D12_CLEAR_VALUE).cast(), &iid, &mut resource);
+            assert_eq!(hr, S_OK, "six-slice depth UAV texture: {hr:#x}");
+            assert!(!resource.is_null());
+            let resource = ID3D12Resource::from_raw(resource);
+            let actual = resource.GetDesc();
+            assert_eq!((actual.Width, actual.Height, actual.DepthOrArraySize, actual.MipLevels, actual.SampleDesc.Count), (768, 768, 6, 1, 1));
+            assert_eq!((actual.Format, actual.Flags), (DXGI_FORMAT_R16_TYPELESS, flags));
+        }
+    }
+
+    #[test]
+    fn slot_133_creates_an_hdr_target_in_unordered_access_layout() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+        type Console = unsafe extern "system" fn(*mut c_void, u64, *const u8, D3D12_BARRIER_LAYOUT, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 133).then_some(f))
+            .expect("console placed resource adapter at slot 133");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+            Anonymous: D3D12_CLEAR_VALUE_0 { Color: [0.0; 4] },
+        };
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 2560), (0x18, 1440), (0x1c, 0x10001), (0x20, clear.Format.0 as u32), (0x24, 1), (0x30, 0x30_0000 | flags.0 as u32)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            assert_eq!(console(device_raw(), 0x4_1000_0000, desc.as_ptr(), D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                (&clear as *const D3D12_CLEAR_VALUE).cast(), &iid, &mut resource), S_OK);
+            assert!(!resource.is_null());
+            let resource = ID3D12Resource::from_raw(resource);
+            let actual = resource.GetDesc();
+            assert_eq!((actual.Width, actual.Height, actual.Format, actual.Flags), (2560, 1440, clear.Format, flags));
+        }
+    }
+
+    #[test]
+    fn slot_133_creates_an_rgba16f_volume_with_uav_layout() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
+
+        type Console = unsafe extern "system" fn(*mut c_void, u64, *const u8, D3D12_BARRIER_LAYOUT, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 133).then_some(f))
+            .expect("console placed resource adapter at slot 133");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 4u32), (8, 0x1000), (0x10, 33), (0x18, 33), (0x1c, 0x10021), (0x20, format.0 as u32), (0x24, 1), (0x2c, 0x105), (0x30, 0x30_0000 | flags.0 as u32)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let dev_ptr = device_raw();
+            let mut resource = std::ptr::null_mut();
+            assert_eq!(console(dev_ptr, 0x4_2001_1000, desc.as_ptr(), D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                std::ptr::null(), &iid, &mut resource), S_OK);
+            assert!(!resource.is_null());
+            let resource = ID3D12Resource::from_raw(resource);
+            let actual = resource.GetDesc();
+            assert_eq!(actual.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE3D);
+            assert_eq!((actual.Width, actual.Height, actual.DepthOrArraySize, actual.MipLevels), (33, 33, 33, 1));
+            assert_eq!((actual.Format, actual.Flags), (format, flags));
+            let dev = ID3D12Device::from_raw_borrowed(&dev_ptr).unwrap();
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut rows = 0;
+            let mut row_bytes = 0;
+            dev.GetCopyableFootprints(&actual, 0, 1, 0, Some(&mut footprint), Some(&mut rows), Some(&mut row_bytes), None);
+            assert_eq!((footprint.Footprint.Depth, rows, row_bytes), (33, 33, 33 * 8));
+        }
+    }
+
+    #[test]
+    fn slot_25_sizes_a_console_d16s8_texture() {
+        type Console = unsafe extern "system" fn(*mut [u64; 2], *mut c_void, u32, u32, *const [u8; 0x38]) -> *mut [u64; 2];
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 25).then_some(f))
+            .expect("console allocation info at slot 25");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 2560), (0x18, 1440), (0x1c, 0x10001), (0x20, 118), (0x24, 1), (0x30, 0x8030_0006)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let mut info = [0; 2];
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            assert_eq!(console(&mut info, device_raw(), 1, 1, &desc), &raw mut info);
+        }
+        let htile = 3072 * 2048 / 16;
+        let depth = 2560u64 * 1536 * 2;
+        let stencil = 2560u64 * 1536;
+        assert_eq!(info, [htile + depth + stencil, 0x10000]);
+        let texture = crate::hle::xg::Texture::new(&desc).unwrap();
+        let (d, d_at) = texture.plane_surface(1).unwrap();
+        let (s, s_at) = texture.plane_surface(2).unwrap();
+        assert_eq!((d.bpe, s.bpe), (2, 1));
+        assert_eq!((d_at, s_at), (htile, htile + depth));
+    }
+
+    #[test]
+    fn slot_133_places_an_uninitialized_uint_texture() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32G32B32A32_UINT;
+        use super::super::{device_x, title_textures, vram};
+        use crate::gpu::texture::{self, Subresource};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let format = DXGI_FORMAT_R32G32B32A32_UINT;
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 1), (0x18, 1), (0x1c, 0x10001),
+            (0x20, format.0 as u32), (0x24, 1), (0x2c, 0x102), (0x30, 0x30_0000 | flags.0 as u32)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS12).cast(),
+                std::mem::size_of_val(&options) as u32).is_err() || !options.EnhancedBarriersSupported.as_bool() {
+                return;
+            }
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            let hr = device_x::create_placed_resource_layout_x(raw, 0x4_2900_0000, desc.as_ptr(),
+                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut resource);
+            assert_eq!(hr, S_OK, "uninitialized placed texture: {hr:#x}");
+            assert!(!resource.is_null());
+            assert!(vram::is_placed_texture(resource as usize));
+            assert_eq!(title_textures::address(resource as usize), None);
+            let resource_ptr = resource;
+            let resource = ID3D12Resource::from_raw(resource_ptr);
+            let actual = resource.GetDesc();
+            assert_eq!((actual.Dimension, actual.Width, actual.Height, actual.Format, actual.Flags),
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 1, 1, format, flags));
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList7 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let barrier = D3D12_TEXTURE_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_NONE, SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                AccessBefore: D3D12_BARRIER_ACCESS_NO_ACCESS, AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+                LayoutBefore: D3D12_BARRIER_LAYOUT_UNDEFINED, LayoutAfter: D3D12_BARRIER_LAYOUT_COMMON,
+                pResource: std::mem::transmute_copy(&resource),
+                Subresources: D3D12_BARRIER_SUBRESOURCE_RANGE { IndexOrFirstMipLevel: u32::MAX, ..Default::default() },
+                Flags: D3D12_TEXTURE_BARRIER_FLAG_DISCARD,
+            };
+            list.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: &barrier }
+            }]);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            texture::wait(dev, &queue).unwrap();
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let texel = Subresource { rows: 1, row_bytes: 16, depth: 1, data: (0..16).map(|i| (i * 13 + 9) as u8).collect() };
+            texture::upload(dev, &queue, &resource, std::slice::from_ref(&texel), common, common).unwrap();
+            assert_eq!(title_textures::read_gpu_subresource(dev, &resource, 0, common).unwrap(), texel.data);
+            drop(resource);
+            assert!(!vram::is_placed_texture(resource_ptr as usize));
+        }
+    }
+
+    #[test]
+    fn slot_133_places_an_uninitialized_depth_texture() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32G8X24_TYPELESS};
+        use super::super::{device_x, title_textures, vram};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let format = DXGI_FORMAT_R32G8X24_TYPELESS;
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 128), (0x18, 128), (0x1c, 0x10001),
+            (0x20, format.0 as u32), (0x24, 1), (0x30, 0x80_30_0000 | flags.0 as u32)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let clear = D3D12_CLEAR_VALUE {
+            Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+            Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.625, Stencil: 0x5a } },
+        };
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device::from_raw_borrowed(&raw).unwrap();
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS12::default();
+            if dev.CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS12, (&mut options as *mut D3D12_FEATURE_DATA_D3D12_OPTIONS12).cast(),
+                std::mem::size_of_val(&options) as u32).is_err() || !options.EnhancedBarriersSupported.as_bool() {
+                return;
+            }
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let mut resource = std::ptr::null_mut();
+            let hr = device_x::create_placed_resource_layout_x(raw, 0x4_2a00_0000, desc.as_ptr(),
+                D3D12_BARRIER_LAYOUT_UNDEFINED, (&clear as *const D3D12_CLEAR_VALUE).cast(), &iid, &mut resource);
+            assert_eq!(hr, S_OK, "uninitialized placed depth texture: {hr:#x}");
+            assert!(!resource.is_null());
+            assert!(vram::is_placed_texture(resource as usize));
+            let resource = ID3D12Resource::from_raw(resource);
+            let actual = resource.GetDesc();
+            assert_eq!((actual.Dimension, actual.Width, actual.Height, actual.Format, actual.Flags),
+                (D3D12_RESOURCE_DIMENSION_TEXTURE2D, 128, 128, format, flags));
+            let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList7 = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
+            let heap: ID3D12DescriptorHeap = dev.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
+                Type: D3D12_DESCRIPTOR_HEAP_TYPE_DSV, NumDescriptors: 1, ..Default::default()
+            }).unwrap();
+            let handle = heap.GetCPUDescriptorHandleForHeapStart();
+            dev.CreateDepthStencilView(&resource, Some(&D3D12_DEPTH_STENCIL_VIEW_DESC {
+                Format: clear.Format, ViewDimension: D3D12_DSV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_DEPTH_STENCIL_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_DSV { MipSlice: 0 } },
+                ..Default::default()
+            }), handle);
+            let transition = |barrier: &D3D12_TEXTURE_BARRIER| list.Barrier(&[D3D12_BARRIER_GROUP {
+                Type: D3D12_BARRIER_TYPE_TEXTURE, NumBarriers: 1, Anonymous: D3D12_BARRIER_GROUP_0 { pTextureBarriers: barrier }
+            }]);
+            let all = D3D12_BARRIER_SUBRESOURCE_RANGE { IndexOrFirstMipLevel: u32::MAX, ..Default::default() };
+            transition(&D3D12_TEXTURE_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_NONE, SyncAfter: D3D12_BARRIER_SYNC_DEPTH_STENCIL,
+                AccessBefore: D3D12_BARRIER_ACCESS_NO_ACCESS, AccessAfter: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE,
+                LayoutBefore: D3D12_BARRIER_LAYOUT_UNDEFINED, LayoutAfter: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE,
+                pResource: std::mem::transmute_copy(&resource), Subresources: all, Flags: D3D12_TEXTURE_BARRIER_FLAG_DISCARD,
+            });
+            list.ClearDepthStencilView(handle, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.625, 0x5a, None);
+            transition(&D3D12_TEXTURE_BARRIER {
+                SyncBefore: D3D12_BARRIER_SYNC_DEPTH_STENCIL, SyncAfter: D3D12_BARRIER_SYNC_ALL,
+                AccessBefore: D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE, AccessAfter: D3D12_BARRIER_ACCESS_COMMON,
+                LayoutBefore: D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE, LayoutAfter: D3D12_BARRIER_LAYOUT_COMMON,
+                pResource: std::mem::transmute_copy(&resource), Subresources: all, Flags: D3D12_TEXTURE_BARRIER_FLAG_NONE,
+            });
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            crate::gpu::texture::wait(dev, &queue).unwrap();
+            let common = D3D12_RESOURCE_STATE_COMMON;
+            let depth = title_textures::read_gpu_subresource(dev, &resource, 0, common).unwrap();
+            let stencil = title_textures::read_gpu_subresource(dev, &resource, 1, common).unwrap();
+            assert_eq!(depth.len(), 128 * 128 * 4);
+            assert!(depth.chunks_exact(4).all(|v| v == 0.625f32.to_le_bytes()));
+            assert_eq!(stencil.len(), 128 * 128);
+            assert!(stencil.iter().all(|&v| v == 0x5a));
+        }
+    }
+
+    #[test]
+    fn slot_133_creates_a_1d_r32_texture_with_uav_layout() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_FLOAT;
+
+        type Console = unsafe extern "system" fn(*mut c_void, u64, *const u8, D3D12_BARRIER_LAYOUT, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 133).then_some(f))
+            .expect("console placed resource adapter at slot 133");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let format = DXGI_FORMAT_R32_FLOAT;
+        let flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 2u32), (0x10, 4096), (0x18, 1), (0x1c, 0x10001), (0x20, format.0 as u32), (0x24, 1), (0x2c, 0x100), (0x30, 0x30_0000 | flags.0 as u32)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let dev = device_raw();
+            let mut resource = std::ptr::null_mut();
+            assert_eq!(console(dev, 0x4_2400_0000, desc.as_ptr(), D3D12_BARRIER_LAYOUT_UNORDERED_ACCESS,
+                std::ptr::null(), &iid, &mut resource), S_OK);
+            assert!(!resource.is_null());
+            let resource = ID3D12Resource::from_raw(resource);
+            let actual = resource.GetDesc();
+            assert_eq!(actual.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE1D);
+            assert_eq!((actual.Width, actual.Height, actual.DepthOrArraySize, actual.MipLevels), (4096, 1, 1, 1));
+            assert_eq!((actual.Format, actual.Flags), (format, flags));
+            let dev = ID3D12Device::from_raw_borrowed(&dev).unwrap();
+            let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+            let mut rows = 0;
+            let mut row_bytes = 0;
+            dev.GetCopyableFootprints(&actual, 0, 1, 0, Some(&mut footprint), Some(&mut rows), Some(&mut row_bytes), None);
+            assert_eq!((footprint.Footprint.Depth, rows, row_bytes), (1, 1, 4096 * 4));
+        }
+    }
+
+    #[test]
+    fn slot_133_creates_msaa_color_and_depth_targets() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM,
+        };
+
+        type Console = unsafe extern "system" fn(*mut c_void, u64, *const u8, D3D12_BARRIER_LAYOUT, *const c_void, *const GUID, *mut *mut c_void) -> HRESULT;
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 133).then_some(f))
+            .expect("console placed resource adapter at slot 133");
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        unsafe {
+            let console: Console = std::mem::transmute(method);
+            let raw = device_raw();
+            let iid = GUID::from_u128(ID3D12Resource::IID.to_u128());
+            let color = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                Anonymous: D3D12_CLEAR_VALUE_0 { Color: [1.0; 4] },
+            };
+            let depth = D3D12_CLEAR_VALUE {
+                Format: DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                Anonymous: D3D12_CLEAR_VALUE_0 { DepthStencil: D3D12_DEPTH_STENCIL_VALUE { Depth: 0.0, Stencil: 0 } },
+            };
+            for (va, format, flags, clear) in [
+                (0x4_0000_0000, color.Format, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, color),
+                (0x4_0040_0000, DXGI_FORMAT_R32G8X24_TYPELESS, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, depth),
+            ] {
+                let mut desc = [0u8; 0x38];
+                for (offset, value) in [(0, 3u32), (0x10, 1), (0x18, 1), (0x1c, 0x10001), (0x20, format.0 as u32), (0x24, 4), (0x30, flags.0 as u32)] {
+                    desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                }
+                let mut resource = std::ptr::null_mut();
+                assert_eq!(console(raw, va, desc.as_ptr(), D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, (&clear as *const D3D12_CLEAR_VALUE).cast(), &iid, &mut resource),
+                    S_OK, "creating 4x MSAA texture with format {}", format.0);
+                assert!(!resource.is_null());
+                let resource = ID3D12Resource::from_raw(resource);
+                let actual = resource.GetDesc();
+                assert_eq!((actual.Width, actual.Height, actual.SampleDesc.Count), (1, 1, 4));
+                assert_eq!((actual.Format, actual.Flags), (format, flags));
+            }
+        }
+    }
+
+    #[test]
+    fn slot_108_returns_msaa_allocation_info_through_the_result_pointer() {
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        let method = console_slots(Kind::Device).into_iter().find_map(|(slot, f)| (slot == 108).then_some(f))
+            .expect("console allocation information adapter at slot 108");
+        type Console = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, *const [u8; 0x38], *mut D3D12_RESOURCE_ALLOCATION_INFO1) -> *mut [u64; 2];
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let mut desc = [0u8; 0x38];
+        for (offset, value) in [(0, 3u32), (0x10, 1), (0x18, 1), (0x1c, 0x10001), (0x20, 28), (0x24, 4), (0x30, 1)] {
+            desc[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        unsafe {
+            let raw = device_raw();
+            let dev = ID3D12Device4::from_raw_borrowed(&raw).expect("D3D12 device4");
+            let desktop = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                Width: 1,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                SampleDesc: DXGI_SAMPLE_DESC { Count: 4, Quality: 0 },
+                Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET,
+                ..Default::default()
+            };
+            let mut native_detail = D3D12_RESOURCE_ALLOCATION_INFO1::default();
+            let native = dev.GetResourceAllocationInfo1(1, 1, &desktop, Some(&mut native_detail));
+            assert_ne!(native.SizeInBytes, u64::MAX);
+            let console: Console = std::mem::transmute(method);
+            let mut detail = D3D12_RESOURCE_ALLOCATION_INFO1::default();
+            let mut ret = [u64::MAX; 2];
+            let out = &mut ret as *mut [u64; 2];
+            assert_eq!(console(out.cast(), raw, 1, 1, &desc, &mut detail), out);
+            assert_eq!(ret, [native.SizeInBytes, native.Alignment]);
+            assert_eq!(detail, native_detail);
+
+            let mut volume = desc;
+            for (offset, value) in [(0, 4u32), (8, 0x1000), (0x24, 1), (0x2c, 0x105), (0x30, 0)] {
+                volume[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+            }
+            let descs = [volume, desc, volume];
+            let mut details = [D3D12_RESOURCE_ALLOCATION_INFO1::default(); 3];
+            assert_eq!(console(out.cast(), raw, 1, 3, descs.as_ptr(), details.as_mut_ptr()), out);
+            let ceil = |size: u64| size.next_multiple_of(native.Alignment);
+            let msaa_offset = ceil(0x1000);
+            let last_offset = msaa_offset + native.SizeInBytes;
+            assert_eq!(ret, [ceil(last_offset + 0x1000), native.Alignment]);
+            assert_eq!(details, [
+                D3D12_RESOURCE_ALLOCATION_INFO1 { Offset: 0, Alignment: 0x1000, SizeInBytes: 0x1000 },
+                D3D12_RESOURCE_ALLOCATION_INFO1 { Offset: msaa_offset, ..native_detail },
+                D3D12_RESOURCE_ALLOCATION_INFO1 { Offset: last_offset, Alignment: 0x1000, SizeInBytes: 0x1000 },
+            ]);
+            assert_eq!(console(out.cast(), raw, 1, 1, &volume, std::ptr::null_mut()), out);
+            assert_eq!(ret, [0x1000, 0x1000]);
+        }
+    }
+
+    #[test]
+    fn a_console_pixel_shader_without_a_console_vertex_shader_uses_the_stream_standin() {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm, CODE};
+
+        unsafe extern "system" fn check_native(this: *mut c_void, desc: *const c_void, _: *const GUID, _: *mut *mut c_void) -> HRESULT {
+            let [size, base] = *desc.cast::<[usize; 2]>();
+            let subs = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)).unwrap();
+            let shader = subs.iter().find(|(ty, _)| *ty == 2).and_then(|(_, p)| payload_shader(p)).unwrap();
+            let calls = &mut *this.cast::<[usize; 2]>();
+            let kind = usize::from(crate::gpu::recomp::pso::is_console(shader));
+            calls[kind] += 1;
+            S_OK
+        }
+
+        let code = dxil_part(0, &[fssm(&CODE, &[(5, 1)])]);
+        let ps = container(&[(b"DXIL", &code)]);
+        assert!(crate::gpu::recomp::pso::is_console(&ps));
+        let mut stream = StreamOut::default();
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        let mut calls = [0usize; 2];
+        let hr = unsafe {
+            create_pipeline_stream(calls.as_mut_ptr().cast(), check_native, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), std::ptr::null_mut())
+        };
+        assert_eq!(hr, S_OK);
+        assert_eq!(calls, [1, 0]);
+    }
+
+    #[test]
+    fn vertex_pixel_stream_translates_before_calling_d3d12() {
+        use crate::gpu::xbox::{is_xbox, tests::{container, dxil_part, fssm, CODE}};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        thread_local! {
+            static SAW_CONSOLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+            static SAW_TRANSLATED_STATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        }
+        unsafe extern "system" fn check_native(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+            let [size, base] = *desc.cast::<[usize; 2]>();
+            let Some(subs) = stream_subobjects(std::slice::from_raw_parts(base as *const u8, size)) else { return E_INVALIDARG };
+            let stages: Vec<_> = subs.iter().filter(|(ty, _)| matches!(ty, 1 | 2)).filter_map(|(_, p)| payload_shader(p)).collect();
+            if stages.iter().any(|s| is_xbox(s)) {
+                SAW_CONSOLE.set(true);
+                return E_INVALIDARG;
+            }
+            let translated = stages.len() == 2
+                && stages.iter().all(|s| crate::gpu::shader::container_parts(s).is_some_and(|p| p.iter().any(|p| p.fourcc == "DXIL")))
+                && subs.iter().any(|(ty, p)| *ty == 21 && p[4..8] == 1u32.to_le_bytes())
+                && !subs.iter().any(|(ty, _)| *ty == 19);
+            if !translated {
+                return E_INVALIDARG;
+            }
+            SAW_TRANSLATED_STATE.set(true);
+            let native: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreatePipelineState")));
+            native(this, desc, riid, ppv)
+        }
+
+        fn shader(kind: u32, hw: u8, api: u8, desktop: &[u8]) -> Vec<u8> {
+            let parts = crate::gpu::shader::container_parts(desktop).expect("desktop shader");
+            let sig = parts.iter().find(|p| p.fourcc == "OSGN").expect("output signature");
+            let code = dxil_part(kind, &[fssm(&CODE, &[(hw, api)])]);
+            container(&[(b"OSGN", &desktop[sig.offset..sig.offset + sig.size]), (b"DXIL", &code)])
+        }
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let vs = shader(1, 4, 0, &dummy().vs);
+        let ps = shader(0, 5, 1, &dummy().ps);
+        let mut stream = StreamOut::default();
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &0usize);
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, &vs);
+        stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, &ps);
+        for ty in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS] {
+            stream.put(ty, &D3D12_SHADER_BYTECODE::default());
+        }
+        let mut depth = [0u8; 56];
+        depth[4..8].copy_from_slice(&1u32.to_le_bytes());
+        depth[8..12].copy_from_slice(&8u32.to_le_bytes());
+        for at in [20, 36] {
+            depth[at..at + 16].copy_from_slice(&[1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 8, 0, 0, 0]);
+        }
+        stream.raw(21, &depth, false);
+        let mut rt = D3D12_RT_FORMAT_ARRAY::default();
+        rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt.NumRenderTargets = 1;
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, &D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE);
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+        stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO, &D3D12_CACHED_PIPELINE_STATE::default());
+        let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+        unsafe {
+            let mut pso = std::ptr::null_mut();
+            let hr = create_pipeline_stream(device_raw(), check_native, desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut pso);
+            assert!(!SAW_CONSOLE.get(), "original Xbox shader reached the native boundary");
+            assert!(SAW_TRANSLATED_STATE.get(), "native stream lost the translated shaders or graphics state");
+            assert_eq!(hr, S_OK, "native stream creation failed: {hr:#x}");
+            let pso = ID3D12PipelineState::from_raw(pso);
+            assert!(is_translated_graphics(pso.as_raw() as usize));
+            assert!(pso_root_signature(pso.as_raw() as usize).is_some());
+        }
+    }
+
+    #[test]
+    fn mesh_stream_accepts_xbox_mesh_in_subobject_24() {
+        use crate::gpu::xbox::tests::{container, dxil_part, fssm};
+        use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_SAMPLE_DESC};
+
+        assert_eq!(super::super::backend(), super::super::Backend::Real);
+        let mut psv = [0u8; 56];
+        psv[..4].copy_from_slice(&48u32.to_le_bytes());
+        psv[16..18].copy_from_slice(&3u16.to_le_bytes());
+        psv[18..20].copy_from_slice(&1u16.to_le_bytes());
+        psv[28] = 13;
+        psv[31] = 2;
+        psv[40..44].copy_from_slice(&32u32.to_le_bytes());
+        let dxil = dxil_part(13, &[fssm(&0xbf81_0000u32.to_le_bytes(), &[(7, 7)])]);
+        let ms = container(&[(b"PSV0", &psv), (b"DXIL", &dxil)]);
+        let (_, ps) = dummy_mesh().expect("DXIL fixtures");
+        let mut rt = D3D12_RT_FORMAT_ARRAY::default();
+        rt.RTFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt.NumRenderTargets = 1;
+        for tag in [D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS] {
+            let mut stream = StreamOut::default();
+            stream.shader(tag, &ms);
+            stream.shader(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, &rt);
+            stream.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC, &DXGI_SAMPLE_DESC { Count: 1, Quality: 0 });
+            let desc = [stream.0.len(), stream.0.as_ptr() as usize];
+            unsafe {
+                let mut raw = std::ptr::null_mut();
+                let hr = dev_create_pipeline_state(device_raw(), desc.as_ptr().cast(), &pc_iid(Kind::PipelineState), &mut raw);
+                assert_eq!(hr, S_OK, "Xbox MS in subobject {}: {hr:#x}", tag.0);
+                let pso = ID3D12PipelineState::from_raw(raw);
+                // a host mesh shader where the adapter runs console mesh programs as one, else
+                // two passes
+                let dev = device_raw();
+                let host = ID3D12Device::from_raw_borrowed(&dev).is_some_and(|d| crate::gpu::recomp::pso::mesh_native_split(d).is_some());
+                let p = pso.as_raw() as usize;
+                assert_eq!((is_native_mesh(p), two_pass_of(p).is_some()), (host, !host));
+            }
+        }
+    }
 
     #[test]
     fn custom_heap_properties_preserve_both_return_abis() {
@@ -4119,7 +9328,7 @@ mod readback_routing_tests {
             // Console-slot paths (`copy_console_slots` invoked from both Simple and Ranges)
             let heap_obj = 0x5555_DEADusize;
             if crate::gpu::uma::get().is_some()
-                && super::super::console_heap::register(heap_obj, 4, 0x10_0000, 0, 32, false, false, false, None)
+                && super::super::console_heap::register(heap_obj, 4, 0x10_0000, 0, 32, false, false, false)
             {
                 let start = super::super::console_heap::start(heap_obj).unwrap();
                 let dst_h = start + super::super::console_heap::SLOT as u64;
@@ -4170,5 +9379,328 @@ mod readback_routing_tests {
             assert_eq!(release(raw), 0);
             assert!(!super::super::list_x::has_list_state(key), "releasing DMA list must remove its list_x::LISTS entry");
         }
+    }
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    // a fake adopted queue: the extension vtable's word before slot 0 points at the PC table
+    unsafe extern "system" fn get_desc(_: *mut c_void, out: usize) -> usize {
+        let d = [1u32, 2, 3, 4];
+        std::ptr::copy_nonoverlapping(d.as_ptr() as *const u8, out as *mut u8, 16);
+        out
+    }
+    unsafe extern "system" fn signal(_: *mut c_void, _: usize, _: usize) -> i32 {
+        0
+    }
+    unsafe extern "system" fn completed_value(_: *mut c_void) -> u64 {
+        u64::MAX
+    }
+
+    /// Queue #18 before the layout is known writes 8 bytes; after a Signal at #14 (the older
+    /// layout) it is GetDesc with all 16.
+    #[test]
+    fn queue_slot_18_before_the_layout_is_known_writes_8_bytes() {
+        let mut pc = [0usize; 32];
+        pc[14] = signal as usize;
+        pc[18] = get_desc as usize;
+        let ext = [pc.as_ptr() as usize, 0];
+        let vtbl = ext.as_ptr() as usize + 8;
+        let mut obj = [vtbl];
+        let this = obj.as_mut_ptr() as *mut c_void;
+        // a fence a queue signalled stays in `list_x`'s sync graph, which asks other tests' cycle
+        // checks for its completed value (#8): it lives on, everything signalled on it completed
+        let mut fence_vtbl = Box::new([0usize; 9]);
+        fence_vtbl[8] = completed_value as usize;
+        let fence = Box::leak(Box::new([Box::leak(fence_vtbl).as_ptr() as usize])).as_ptr() as usize;
+        let (shifted, older): (&'static AtomicBool, &'static AtomicBool) = (Box::leak(Box::default()), Box::leak(Box::default()));
+        TEST_QUEUE_FLAGS.with(|f| f.set(Some((shifted, older))));
+        unsafe {
+            let mut out = [0xAAAA_AAAAu32; 4];
+            let r = queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            assert_eq!(r, out.as_ptr() as usize);
+            assert_eq!(out, [1, 2, 0xAAAA_AAAA, 0xAAAA_AAAA], "only the first 8 bytes");
+            FENCES.write().unwrap().push(fence);
+            queue_dispatch(14, this, fence, 1, 0, 0);
+            FENCES.write().unwrap().retain(|&f| f != fence);
+            assert!(older.load(Ordering::Acquire) && !shifted.load(Ordering::Acquire));
+            let mut out = [0xAAAA_AAAAu32; 4];
+            queue_dispatch(18, this, out.as_mut_ptr() as usize, 0, 0, 0);
+            assert_eq!(out, [1, 2, 3, 4], "older layout: the whole description");
+        }
+        TEST_QUEUE_FLAGS.with(|f| f.set(None));
+    }
+}
+
+#[cfg(test)]
+mod srv_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_BC1_UNORM_SRGB;
+
+    #[test]
+    fn a_cube_view_becomes_the_cube_array_of_one_cube() {
+        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_BC1_UNORM_SRGB,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+            Shader4ComponentMapping: 0x1688,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                TextureCube: D3D12_TEXCUBE_SRV { MostDetailedMip: 2, MipLevels: 3, ResourceMinLODClamp: 1.5 },
+            },
+        };
+        let v = cube_as_cube_array(&cube).expect("a cube view is rewritten");
+        assert_eq!(v.ViewDimension, D3D12_SRV_DIMENSION_TEXTURECUBEARRAY);
+        assert_eq!((v.Format, v.Shader4ComponentMapping), (DXGI_FORMAT_BC1_UNORM_SRGB, 0x1688), "format and mapping kept");
+        let a = unsafe { v.Anonymous.TextureCubeArray };
+        assert_eq!((a.MostDetailedMip, a.MipLevels, a.First2DArrayFace, a.NumCubes), (2, 3, 0, 1));
+        assert_eq!(a.ResourceMinLODClamp, 1.5);
+
+        // a cube array and every other view are forwarded as the title made them
+        let mut array = cube;
+        array.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBEARRAY;
+        array.Anonymous.TextureCubeArray = D3D12_TEXCUBE_ARRAY_SRV { NumCubes: 2, ..Default::default() };
+        assert!(cube_as_cube_array(&array).is_none());
+        let mut d2 = cube;
+        d2.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+        assert!(cube_as_cube_array(&d2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod console_format_query_tests {
+    use super::*;
+    use windows::Win32::Graphics::Dxgi::Common::*;
+
+    #[test]
+    fn committed_bc_address_reserve_covers_the_console_layout() {
+        let mut desc = [0u8; 0x38];
+        desc[0..4].copy_from_slice(&D3D12_RESOURCE_DIMENSION_TEXTURE2D.0.to_le_bytes());
+        desc[0x10..0x18].copy_from_slice(&128u64.to_le_bytes());
+        desc[0x18..0x1C].copy_from_slice(&16384u32.to_le_bytes());
+        desc[0x1C..0x1E].copy_from_slice(&128u16.to_le_bytes());
+        desc[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        desc[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        desc[0x2C..0x30].copy_from_slice(&0x109u32.to_le_bytes());
+        for format in [DXGI_FORMAT_BC1_TYPELESS, DXGI_FORMAT_BC1_UNORM] {
+            desc[0x20..0x24].copy_from_slice(&format.0.to_le_bytes());
+            assert_eq!(console_bc_footprint(&desc).and_then(texture_address_reserve_size), Some((512 << 20) + TEXTURE_ADDRESS_PAGE));
+        }
+        desc[0x20..0x24].copy_from_slice(&DXGI_FORMAT_R8G8B8A8_UNORM.0.to_le_bytes());
+        assert_eq!(console_bc_footprint(&desc), None);
+        assert_eq!(texture_address_reserve_size(1 << 30), None);
+    }
+
+    #[test]
+    fn console_formats_are_asked_as_the_pcs() {
+        for (console, pc) in [(116u32, 10u32), (117, 10), (118, 45), (119, 46), (120, 47)] {
+            let mut d = [0u32; 3];
+            d[0] = console;
+            let back = unsafe { console_format_query(D3D12_FEATURE_FORMAT_SUPPORT.0, d.as_mut_ptr() as *mut u8, 12) };
+            assert_eq!((back, d[0]), (Some(console), pc));
+        }
+        // a PC format, or a feature without one: untouched
+        let mut d = [45u32, 0, 0];
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_FORMAT_SUPPORT.0, d.as_mut_ptr() as *mut u8, 12) }, None);
+        let mut d = [118u32; 16];
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_D3D12_OPTIONS.0, d.as_mut_ptr() as *mut u8, 64) }, None);
+        assert_eq!(d[0], 118);
+        assert_eq!(unsafe { console_format_query(D3D12_FEATURE_FORMAT_INFO.0, std::ptr::null_mut(), 8) }, None);
+    }
+
+    /// A hardware device (None: no D3D12 GPU here – skipped).
+    fn device() -> Option<ID3D12Device> {
+        let mut dev: Option<ID3D12Device> = None;
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev) }.ok()?;
+        dev
+    }
+
+    /// CheckFeatureSupport of the PC device as `dev_check_feature_support` reaches it (vtable #13).
+    fn pc_check(dev: &ID3D12Device) -> CheckFeatureSupportFn {
+        unsafe { std::mem::transmute(*(*(dev.as_raw() as *const *const usize)).add(13)) }
+    }
+
+    /// GPU: the queries a title makes of D16_UNORM_S8_UINT (118) and its family succeed with the
+    /// PC format's answers, and the caller's format field is the console's again. Asked as is, the
+    /// PC has no such format.
+    #[test]
+    fn gpu_console_depth_formats_are_supported() {
+        let Some(dev) = device() else { return };
+        let (this, f) = (dev.as_raw(), pc_check(&dev));
+        // the gap: the PC's own answer (unless another test adopted a device, and the vtable it
+        // shares with this one already holds `dev_check_feature_support`)
+        if f as usize != dev_check_feature_support as usize {
+            let mut raw = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(118), ..Default::default() };
+            let hr = unsafe { f(this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut raw as *mut _ as *mut u8, size_of_val(&raw) as u32) };
+            assert!(hr < 0 || raw.Support1.0 == 0, "the PC knows format 118 ({hr:#x}, {:#x})", raw.Support1.0);
+        }
+
+        for (format, need) in [
+            (118, D3D12_FORMAT_SUPPORT1_DEPTH_STENCIL),
+            (119, D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+            (120, D3D12_FORMAT_SUPPORT1_SHADER_LOAD),
+            (116, D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+            (117, D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+        ] {
+            let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT(format), ..Default::default() };
+            let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut s as *mut _ as *mut u8, size_of_val(&s) as u32) };
+            assert!(hr >= 0, "FORMAT_SUPPORT {format}: {hr:#x}");
+            assert_eq!(s.Format.0, format as i32, "the caller's format");
+            assert!(s.Support1.0 & need.0 != 0, "FORMAT_SUPPORT {format}: {:#x}", s.Support1.0);
+        }
+
+        let mut ms = D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS { Format: DXGI_FORMAT(118), SampleCount: 4, ..Default::default() };
+        let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS.0, &mut ms as *mut _ as *mut u8, size_of_val(&ms) as u32) };
+        assert!(hr >= 0 && ms.NumQualityLevels >= 1, "MULTISAMPLE_QUALITY_LEVELS 118 ×4: {hr:#x} {}", ms.NumQualityLevels);
+        assert_eq!((ms.Format.0, ms.SampleCount), (118, 4));
+
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO { Format: DXGI_FORMAT(118), PlaneCount: 0 };
+        let hr = unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_INFO.0, &mut info as *mut _ as *mut u8, size_of_val(&info) as u32) };
+        assert!(hr >= 0, "FORMAT_INFO 118: {hr:#x}");
+        assert_eq!((info.Format.0, info.PlaneCount), (118, 2));
+
+        // a PC format is asked as it is
+        let mut s = D3D12_FEATURE_DATA_FORMAT_SUPPORT { Format: DXGI_FORMAT_R8G8B8A8_UNORM, ..Default::default() };
+        assert!(unsafe { check_feature_support_x(f, this, D3D12_FEATURE_FORMAT_SUPPORT.0, &mut s as *mut _ as *mut u8, size_of_val(&s) as u32) } >= 0);
+        assert_eq!(s.Format, DXGI_FORMAT_R8G8B8A8_UNORM);
+    }
+
+    /// GPU: allocation info of the console's 116 – 120 textures is a real size – the console's
+    /// (XG), and the PC's for the resource made of the desc (`pc_resource_desc`), both sane.
+    #[test]
+    fn gpu_console_format_allocation_info_is_sane() {
+        let Some(dev) = device() else { return };
+        // (bytes a pixel at least, as XG lays them out: 119 alone is a plain 2-byte format, 120 alone
+        // the stencil plane)
+        for (format, flags, bytes) in [(118u32, 2u32, 3u64), (118, 0, 3), (119, 0, 2), (120, 0, 1), (116, 1, 4), (117, 1, 4)] {
+            let mut x = [0u8; 0x38];
+            x[0..4].copy_from_slice(&3u32.to_le_bytes());
+            x[0x10..0x18].copy_from_slice(&1920u64.to_le_bytes());
+            x[0x18..0x1C].copy_from_slice(&1080u32.to_le_bytes());
+            x[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+            x[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+            x[0x20..0x24].copy_from_slice(&format.to_le_bytes());
+            x[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+            x[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
+            let t = crate::hle::xg::Texture::new(&x).unwrap_or_else(|hr| panic!("XG {format}: {hr:#x}"));
+            let (size, align) = (t.size(), t.alignment());
+            assert!(size >= 1920 * 1080 * bytes && size < 1 << 30 && align.is_power_of_two(), "XG {format}: {size:#x} {align:#x}");
+            let d: D3D12_RESOURCE_DESC = unsafe { std::ptr::read_unaligned(super::super::device_x::pc_resource_desc(&x).as_ptr() as *const _) };
+            let pc = unsafe { dev.GetResourceAllocationInfo(0, &[d]) };
+            assert!(pc.SizeInBytes != u64::MAX && pc.SizeInBytes >= 1920 * 1080 * 4 && pc.Alignment > 0, "PC {format} as {}: {:#x}", d.Format.0, pc.SizeInBytes);
+        }
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+    use super::super::pso_manifest::Kind;
+
+    /// A pipeline kept for the warm-up (`OwnedDesc::record`) is made again as the title described
+    /// it: its shaders, its input layout and the rest of its description, its root signature none.
+    #[test]
+    fn a_kept_pipeline_is_made_again_as_the_title_described_it() {
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let (vs, ps) = (b"vertex shader bytes".to_vec(), b"pixel shader".to_vec());
+        let name = c"TEXCOORD";
+        let elems = [D3D12_INPUT_ELEMENT_DESC {
+            SemanticName: PCSTR(name.as_ptr() as *const u8),
+            SemanticIndex: 1,
+            Format: DXGI_FORMAT(2),
+            InputSlot: 0,
+            AlignedByteOffset: 12,
+            InputSlotClass: D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA,
+            InstanceDataStepRate: 0,
+        }];
+        let mut d = D3D12_GRAPHICS_PIPELINE_STATE_DESC::default();
+        d.VS = bytecode(&vs);
+        d.PS = bytecode(&ps);
+        d.InputLayout = D3D12_INPUT_LAYOUT_DESC { pInputElementDescs: elems.as_ptr(), NumElements: 1 };
+        d.NumRenderTargets = 2;
+        d.RTVFormats[1] = DXGI_FORMAT(28);
+        unsafe {
+            let owned = own_graphics(&d as *const _ as *const c_void).unwrap();
+            let kept = owned.record(Kind::Graphics);
+            assert_eq!(kept.shaders.len(), 2);
+            assert_eq!(kept.shaders.iter().map(|(at, _)| super::super::pso_manifest::stage_at(&kept, *at)).collect::<Vec<_>>(), ["VS", "PS"]);
+            let again = OwnedDesc::from_record(&kept).unwrap();
+            let OwnedDesc::Graphics(g, ..) = &again else { panic!("a graphics description") };
+            assert_eq!(shader_bytes(&g.VS).unwrap(), vs.as_slice());
+            assert_eq!(shader_bytes(&g.PS).unwrap(), ps.as_slice());
+            assert!(g.GS.pShaderBytecode.is_null() && g.GS.BytecodeLength == 0);
+            assert_eq!((g.NumRenderTargets, g.RTVFormats[1]), (2, DXGI_FORMAT(28)));
+            assert_eq!(g.InputLayout.NumElements, 1);
+            let e = &*g.InputLayout.pInputElementDescs;
+            assert_eq!(std::ffi::CStr::from_ptr(e.SemanticName.0 as *const std::ffi::c_char), name);
+            assert_eq!((e.SemanticIndex, e.AlignedByteOffset), (1, 12));
+            assert_eq!(std::mem::transmute_copy::<_, usize>(&g.pRootSignature), 0);
+            assert_eq!(again.record(Kind::Graphics), kept, "kept again the same");
+
+            let cs = b"compute shader".to_vec();
+            let mut c = D3D12_COMPUTE_PIPELINE_STATE_DESC::default();
+            c.CS = bytecode(&cs);
+            c.NodeMask = 1;
+            let kept = own_compute(&c as *const _ as *const c_void).unwrap().record(Kind::Compute);
+            let again = OwnedDesc::from_record(&kept).unwrap();
+            let OwnedDesc::Compute(c2, _) = &again else { panic!("a compute description") };
+            assert_eq!(shader_bytes(&c2.CS).unwrap(), cs.as_slice());
+            assert_eq!(c2.NodeMask, 1);
+            assert_eq!(again.record(Kind::Compute), kept);
+        }
+    }
+
+    /// A stream whose last subobject is a 4-byte payload at its very end (a sample mask; a retail
+    /// game's 688-byte stream) is kept with its shaders, read only within the stream.
+    #[test]
+    fn a_stream_ending_in_a_four_byte_payload_is_kept() {
+        let vs = intern_shader_blob(b"vertex shader bytes");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes());
+        buf.extend_from_slice(&[0; 4]);
+        buf.extend_from_slice(&(vs.as_ptr() as u64).to_le_bytes());
+        buf.extend_from_slice(&(vs.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&9u32.to_le_bytes());
+        buf.extend_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(stream_fields(&buf).unwrap().last().map(|f| (f.0, f.1 + f.2)), Some((9, buf.len())));
+        let kept = OwnedDesc::Stream(Box::new([0, 0]), buf, vec![vs.clone()], Vec::new(), Vec::new()).record(Kind::MeshStream);
+        assert_eq!(kept.shaders, vec![(8, vs)]);
+        assert_eq!(super::super::pso_manifest::stage_at(&kept, 8), "VS");
+        assert_eq!(&kept.desc[8..16], &[0; 8]);
+    }
+}
+
+
+#[cfg(test)]
+mod governor_tests {
+    use super::*;
+
+    fn governor() -> Governor {
+        Governor { state: Mutex::new(GovState { running: 0, giants: 0, urgent: 0, starving: 0, reserved: 0 }), cv: std::sync::Condvar::new() }
+    }
+
+    #[test]
+    fn a_waited_for_compile_too_big_for_the_memory_is_refused_at_once() {
+        let g = governor();
+        let too_big = (available_physical() / 1536) as usize + (1 << 20);
+        let t0 = std::time::Instant::now();
+        assert!(matches!(g.acquire(too_big, 1, None, false, || true), Err(Refused::NoMemory)));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        let s = g.state.lock().unwrap();
+        assert_eq!((s.running, s.starving, s.reserved), (0, 0, 0));
+    }
+
+    #[test]
+    fn a_waited_for_compile_that_fits_starts_at_once_outside_the_limits() {
+        if available_physical() < peak(0) + URGENT_FLOOR + (1 << 30) {
+            return;
+        }
+        let g = governor();
+        let slot = g.acquire(1 << 10, 0, Some(0), false, || true).ok().expect("started");
+        assert!(slot.urgent && !slot.giant);
+        assert_eq!(g.in_flight(), (1, 0, 1));
+        g.release(&slot);
+        std::mem::forget(slot);
+        assert_eq!(g.in_flight(), (0, 0, 0));
     }
 }

@@ -5,7 +5,7 @@
 //! encoding identification, literal constants, SDWA/DPP extension dwords and MIMG NSA.
 //! It is the first stage of the shader recompiler (console microcode → PC shaders).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::OnceLock;
 
@@ -419,24 +419,32 @@ pub fn encoding(name: &str) -> Option<&'static Encoding> {
     ENCODINGS.iter().find(|e| e.name == name)
 }
 
-/// VGPRs an instruction reads and writes (explicit operands; register ranges by operand
-/// size). SDWA/DPP src0 comes from the extension dword.
 /// SGPRs (codes 0–127 without NULL: s0–s105, VCC, M0, EXEC…) read and written by the
 /// explicit operands: (reads, writes).
 pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
     let (mut r, mut w) = (Vec::new(), Vec::new());
+    let sdwa = (d.variant == Variant::Sdwa).then(|| d.words[1]);
     for o in d.ienc.operands {
         let Some(f) = o.field else { continue };
         if f == "LITERAL" || o.implicit {
             continue;
         }
-        if !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k)) {
+        let Some(mut v) = field_value(d.enc, &d.words, f) else { continue };
+        if let Some(ext) = sdwa.filter(|_| matches!(f, "SRC0" | "VSRC1")) {
+            let selector = if f == "SRC0" {
+                v = u64::from(ext & 0xff);
+                23
+            } else {
+                31
+            };
+            if (ext >> selector) & 1 == 0 {
+                continue;
+            }
+        } else if (f == "SRC0" && d.variant != Variant::Plain)
+            || !["SREG", "SSRC", "SDST", "OPR_SRC"].iter().any(|k| o.ty.contains(k))
+        {
             continue;
         }
-        if f == "SRC0" && d.variant != Variant::Plain {
-            continue;
-        }
-        let Some(v) = field_value(d.enc, &d.words, f) else { continue };
         let v = v * register_scale(f);
         if v > 127 || v == 125 {
             continue;
@@ -445,14 +453,25 @@ pub fn sgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         let dst = if o.output { &mut w } else { &mut r };
         dst.extend(v..(v + n).min(128));
     }
+    if let Some(ext) = sdwa {
+        let sdst = u64::from(ext >> 8 & 0x7f);
+        if d.enc.name == "ENC_VOPC" && ext >> 15 & 1 != 0 && !d.inst.name.starts_with("V_CMPX") && sdst != 125 {
+            w.extend(sdst..(sdst + 2).min(128));
+        }
+    }
     (r, w)
 }
 
+/// VGPRs an instruction reads and writes (explicit operands; register ranges by operand
+/// size). SDWA/DPP src0 comes from the extension dword.
 pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
     let (mut r, mut w) = (Vec::new(), Vec::new());
     for o in d.ienc.operands {
         let Some(f) = o.field else { continue };
         if f == "LITERAL" || o.implicit {
+            continue;
+        }
+        if f == "VSRC1" && d.variant == Variant::Sdwa && d.words[1] >> 31 != 0 {
             continue;
         }
         let Some(mut v) = field_value(d.enc, &d.words, f) else { continue };
@@ -470,6 +489,23 @@ pub fn vgpr_uses(d: &Decoded) -> (Vec<u64>, Vec<u64>) {
         };
         if !vgpr {
             continue;
+        }
+        if f == "VADDR" && d.enc.name == "ENC_MIMG" {
+            let layout = match field_value(d.enc, &d.words, "NSA") {
+                Some(1) => encoding("MIMG_NSA1"),
+                Some(2) => encoding("MIMG_NSA2"),
+                Some(3) => encoding("MIMG_NSA3"),
+                _ => None,
+            };
+            if let Some(layout) = layout {
+                r.push(v);
+                for field in layout.fields {
+                    if field.name != "VADDR" && field.name.starts_with("VADDR") {
+                        r.extend(field_value(layout, &d.words, field.name));
+                    }
+                }
+                continue;
+            }
         }
         let mut n = (o.size as u64).div_ceil(32).max(1);
         // MUBUF / MTBUF VADDR: only the index and / or offset VGPRs actually used
@@ -518,9 +554,16 @@ fn scalar_int(d: &Decoded, code: u64) -> Option<u32> {
 /// (`far_target`), so it is an unconditional branch like `s_branch` to everything that
 /// follows the control flow. Any other `s_setpc_b64` stays an indirect jump.
 pub fn resolve_far_jumps(insts: &mut [Decoded]) {
+    for d in insts.iter_mut() {
+        d.far_target = None;
+    }
+    let mut candidates = Vec::new();
     for k in 3..insts.len() {
         let [get, lo, hi, set] = &insts[k - 3..=k] else { continue };
         if get.inst.name != "S_GETPC_B64" || set.inst.name != "S_SETPC_B64" {
+            continue;
+        }
+        if get.pc + get.len as u64 != lo.pc || lo.pc + lo.len as u64 != hi.pc || hi.pc + hi.len as u64 != set.pc {
             continue;
         }
         let sub = match (lo.inst.name, hi.inst.name) {
@@ -547,7 +590,18 @@ pub fn resolve_far_jumps(insts: &mut [Decoded]) {
         let (Some(l), Some(h)) = (half(lo, r), half(hi, r + 1)) else { continue };
         let offset = (h as u64) << 32 | l as u64;
         let base = get.pc + get.len as u64;
-        insts[k].far_target = Some(if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) });
+        let target = if sub { base.wrapping_sub(offset) } else { base.wrapping_add(offset) };
+        candidates.push((k, target));
+    }
+    if candidates.is_empty() {
+        return;
+    }
+    let entries: HashSet<_> = insts.iter().filter_map(branch_target)
+        .chain(candidates.iter().map(|&(_, target)| target)).collect();
+    for (k, target) in candidates {
+        if insts[k - 2..=k].iter().all(|d| !entries.contains(&d.pc)) {
+            insts[k].far_target = Some(target);
+        }
     }
 }
 
@@ -665,6 +719,41 @@ pub fn find_programs(blob: &[u8]) -> Vec<(usize, usize)> {
 mod tests {
     use super::*;
 
+    fn far_jump(pc: u64, subtract: bool) -> Vec<Decoded> {
+        let (lo, hi) = if subtract { ("S_SUB_U32", "S_SUBB_U32") } else { ("S_ADD_U32", "S_ADDC_U32") };
+        [
+            ("S_GETPC_B64", "ENC_SOP1", &[("SDST", 4)][..]),
+            (lo, "ENC_SOP2", &[("SDST", 4), ("SSRC0", 4), ("SSRC1", 144)]),
+            (hi, "ENC_SOP2", &[("SDST", 5), ("SSRC0", 5), ("SSRC1", 128)]),
+            ("S_SETPC_B64", "ENC_SOP1", &[("SSRC0", 4)]),
+        ].into_iter().enumerate().map(|(i, (op, enc, fields))| {
+            decode(&encode(op, enc, fields, None).unwrap(), pc + i as u64 * 4).unwrap()
+        }).collect()
+    }
+
+    #[test]
+    fn far_jump_requires_entry_at_getpc() {
+        for subtract in [false, true] {
+            for entry in 0..=3 {
+                let bytes = encode("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", entry)], None).unwrap();
+                let mut insts = vec![decode(&bytes, 0x100).unwrap()];
+                insts.extend(far_jump(0x104, subtract));
+                resolve_far_jumps(&mut insts);
+                let target = if subtract { 0xf8 } else { 0x118 };
+                assert_eq!(branch_target(&insts[4]), (entry == 0).then_some(target));
+            }
+        }
+    }
+
+    #[test]
+    fn far_jump_accounts_for_targets_of_other_far_jumps() {
+        let mut insts = far_jump(0, false);
+        insts.extend(far_jump(16, false));
+        resolve_far_jumps(&mut insts);
+        assert_eq!(branch_target(&insts[3]), Some(20));
+        assert_eq!(branch_target(&insts[7]), None);
+    }
+
     fn dis(bytes: &[u8]) -> String {
         format(&decode(bytes, 0).unwrap())
     }
@@ -693,6 +782,60 @@ mod tests {
         // SBASE counts SGPR pairs, SRSRC SGPR quads (seen in retail code)
         assert_eq!(dis(&[0x08, 0x02, 0x08, 0xf4, 0x20, 0x09, 0x00, 0xfa]), "s_load_dwordx4 s[8:11], s[16:17], 0x920");
         assert_eq!(dis(&[0x04, 0x02, 0x28, 0xf4, 0x40, 0x00, 0x00, 0xfa]), "s_buffer_load_dwordx4 s[8:11], s[8:11], 0x40");
+    }
+
+    #[test]
+    fn sdwa_register_uses_follow_the_operand_selectors() {
+        let uses = |name, enc, fields: &[(&str, u64)]| {
+            let bytes = encode(name, enc, fields, None).unwrap();
+            let d = decode(&bytes, 0).unwrap();
+            assert_eq!(d.variant, Variant::Sdwa);
+            (sgpr_uses(&d), vgpr_uses(&d))
+        };
+        assert_eq!(
+            uses("V_MOV_B32", "VOP1_VOP_SDWA", &[("SRC0", 0xf9), ("VSRC0", 4), ("S0", 1), ("VDST", 1)]),
+            ((vec![4], vec![]), (vec![], vec![1])),
+        );
+        assert_eq!(
+            uses(
+                "V_ADD_NC_U32", "VOP2_VOP_SDWA",
+                &[("SRC0", 0xf9), ("VSRC0", 242), ("S0", 1), ("VSRC1", 5), ("S1", 1), ("VDST", 2)],
+            ),
+            ((vec![5], vec![]), (vec![], vec![2])),
+        );
+        let fields = &[("SRC0", 0xf9), ("VSRC0", 3), ("VSRC1", 6), ("SD", 1), ("SDST", 20)];
+        assert_eq!(
+            uses("V_CMP_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", fields),
+            ((vec![], vec![20, 21]), (vec![3, 6], vec![])),
+        );
+        assert_eq!(
+            uses("V_CMPX_EQ_U32", "VOPC_VOP_SDWA_SDST_ENC", fields),
+            ((vec![], vec![]), (vec![3, 6], vec![])),
+        );
+    }
+
+    #[test]
+    fn image_address_registers_follow_the_encoded_layout() {
+        for nsa in 0..=3 {
+            let mut bytes = encode(
+                "IMAGE_SAMPLE",
+                "ENC_MIMG",
+                &[("NSA", nsa), ("VADDR", 4), ("VDATA", 16), ("DMASK", 15)],
+                None,
+            )
+            .unwrap();
+            let extra: Vec<u8> = (0..nsa * 4).map(|i| (255 - i) as u8).collect();
+            bytes.extend_from_slice(&extra);
+            let (mut reads, writes) = vgpr_uses(&decode(&bytes, 0).unwrap());
+            reads.sort_unstable();
+            let expected = if extra.is_empty() {
+                vec![4, 5, 6]
+            } else {
+                std::iter::once(4).chain(extra.iter().rev().copied().map(u64::from)).collect()
+            };
+            assert_eq!(reads, expected);
+            assert_eq!(writes, vec![16, 17, 18, 19]);
+        }
     }
 
     #[test]

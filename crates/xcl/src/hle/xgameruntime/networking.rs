@@ -589,9 +589,29 @@ fn host_connectivity_hint() -> Option<NlNetworkConnectivityHint> {
     if unsafe { f(&mut hint) } == 0 { Some(hint) } else { None }
 }
 
+/// A console without a network (`XCL_NETWORK=0`): the stack is initialized but reaches
+/// nothing. XNetworkingConnectivityLevelHint::None (1) and XNetworkingConnectivityCostHint::
+/// Unknown (0), no interface (devdocs.xbox.com, reference/networking/xnetworking/enums). The
+/// GDK tells titles to wait until `networkInitialized` is true before they touch the network
+/// ("Network initialization and connectivity", docs.xbox.com), so it stays true: false would
+/// hold a title at that wait instead of sending it down its offline path.
+pub const OFFLINE_HINT: XNetworkingConnectivityHint = XNetworkingConnectivityHint {
+    connectivity_level: 1,
+    connectivity_cost: 0,
+    iana_interface_type: 0,
+    network_initialized: true,
+    approaching_data_limit: false,
+    over_data_limit: false,
+    roaming: false,
+};
+
 pub unsafe extern "system" fn XNetworkingGetConnectivityHint(out: *mut XNetworkingConnectivityHint) -> HRESULT {
     if out.is_null() {
         return E_INVALIDARG;
+    }
+    if crate::hle::netoff::enabled() {
+        *out = OFFLINE_HINT;
+        return S_OK;
     }
     let host = host_connectivity_hint();
     let level = match host.map(|h| h.connectivity_level) {
@@ -760,7 +780,21 @@ mod tests {
     }
 
     #[test]
+    fn connectivity_hint_without_a_network_is_initialized_and_none() {
+        crate::hle::netoff::OFFLINE_HERE.with(|o| o.set(Some(true)));
+        unsafe {
+            let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
+            assert_eq!(XNetworkingGetConnectivityHint(&mut hint), S_OK);
+            assert_eq!(hint, OFFLINE_HINT);
+            assert_eq!(hint.connectivity_level, 1);
+            assert!(hint.network_initialized);
+        }
+        crate::hle::netoff::OFFLINE_HERE.with(|o| o.set(None));
+    }
+
+    #[test]
     fn connectivity_hint_and_pin_verification() {
+        crate::hle::netoff::OFFLINE_HERE.with(|o| o.set(Some(false)));
         unsafe {
             let mut hint: XNetworkingConnectivityHint = std::mem::zeroed();
             assert_eq!(XNetworkingGetConnectivityHint(&mut hint), S_OK);

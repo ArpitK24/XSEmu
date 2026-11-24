@@ -532,58 +532,147 @@ fn try_length_prefixed_block<'a>(block: &'a [u8], multistream: bool) -> Option<(
     Some((packets, zero_padded))
 }
 
-/// Extract Opus audio packets from an Ogg Opus stream (skipping `OpusHead` and `OpusTags`).
-fn extract_ogg_opus<'a>(data: &'a [u8], multistream: bool) -> Option<Vec<Cow<'a, [u8]>>> {
+struct OggTiming {
+    head: OpusHead,
+    decoded_48k: u64,
+    end_48k: u64,
+}
+
+impl OggTiming {
+    fn pcm_range(&self, rate: u32) -> std::ops::Range<u64> {
+        let start_48k = u64::from(self.head.pre_skip).min(self.end_48k);
+        frames_at_rate(start_48k, rate)..frames_at_rate(self.end_48k, rate)
+    }
+
+    fn trim_pcm(&self, pcm: &mut Vec<i16>, rate: u32, channels: usize) -> bool {
+        // The MFT can defer output. Only slice PCM when the complete decoded timeline
+        // is present, so a short result is never mistaken for tail padding.
+        if pcm.len() % channels != 0
+            || (pcm.len() / channels) as u64 != frames_at_rate(self.decoded_48k, rate)
+        {
+            return false;
+        }
+        let range = self.pcm_range(rate);
+        pcm.truncate(range.end as usize * channels);
+        pcm.drain(..range.start as usize * channels);
+        true
+    }
+}
+
+struct ExtractedPackets<'a> {
+    packets: Vec<Cow<'a, [u8]>>,
+    timing: Option<OggTiming>,
+}
+
+/// Extract packets with the existing lacing rules. Use timing only when the submitted
+/// pages describe one complete Opus logical stream with an unbroken packet sequence.
+fn extract_ogg_opus(data: &[u8], multistream: bool) -> Option<ExtractedPackets<'_>> {
     if data.len() < 27 || &data[..4] != b"OggS" {
         return None;
     }
-    let mut packets: Vec<Cow<'a, [u8]>> = Vec::new();
-    let mut cur: Vec<u8> = Vec::new();
+    let serial = &data[14..18];
+    let mut packets = Vec::new();
+    let mut cur = Vec::new();
     let mut pos = 0usize;
+    let mut sequence = 0u32;
+    let mut contiguous = true;
+    let mut head = None;
+    let mut have_tags = false;
+    let mut previous_granule = None::<u64>;
+    let mut decoded_48k = 0u64;
+    let mut timing = None;
     while pos < data.len() {
-        if pos + 27 > data.len() || &data[pos..pos + 4] != b"OggS" {
+        let page = data.get(pos..pos + 27)?;
+        if &page[..4] != b"OggS" {
             return None;
         }
-        let nseg = data[pos + 26] as usize;
-        let seg_start = pos + 27;
-        let mut body = seg_start + nseg;
-        if body > data.len() {
-            return None;
-        }
-        for &l in &data[seg_start..seg_start + nseg] {
-            let l = l as usize;
-            let next = body.checked_add(l)?;
-            if next > data.len() {
-                return None;
-            }
-            let slice = &data[body..next];
+        let flags = page[5];
+        let bos = flags & 0x02 != 0;
+        let eos = flags & 0x04 != 0;
+        let granule = u64::from_le_bytes(page[6..14].try_into().unwrap());
+        let laces = data.get(pos + 27..pos + 27 + page[26] as usize)?;
+        let mut body = pos + 27 + laces.len();
+        let mut page_samples = 0u64;
+        contiguous &= page[4] == 0
+            && flags & !0x07 == 0
+            && bos == (pos == 0)
+            && (flags & 0x01 != 0) == !cur.is_empty()
+            && &page[14..18] == serial
+            && &page[18..22] == sequence.to_le_bytes().as_slice();
+        sequence = sequence.wrapping_add(1);
+
+        for (i, &lace) in laces.iter().enumerate() {
+            let next = body.checked_add(lace as usize)?;
+            let slice = data.get(body..next)?;
             body = next;
-            if cur.is_empty() && l < 255 {
-                if !slice.is_empty()
-                    && !slice.starts_with(b"OpusHead")
-                    && !slice.starts_with(b"OpusTags")
-                {
-                    parse_packet(slice, multistream)?;
-                    packets.push(Cow::Borrowed(slice));
-                }
+            if lace == 255 {
+                cur.extend_from_slice(slice);
+                continue;
+            }
+            let packet = if cur.is_empty() {
+                Cow::Borrowed(slice)
             } else {
                 cur.extend_from_slice(slice);
-                if l < 255 {
-                    if !cur.is_empty()
-                        && !cur.starts_with(b"OpusHead")
-                        && !cur.starts_with(b"OpusTags")
-                    {
-                        parse_packet(&cur, multistream)?;
-                        packets.push(Cow::Owned(std::mem::take(&mut cur)));
-                    } else {
-                        cur.clear();
-                    }
+                Cow::Owned(std::mem::take(&mut cur))
+            };
+            if packet.starts_with(b"OpusHead") {
+                if pos == 0 && laces.len() == 1 && granule == 0 {
+                    head = parse_opus_head(&packet);
+                } else {
+                    contiguous = false;
                 }
+            } else if packet.starts_with(b"OpusTags") {
+                contiguous &= head.is_some()
+                    && !have_tags
+                    && packet.len() >= 16
+                    && i + 1 == laces.len()
+                    && granule == 0;
+                have_tags = true;
+            } else if packet.is_empty() {
+                contiguous = false;
+            } else {
+                let info = parse_packet(&packet, multistream)?;
+                contiguous &= have_tags;
+                page_samples += u64::from(info.total_samples_48k);
+                packets.push(packet);
             }
         }
+
+        if contiguous
+            && eos
+            && body == data.len()
+            && cur.is_empty()
+            && page_samples > 0
+            && granule != u64::MAX
+        {
+            // RFC 7845 section 4.4 counts only packets completed on the EOS page.
+            // If this is also the first audio page, section 4.5 uses a zero origin for
+            // a short granule, or infers an initial offset when the granule is larger.
+            let keep = match previous_granule {
+                Some(previous) => granule.checked_sub(previous).filter(|&n| n <= page_samples),
+                None => Some(granule.min(page_samples)),
+            };
+            if let (Some(head), Some(keep)) = (head.take(), keep) {
+                timing = Some(OggTiming {
+                    head,
+                    decoded_48k: decoded_48k + page_samples,
+                    end_48k: decoded_48k + keep,
+                });
+            }
+        }
+        if !eos && page_samples > 0 {
+            contiguous &= granule != u64::MAX
+                && match previous_granule {
+                    Some(previous) => previous.checked_add(page_samples) == Some(granule),
+                    None => granule >= page_samples,
+                };
+            previous_granule = Some(granule);
+            decoded_48k += page_samples;
+        }
+        contiguous &= !eos;
         pos = body;
     }
-    Some(packets)
+    Some(ExtractedPackets { packets, timing })
 }
 
 /// Extract RFC 6716 Opus packets from a submitted audio buffer.
@@ -596,13 +685,24 @@ fn extract_ogg_opus<'a>(data: &'a [u8], multistream: bool) -> Option<Vec<Cow<'a,
 /// 4. A single raw RFC 6716 Opus packet,
 /// 5. A single unpadded `[u16 LE len][packet]` if raw parsing rejected the buffer.
 pub fn extract_packets<'a>(data: &'a [u8], block_align: u16, multistream: bool) -> Vec<Cow<'a, [u8]>> {
+    extract_buffer(data, block_align, multistream).packets
+}
+
+fn extract_buffer(data: &[u8], block_align: u16, multistream: bool) -> ExtractedPackets<'_> {
+    if data.starts_with(b"OggS") {
+        if let Some(ogg) = extract_ogg_opus(data, multistream) {
+            return ogg;
+        }
+    }
+    ExtractedPackets {
+        packets: extract_raw_packets(data, block_align, multistream),
+        timing: None,
+    }
+}
+
+fn extract_raw_packets(data: &[u8], block_align: u16, multistream: bool) -> Vec<Cow<'_, [u8]>> {
     if data.is_empty() {
         return Vec::new();
-    }
-    if data.starts_with(b"OggS") {
-        if let Some(pkts) = extract_ogg_opus(data, multistream) {
-            return pkts;
-        }
     }
     // Multiple fixed-size blocks (e.g. N * 2048 B AWC blocks); a format without a usable
     // nBlockAlign gets the AWC block size
@@ -643,19 +743,27 @@ pub fn extract_packets<'a>(data: &'a [u8], block_align: u16, multistream: bool) 
     Vec::new()
 }
 
-/// Total expected PCM frames (samples per channel at `rate` Hz) across all extracted Opus packets.
+/// Expected PCM frames (samples per channel at `rate` Hz), using Ogg timing when available.
 /// Used as a fallback estimate if Media Foundation is unavailable.
 pub fn estimate_buffer_frames(data: &[u8], block_align: u16, rate: u32, multistream: bool) -> Option<u64> {
-    let pkts = extract_packets(data, block_align, multistream);
-    if pkts.is_empty() {
+    let extracted = extract_buffer(data, block_align, multistream);
+    if let Some(timing) = extracted.timing {
+        let range = timing.pcm_range(rate);
+        return Some(range.end - range.start);
+    }
+    if extracted.packets.is_empty() {
         return None;
     }
     let mut samples_48k = 0u64;
-    for p in &pkts {
+    for p in &extracted.packets {
         let info = parse_packet(p, multistream)?;
-        samples_48k += info.total_samples_48k as u64;
+        samples_48k += u64::from(info.total_samples_48k);
     }
-    Some((samples_48k * rate as u64) / 48_000)
+    Some(frames_at_rate(samples_48k, rate))
+}
+
+fn frames_at_rate(samples_48k: u64, rate: u32) -> u64 {
+    ((u128::from(samples_48k) * u128::from(rate)) / 48_000) as u64
 }
 
 // ---------------------------------------------------------------------------------------
@@ -718,9 +826,203 @@ fn mf_runtime() -> Result<&'static MfRuntime, String> {
     .map_err(|e| e.clone())
 }
 
-/// Whether Windows' built-in `MSOpusDecoder.dll` + Media Foundation runtime is available.
+/// Whether an Opus decoder is available: Windows' built-in `MSOpusDecoder.dll` + Media Foundation
+/// runtime, or libopus loaded from `opus.dll` (see [`libopus`]).
 pub fn is_available() -> bool {
-    mf_runtime().is_ok()
+    mf_runtime().is_ok() || libopus().is_ok()
+}
+
+/// The decoder in use ("Windows MSOpusDecoder", "libopus (path)"), or why there is none. Logged once.
+pub fn backend() -> String {
+    match (mf_runtime(), libopus()) {
+        (Ok(_), _) => "Windows' MSOpusDecoder (Media Foundation)".to_string(),
+        (_, Ok(l)) => format!("libopus ({})", l.path),
+        (Err(a), Err(b)) => format!("none ({a}; {b})"),
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// libopus from `opus.dll`, loaded at run time (where Windows' decoder does not exist: Wine)
+// ---------------------------------------------------------------------------------------
+//
+// Not distributed with XCL (like DXC): `opus.dll` – libopus (BSD-3-Clause), built for Windows – is
+// looked for in `%XCL_OPUS_DIR%`, then next to xcl.exe (`opus.dll`, `libopus.dll`, `libopus-0.dll`).
+// Windows' own decoder is used first when the system has it. Only the decoder is used.
+
+type OpusDecoderCreateFn = unsafe extern "C" fn(i32, i32, *mut i32) -> *mut c_void;
+type OpusDecodeFn = unsafe extern "C" fn(*mut c_void, *const u8, i32, *mut i16, i32, i32) -> i32;
+type OpusDecoderDestroyFn = unsafe extern "C" fn(*mut c_void);
+type OpusDecoderCtlFn = unsafe extern "C" fn(*mut c_void, i32, ...) -> i32;
+
+/// `OPUS_RESET_STATE`: the decoder starts again
+const OPUS_RESET_STATE: i32 = 4028;
+
+struct LibOpus {
+    path: String,
+    create: OpusDecoderCreateFn,
+    decode: OpusDecodeFn,
+    destroy: OpusDecoderDestroyFn,
+    ctl: OpusDecoderCtlFn,
+}
+
+static LIBOPUS: OnceLock<Result<LibOpus, String>> = OnceLock::new();
+
+fn libopus() -> Result<&'static LibOpus, String> {
+    LIBOPUS
+        .get_or_init(|| unsafe {
+            use std::os::windows::ffi::OsStrExt;
+            use windows_sys::Win32::Foundation::FreeLibrary;
+            use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
+            let mut dirs: Vec<std::path::PathBuf> = Vec::new();
+            if let Some(d) = std::env::var_os("XCL_OPUS_DIR") {
+                dirs.push(d.into());
+            }
+            if let Some(d) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
+                dirs.push(d);
+            }
+            for dir in &dirs {
+                for name in ["opus.dll", "libopus.dll", "libopus-0.dll"] {
+                    let path = dir.join(name);
+                    if !path.is_file() {
+                        continue;
+                    }
+                    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+                    let h = LoadLibraryW(wide.as_ptr()) as usize;
+                    if h == 0 {
+                        continue;
+                    }
+                    let f = |n: &str| crate::resolver::system_proc_in(h, &crate::pe::ImportName::Name { hint: 0, name: n.into() });
+                    let (Some(create), Some(decode), Some(destroy), Some(ctl)) =
+                        (f("opus_decoder_create"), f("opus_decode"), f("opus_decoder_destroy"), f("opus_decoder_ctl"))
+                    else {
+                        // a DLL that is not libopus (one of the four symbols is missing): not kept loaded
+                        FreeLibrary(h as _);
+                        continue;
+                    };
+                    return Ok(LibOpus {
+                        path: path.display().to_string(),
+                        create: std::mem::transmute::<usize, OpusDecoderCreateFn>(create),
+                        decode: std::mem::transmute::<usize, OpusDecodeFn>(decode),
+                        destroy: std::mem::transmute::<usize, OpusDecoderDestroyFn>(destroy),
+                        ctl: std::mem::transmute::<usize, OpusDecoderCtlFn>(ctl),
+                    });
+                }
+            }
+            Err("no opus.dll (libopus) in %XCL_OPUS_DIR% or next to xcl.exe".to_string())
+        })
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// One libopus decoder (1 or 2 channels), the same job as [`MftDecoder`].
+struct LibDecoder {
+    lib: &'static LibOpus,
+    state: *mut c_void,
+    channels: u16,
+    output_rate: u32,
+    /// stream time of the next packet, as [`MftDecoder`] keeps it (0: nothing decoded since the start / the last flush)
+    timestamp_100ns: i64,
+}
+
+impl LibDecoder {
+    fn new(channels: u16, sample_rate: u32) -> Result<Self, String> {
+        let lib = libopus()?;
+        let ch = channels.clamp(1, 2);
+        // libopus decodes to 8, 12, 16, 24 or 48 kHz
+        let rate = if matches!(sample_rate, 8_000 | 12_000 | 16_000 | 24_000 | 48_000) { sample_rate } else { 48_000 };
+        let mut err = 0i32;
+        let state = unsafe { (lib.create)(rate as i32, ch as i32, &mut err) };
+        if state.is_null() || err != 0 {
+            return Err(format!("opus_decoder_create: {err}"));
+        }
+        Ok(Self { lib, state, channels: ch, output_rate: rate, timestamp_100ns: 0 })
+    }
+
+    fn flush(&mut self) {
+        unsafe {
+            (self.lib.ctl)(self.state, OPUS_RESET_STATE);
+        }
+        self.timestamp_100ns = 0;
+    }
+
+    fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        // as MftDecoder: an empty or malformed packet is an error (libopus would conceal a lost one)
+        parse_packet(packet, false).ok_or_else(|| "invalid RFC 6716 Opus packet".to_string())?;
+        let max_frames = (MAX_PACKET_SAMPLES_48K as usize * self.output_rate as usize) / 48_000;
+        let ch = self.channels as usize;
+        let start = out.len();
+        out.resize(start + max_frames * ch, 0);
+        let n = unsafe { (self.lib.decode)(self.state, packet.as_ptr(), packet.len() as i32, out[start..].as_mut_ptr(), max_frames as i32, 0) };
+        if n < 0 {
+            out.truncate(start);
+            return Err(format!("opus_decode: {n}"));
+        }
+        out.truncate(start + n as usize * ch);
+        // the time the packet covers: its frames at the output rate
+        self.timestamp_100ns = self.timestamp_100ns.saturating_add(n as i64 * 10_000_000 / self.output_rate as i64);
+        Ok(n as usize)
+    }
+}
+
+impl Drop for LibDecoder {
+    fn drop(&mut self) {
+        unsafe { (self.lib.destroy)(self.state) }
+    }
+}
+
+// SAFETY: a libopus decoder state is used by one thread at a time (`&mut self`).
+unsafe impl Send for LibDecoder {}
+
+/// One single-stream decoder: Windows' MFT where there is one, else libopus.
+enum SingleStreamDecoder {
+    Mft(MftDecoder),
+    Lib(LibDecoder),
+}
+
+impl SingleStreamDecoder {
+    fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
+        // the decoder actually made, logged once (Media Foundation can load and still fail to make one)
+        static CHOICE: std::sync::Once = std::sync::Once::new();
+        let d = match MftDecoder::new(channels, sample_rate, head_bytes) {
+            Ok(d) => Ok(Self::Mft(d)),
+            Err(mft) => LibDecoder::new(channels, sample_rate).map(Self::Lib).map_err(|lib| format!("{mft}; {lib}")),
+        };
+        CHOICE.call_once(|| match &d {
+            Ok(Self::Mft(_)) => crate::xlog_info!("Opus: decoder = Windows' MSOpusDecoder (Media Foundation)"),
+            Ok(Self::Lib(l)) => crate::xlog_info!("Opus: decoder = libopus ({})", l.lib.path),
+            Err(e) => crate::xlog_info!("Opus: decoder = none ({e})"),
+        });
+        d
+    }
+
+    fn output_rate(&self) -> u32 {
+        match self {
+            Self::Mft(d) => d.output_rate,
+            Self::Lib(d) => d.output_rate,
+        }
+    }
+
+    /// stream time of the next packet (0: nothing decoded since the start / the last flush)
+    fn timestamp_100ns(&self) -> i64 {
+        match self {
+            Self::Mft(d) => d.timestamp_100ns,
+            Self::Lib(d) => d.timestamp_100ns,
+        }
+    }
+
+    fn flush(&mut self) {
+        match self {
+            Self::Mft(d) => d.flush(),
+            Self::Lib(d) => d.flush(),
+        }
+    }
+
+    fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        match self {
+            Self::Mft(d) => d.decode_packet(packet, out),
+            Self::Lib(d) => d.decode_packet(packet, out),
+        }
+    }
 }
 
 fn mf_create_media_type(rt: &MfRuntime) -> Result<IMFMediaType, String> {
@@ -774,7 +1076,7 @@ enum OutputSampleFormat {
     Float32,
 }
 
-struct SingleStreamDecoder {
+struct MftDecoder {
     mft: IMFTransform,
     channels: u16,
     output_rate: u32,
@@ -784,7 +1086,7 @@ struct SingleStreamDecoder {
     timestamp_100ns: i64,
 }
 
-impl SingleStreamDecoder {
+impl MftDecoder {
     fn new(channels: u16, sample_rate: u32, head_bytes: Option<&[u8]>) -> Result<Self, String> {
         let rt = mf_runtime()?;
         let mft = create_opus_mft(rt)?;
@@ -840,7 +1142,7 @@ impl SingleStreamDecoder {
     }
 
     unsafe fn configure_output(&mut self) -> Result<(), String> {
-        let mut chosen: Option<(IMFMediaType, OutputSampleFormat, u32, u16)> = None;
+        let mut chosen: Option<(IMFMediaType, OutputSampleFormat, u32)> = None;
         for idx in 0..32u32 {
             let Ok(mt) = self.mft.GetOutputAvailableType(0, idx) else {
                 break;
@@ -850,17 +1152,20 @@ impl SingleStreamDecoder {
             };
             let bits = mt.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE).unwrap_or(0);
             let rate = mt.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).unwrap_or(48_000);
-            let ch = mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).unwrap_or(self.channels as u32) as u16;
+            if mt.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok() != Some(u32::from(self.channels)) {
+                continue;
+            }
             if sub == MFAudioFormat_PCM && bits == 16 {
-                chosen = Some((mt, OutputSampleFormat::Pcm16, rate, ch));
+                chosen = Some((mt, OutputSampleFormat::Pcm16, rate));
                 break;
             }
             if sub == MFAudioFormat_Float && bits == 32 && chosen.is_none() {
-                chosen = Some((mt, OutputSampleFormat::Float32, rate, ch));
+                chosen = Some((mt, OutputSampleFormat::Float32, rate));
             }
         }
-        let (mt, fmt, rate, ch) =
-            chosen.ok_or_else(|| "MSOpusDecoder offered no PCM16 or Float32 output type".to_string())?;
+        let (mt, fmt, rate) = chosen.ok_or_else(|| {
+            format!("MSOpusDecoder offered no PCM16 or Float32 output type with {} channel(s)", self.channels)
+        })?;
         self.mft
             .SetOutputType(0, &mt, 0)
             .map_err(|e| format!("SetOutputType: {e}"))?;
@@ -874,13 +1179,12 @@ impl SingleStreamDecoder {
             != 0;
         self.output_fmt = fmt;
         self.output_rate = rate;
-        self.channels = ch;
         self.mft_provides_samples = provides;
         let bytes_per_sample = match fmt {
             OutputSampleFormat::Pcm16 => 2u32,
             OutputSampleFormat::Float32 => 4u32,
         };
-        let max_pkt_bytes = MAX_PACKET_SAMPLES_48K * ch as u32 * bytes_per_sample;
+        let max_pkt_bytes = MAX_PACKET_SAMPLES_48K * u32::from(self.channels) * bytes_per_sample;
         self.min_output_bytes = info.cbSize.max(max_pkt_bytes);
         Ok(())
     }
@@ -936,6 +1240,7 @@ impl SingleStreamDecoder {
     }
 
     unsafe fn drain_output(&mut self, rt: &MfRuntime, out: &mut Vec<i16>) -> Result<(), String> {
+        let mut stream_changes = 0;
         loop {
             let alloc_sample = if self.mft_provides_samples {
                 None
@@ -963,10 +1268,15 @@ impl SingleStreamDecoder {
                 Ok(()) => {
                     if let Some(s) = sample {
                         self.append_sample_pcm16(&s, out)?;
+                        stream_changes = 0;
                     }
                 }
                 Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => break,
                 Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                    stream_changes += 1;
+                    if stream_changes > 4 {
+                        return Err("MSOpusDecoder kept changing its output type".to_string());
+                    }
                     self.configure_output()?;
                     continue;
                 }
@@ -1055,13 +1365,9 @@ impl Decoder {
                 streams.push(SingleStreamDecoder::new(sch, rate, Some(&ud))?);
             }
         }
-        let output_rate = streams[0].output_rate;
+        let output_rate = streams[0].output_rate();
         let pre_skip_scaled = ((head.pre_skip as u64 * output_rate as u64) / 48_000) as usize;
-        let output_gain_scale = if head.output_gain == 0 {
-            1.0
-        } else {
-            10.0f32.powf(head.output_gain as f32 / (20.0 * 256.0))
-        };
+        let output_gain_scale = gain_scale(head.output_gain);
 
         Ok(Self {
             streams,
@@ -1099,6 +1405,13 @@ impl Decoder {
     /// Decode one RFC 6716 (single-stream or multistream) Opus packet and append interleaved
     /// PCM16 samples to `out`. Returns the number of PCM frames (samples per channel) appended.
     pub fn decode_packet(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<usize, String> {
+        let start = out.len();
+        self.decode_packet_pcm(packet, out)?;
+        self.trim_pre_skip(out, start);
+        Ok((out.len() - start) / self.channels as usize)
+    }
+
+    fn decode_packet_pcm(&mut self, packet: &[u8], out: &mut Vec<i16>) -> Result<(), String> {
         let start = out.len();
         let ch = self.channels as usize;
 
@@ -1149,8 +1462,13 @@ impl Decoder {
             }
         }
 
-        // Trim RFC 7845 pre-skip samples if declared by OpusHead.
+        Ok(())
+    }
+
+    fn trim_pre_skip(&mut self, out: &mut Vec<i16>, start: usize) {
+        // Trim any remaining pre-skip configured on the voice.
         if self.pre_skip_left > 0 {
+            let ch = self.channels as usize;
             let produced_frames = (out.len() - start) / ch;
             let drop_frames = produced_frames.min(self.pre_skip_left);
             if drop_frames > 0 {
@@ -1158,22 +1476,50 @@ impl Decoder {
                 self.pre_skip_left -= drop_frames;
             }
         }
-
-        Ok((out.len() - start) / ch)
     }
 
     /// Extract and decode all Opus packets from `data` into interleaved PCM16.
     pub fn decode_buffer(&mut self, data: &[u8], block_align: u16) -> Result<Vec<i16>, String> {
-        let packets = extract_packets(data, block_align, self.multistream);
+        let ExtractedPackets { packets, timing } = extract_buffer(data, block_align, self.multistream);
         if packets.is_empty() {
             return Err("buffer contains no valid RFC 6716 Opus packets".to_string());
         }
         let mut out = Vec::new();
-        for pkt in &packets {
-            self.decode_packet(pkt, &mut out)?;
+        let timing = timing.filter(|t| {
+            // Reuse the voice's configured MFTs only at a decoder stream boundary
+            // and when the Ogg headers describe the same channel layout and gain.
+            u16::from(t.head.channels) == self.channels
+                && usize::from(t.head.stream_count) == self.streams.len()
+                && t.head.coupled_count == self.coupled_count
+                && t.head.mapping == self.mapping
+                && gain_scale(t.head.output_gain) == self.output_gain_scale
+                && self.streams.iter().all(|s| s.timestamp_100ns() == 0)
+        });
+        if let Some(timing) = timing {
+            for pkt in &packets {
+                let start = out.len();
+                if let Err(err) = self.decode_packet_pcm(pkt, &mut out) {
+                    out.truncate(start);
+                    self.trim_pre_skip(&mut out, 0);
+                    return Err(err);
+                }
+            }
+            if timing.trim_pcm(&mut out, self.output_rate, self.channels as usize) {
+                self.pre_skip_left = 0;
+            } else {
+                self.trim_pre_skip(&mut out, 0);
+            }
+        } else {
+            for pkt in &packets {
+                self.decode_packet(pkt, &mut out)?;
+            }
         }
         Ok(out)
     }
+}
+
+fn gain_scale(gain: i16) -> f32 {
+    10.0f32.powf(f32::from(gain) / (20.0 * 256.0))
 }
 
 #[inline]
@@ -1338,6 +1684,158 @@ pub(crate) mod tests {
         (&b[doff..doff + dsz], u32_at(foff) as usize, b[foff + 29].max(1) as u16)
     }
 
+    fn push_ogg_page(
+        ogg: &mut Vec<u8>,
+        serial: u32,
+        sequence: u32,
+        flags: u8,
+        granule: u64,
+        laces: &[u8],
+        body: &[u8],
+    ) {
+        assert_eq!(laces.iter().map(|&l| usize::from(l)).sum::<usize>(), body.len());
+        let start = ogg.len();
+        ogg.extend_from_slice(b"OggS\x00");
+        ogg.push(flags);
+        ogg.extend_from_slice(&granule.to_le_bytes());
+        ogg.extend_from_slice(&serial.to_le_bytes());
+        ogg.extend_from_slice(&sequence.to_le_bytes());
+        ogg.extend_from_slice(&[0; 4]);
+        ogg.push(u8::try_from(laces.len()).unwrap());
+        ogg.extend_from_slice(laces);
+        ogg.extend_from_slice(body);
+
+        let mut crc = 0u32;
+        for &byte in &ogg[start..] {
+            crc ^= u32::from(byte) << 24;
+            for _ in 0..8 {
+                let polynomial = if crc & 0x8000_0000 != 0 { 0x04C1_1DB7 } else { 0 };
+                crc = (crc << 1) ^ polynomial;
+            }
+        }
+        ogg[start + 22..start + 26].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    fn push_ogg_packets(
+        ogg: &mut Vec<u8>,
+        serial: u32,
+        sequence: u32,
+        flags: u8,
+        granule: u64,
+        packets: &[&[u8]],
+    ) {
+        let mut laces = Vec::new();
+        for packet in packets {
+            laces.extend(std::iter::repeat(255).take(packet.len() / 255));
+            laces.push((packet.len() % 255) as u8);
+        }
+        push_ogg_page(ogg, serial, sequence, flags, granule, &laces, &packets.concat());
+    }
+
+    fn ogg_headers(head: &[u8], serial: u32) -> Vec<u8> {
+        let mut ogg = Vec::new();
+        push_ogg_packets(&mut ogg, serial, 0, 0x02, 0, &[head]);
+        push_ogg_packets(&mut ogg, serial, 1, 0, 0, &[b"OpusTags\0\0\0\0\0\0\0\0"]);
+        ogg
+    }
+
+    #[test]
+    fn ogg_eos_frame_estimate_handles_preskip_and_initial_granules() {
+        let head = build_opus_head(1, 48_000, 313, 0);
+        let packet = &[0xF8, 0xFF, 0xFE];
+        let mut ogg = ogg_headers(&head, 7);
+        let headers_len = ogg.len();
+
+        for (granule, keep) in [(800, 800), (1960, 960)] {
+            ogg.truncate(headers_len);
+            push_ogg_packets(&mut ogg, 7, 2, 0x04, granule, &[packet]);
+            assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(keep - 313));
+        }
+
+        ogg.truncate(headers_len);
+        // A 5000-frame initial offset puts both absolute granules beyond the decoded length.
+        push_ogg_packets(&mut ogg, 7, 2, 0, 5960, &[packet]);
+        push_ogg_packets(&mut ogg, 7, 3, 0x04, 6724, &[packet]);
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(1724 - 313));
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 24_000, false), Some(862 - 156));
+
+        ogg.truncate(headers_len);
+        push_ogg_packets(&mut ogg, 7, 2, 0, 5960, &[packet]);
+        push_ogg_packets(&mut ogg, 7, 3, 0x04, 7684, &[packet, packet]);
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(2684 - 313));
+
+        for granule in [200, 313] {
+            ogg.truncate(headers_len);
+            push_ogg_packets(&mut ogg, 7, 2, 0x04, granule, &[packet]);
+            assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(0));
+        }
+    }
+
+    #[test]
+    fn ogg_timing_requires_one_complete_contiguous_link() {
+        let head = build_opus_head(1, 48_000, 0, 0);
+        let packet = &[0xF8, 0xFF, 0xFE];
+        let mut ogg = ogg_headers(&head, 7);
+        let audio_start = ogg.len();
+        push_ogg_packets(&mut ogg, 7, 2, 0x04, 800, &[packet]);
+        assert_eq!(estimate_buffer_frames(&ogg[audio_start..], 0, 48_000, false), Some(960));
+
+        ogg.extend_from_slice(&ogg_headers(&head, 8));
+        push_ogg_packets(&mut ogg, 8, 2, 0x04, 800, &[packet]);
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(1920));
+
+        ogg.truncate(audio_start);
+        push_ogg_packets(&mut ogg, 7, 2, 0, 960, &[packet]);
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(960));
+        push_ogg_packets(&mut ogg, 7, 4, 0x04, 1600, &[packet]);
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(1920));
+    }
+
+    #[test]
+    fn ogg_timing_counts_continued_packet_on_its_completion_page() {
+        let head = build_opus_head(1, 48_000, 0, 0);
+        let mut ogg = ogg_headers(&head, 7);
+        let packet = &[0xF8, 0xFF, 0xFE];
+        let mut continued = [0u8; 256];
+        // One 20 ms frame in code-3 framing with 251 bytes of padding.
+        continued[..5].copy_from_slice(&[0xFB, 0x41, 251, 0xFF, 0xFE]);
+        push_ogg_packets(&mut ogg, 7, 2, 0, 5960, &[packet]);
+        push_ogg_page(&mut ogg, 7, 3, 0, u64::MAX, &[255], &continued[..255]);
+        push_ogg_page(&mut ogg, 7, 4, 0x05, 6724, &[1], &continued[255..]);
+
+        let packets = extract_packets(&ogg, 0, false);
+        assert_eq!(packets.len(), 2);
+        assert_eq!(packets[0].as_ref(), packet);
+        assert_eq!(packets[1].as_ref(), continued.as_slice());
+        assert_eq!(estimate_buffer_frames(&ogg, 0, 48_000, false), Some(1724));
+    }
+
+    #[test]
+    fn ogg_pcm_trim_requires_full_mft_output() {
+        let timing = OggTiming {
+            head: parse_opus_head(&build_opus_head(2, 48_000, 313, 0)).unwrap(),
+            decoded_48k: 1920,
+            end_48k: 1724,
+        };
+        let pcm: Vec<i16> = (0..1920).collect(); // 960 stereo frames at 24 kHz.
+        let mut primed = pcm[..1440].to_vec();
+        assert!(!timing.trim_pcm(&mut primed, 24_000, 2));
+        assert_eq!(primed.as_slice(), &pcm[..1440]);
+
+        let mut full = pcm.clone();
+        assert!(timing.trim_pcm(&mut full, 24_000, 2));
+        assert_eq!(full.as_slice(), &pcm[156 * 2..862 * 2]);
+
+        let shorter_than_preskip = OggTiming {
+            head: parse_opus_head(&build_opus_head(2, 48_000, 313, 0)).unwrap(),
+            decoded_48k: 1920,
+            end_48k: 200,
+        };
+        let mut discarded = pcm.clone();
+        assert!(shorter_than_preskip.trim_pcm(&mut discarded, 24_000, 2));
+        assert!(discarded.is_empty());
+    }
+
     #[test]
     fn framing_detection_awc_blocks_and_raw() {
         let pkt1 = [0x78u8, 0x11, 0x22, 0x33];
@@ -1356,6 +1854,7 @@ pub(crate) mod tests {
         two.extend_from_slice(&block);
         let got2 = extract_packets(&two, 2048, false);
         assert_eq!(got2.len(), 4);
+        assert_eq!(estimate_buffer_frames(&two, 2048, 48_000, false), Some(3840));
 
         let mut tricky = vec![0u8; 250];
         tricky[0] = 0xF8;
@@ -1363,6 +1862,7 @@ pub(crate) mod tests {
         let got_raw = extract_packets(&tricky, 1, false);
         assert_eq!(got_raw.len(), 1);
         assert_eq!(got_raw[0].as_ref(), tricky.as_slice());
+        assert_eq!(estimate_buffer_frames(&tricky, 1, 48_000, false), Some(960));
     }
 
     // Compact real libopus RFC 6716 test packets (440 Hz mono, 440/880 Hz stereo, SILK/Hybrid/CELT, 5.1).
@@ -1483,6 +1983,42 @@ pub(crate) mod tests {
         let peak_ch = |c: usize| pcm51.chunks_exact(6).map(|fr| fr[c].unsigned_abs()).max().unwrap_or(0);
         assert!(peak_ch(1) > 2000, "center channel should carry the tone");
         assert!(peak_ch(0) < 50 && peak_ch(5) < 50, "silent channels should remain near zero");
+    }
+
+    #[test]
+    fn decode_ogg_eos_matches_raw_pcm_window_mono_and_stereo() {
+        if !is_available() {
+            eprintln!("skipping: MSOpusDecoder.dll not available");
+            return;
+        }
+        let cases = [
+            (1, &MONO_HYBRID_20MS[..2], 0, 0),
+            (2, &STEREO_CELT_20MS[..2], 312, 5000),
+        ];
+        for (channels, packets, pre_skip, initial_granule) in cases {
+            let head = build_opus_head(channels, 48_000, pre_skip, 0);
+            let mut ogg = ogg_headers(&head, 7);
+            push_ogg_packets(&mut ogg, 7, 2, 0, initial_granule + 960, &packets[..1]);
+            push_ogg_packets(&mut ogg, 7, 3, 0x04, initial_granule + 1724, &packets[1..]);
+
+            let mut raw_decoder = Decoder::new(u16::from(channels), 48_000, &[]).unwrap();
+            let mut raw = Vec::new();
+            for pkt in packets {
+                let pcm = raw_decoder.decode_buffer(pkt, 0).unwrap();
+                assert_eq!(pcm.len(), 960 * usize::from(channels));
+                raw.extend(pcm);
+            }
+            let ch = usize::from(channels);
+            for extra in [&[][..], head.as_slice()] {
+                let mut dec = Decoder::new(u16::from(channels), 48_000, extra).unwrap();
+                let pcm = dec.decode_buffer(&ogg, 0).unwrap();
+                assert_eq!(pcm.as_slice(), &raw[usize::from(pre_skip) * ch..1724 * ch]);
+                assert_eq!(
+                    estimate_buffer_frames(&ogg, 0, 48_000, false),
+                    Some((pcm.len() / ch) as u64),
+                );
+            }
+        }
     }
 
     #[test]
