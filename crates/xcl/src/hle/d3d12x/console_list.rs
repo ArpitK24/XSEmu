@@ -809,6 +809,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                 let (pd, ps) = (dst[0] as *mut c_void, src[0] as *mut c_void);
                 if ID3D12Resource::from_raw_borrowed(&pd).is_some() && ID3D12Resource::from_raw_borrowed(&ps).is_some() {
                     super::residency::note_list_resources(st.pc, [pd as usize, ps as usize]);
+                    super::vram::note_gpu_write(pd as usize);
                     list.CopyTextureRegion(
                         dst.as_ptr() as *const D3D12_TEXTURE_COPY_LOCATION,
                         get(13),

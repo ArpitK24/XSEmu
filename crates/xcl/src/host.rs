@@ -94,18 +94,23 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (arenas, arenas_made) = crate::hle::d3d12x::vram::arena_bytes();
                 let (pools, pools_mapped) = crate::hle::d3d12x::sparse::pool_bytes();
                 let (pages, page_pools) = crate::hle::d3d12x::vram::page_bytes();
+                let unbacked = crate::hle::d3d12x::vram::unbacked_bytes();
+                let (slab_used, slabs) = crate::hle::d3d12x::vram::slab_bytes();
                 let mb = |b: u64| b >> 20;
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB; {} MB of texture tiles without texels have none); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); small-texture slabs {} KB ({} KB in use)",
                     mb(private),
                     mb(local),
                     mb(non_local),
                     mb(pages as u64),
                     mb(page_pools as u64),
+                    mb(unbacked as u64),
                     mb(arenas as u64),
                     mb(arenas_made as u64),
                     mb(pools as u64),
-                    mb(pools_mapped as u64)
+                    mb(pools_mapped as u64),
+                    slabs >> 10,
+                    slab_used >> 10
                 );
                 last = now;
             }
@@ -198,6 +203,9 @@ fn commit_breakdown() -> String {
     let uma = crate::gpu::uma::get();
     let (mut sparse, mut unified, mut watched, mut physical, mut title, mut mapped, mut image) = (0u64, 0u64, 0u64, 0u64, 0u64, 0u64, 0u64);
     let mut untracked: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
+    // write-combined private memory nobody here allocates: what WDDM commits in the process for
+    // each video-memory allocation (heaps, committed resources, upload buffers) – by allocation
+    let mut write_combined: std::collections::HashMap<usize, u64> = std::collections::HashMap::new();
     let mut at = 0x1_0000usize;
     while at < 0x7FFF_FFFF_0000 {
         let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
@@ -217,7 +225,12 @@ fn commit_breakdown() -> String {
             MEM_PRIVATE if crate::hle::kernelx::in_graphics_reservation(base) => watched += size,
             MEM_PRIVATE if crate::hle::kernelx::in_reservation(base) => physical += size,
             MEM_PRIVATE if crate::memmap::reservation(base).is_some() => title += size,
-            _ => *untracked.entry(m.AllocationBase as usize).or_default() += size,
+            _ => {
+                *untracked.entry(m.AllocationBase as usize).or_default() += size;
+                if m.Type == MEM_PRIVATE && m.Protect & 0x400 != 0 {
+                    *write_combined.entry(m.AllocationBase as usize).or_default() += size;
+                }
+            }
         }
     }
     let (mut large, mut medium, mut small, mut n_large, mut n_medium) = (0u64, 0u64, 0u64, 0, 0);
@@ -233,9 +246,11 @@ fn commit_breakdown() -> String {
         }
     }
     let mb = |b: u64| b >> 20;
+    let pool = 64u64 << 20;
     format!(
-        "private {} MB in sparse windows, {} MB in unified memory, {} MB in watched graphics reservations, {} MB in physical-page reservations, {} MB other title allocations; untracked {} MB ({} allocations of 64 MB+: {} MB, {} of 1-64 MB: {} MB, smaller: {} MB; the title's XMemAlloc heap memory {} MB of it); mapped {} MB, images {} MB",
+        "private {} MB in sparse windows, {} MB in unified memory, {} MB in watched graphics reservations, {} MB in physical-page reservations, {} MB other title allocations; untracked {} MB ({} allocations of 64 MB+: {} MB, {} of 1-64 MB: {} MB, smaller: {} MB; the title's XMemAlloc heap memory {} MB of it; write-combined – the commit behind video memory – {} MB of it in {} allocations, {} of them of 64 MB); mapped {} MB, images {} MB",
         mb(sparse), mb(unified), mb(watched), mb(physical), mb(title),
-        mb(large + medium + small), n_large, mb(large), n_medium, mb(medium), mb(small), mb(crate::hle::kernelx::xmem_heap_bytes() as u64), mb(mapped), mb(image)
+        mb(large + medium + small), n_large, mb(large), n_medium, mb(medium), mb(small), mb(crate::hle::kernelx::xmem_heap_bytes() as u64),
+        mb(write_combined.values().sum()), write_combined.len(), write_combined.values().filter(|&&b| b == pool).count(), mb(mapped), mb(image)
     )
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
@@ -16,19 +17,31 @@ fn selection() -> &'static [u64] {
 
 static SHADERS: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
 
+fn capture_selection() -> Option<(u64, u32)> {
+    static CAPTURE: OnceLock<Option<(u64, u32)>> = OnceLock::new();
+    *CAPTURE.get_or_init(|| {
+        let value = std::env::var("XCL_GPU_DISPATCH_CAPTURE").ok()?;
+        let (hash, count) = value.trim().split_once(':').unwrap_or((value.trim(), "1"));
+        let hash = u64::from_str_radix(hash.trim().trim_start_matches("0x"), 16).ok()?;
+        let count = count.trim().parse::<u32>().ok()?.min(8);
+        (count != 0).then_some((hash, count))
+    })
+}
+
 pub(super) fn note(pso: usize, shader: &[u8]) {
     let selected = selection();
-    if selected.is_empty() {
+    let capture = capture_selection().map(|(hash, _)| hash);
+    if selected.is_empty() && capture.is_none() {
         return;
     }
     let hash = crate::gpu::shader::fnv64(shader);
-    if selected.contains(&hash) {
+    if selected.contains(&hash) || capture == Some(hash) {
         SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, hash);
     }
 }
 
 pub(super) fn forget(pso: usize) {
-    if !selection().is_empty() {
+    if !selection().is_empty() || capture_selection().is_some() {
         if let Some(h) = SHADERS.lock().unwrap().as_mut() {
             h.remove(&pso);
         }
@@ -50,7 +63,17 @@ pub(super) fn shader(pso: usize) -> Option<u64> {
     if selection().is_empty() {
         return None;
     }
-    SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
+    SHADERS.lock().unwrap().as_ref()?.get(&pso).copied().filter(|h| selection().contains(h))
+}
+
+pub(super) fn take_capture(pso: usize) -> Option<(u64, u32)> {
+    static TAKEN: AtomicU32 = AtomicU32::new(0);
+    let (hash, limit) = capture_selection()?;
+    if TAKEN.load(Ordering::Relaxed) >= limit || SHADERS.lock().unwrap().as_ref()?.get(&pso) != Some(&hash) {
+        return None;
+    }
+    let index = TAKEN.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |i| (i < limit).then_some(i + 1)).ok()?;
+    Some((hash, index + 1))
 }
 
 pub(super) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, [x, y, z]: [u32; 3]) {

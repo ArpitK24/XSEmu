@@ -63,6 +63,9 @@ fn count(k: usize) {
         let (allocators, blocks) = console_list::pending_blocks();
         let (coherent_used, coherent_total, sparse_used) = crate::gpu::uma::get()
             .map_or((0, 0, 0), |u| (u.used() >> 20, u.size() >> 20, u.sparse_used() >> 20));
+        if let Some(u) = crate::gpu::uma::get().filter(|u| u.has_sparse()) {
+            crate::gpu::uma::note_coherent_need(u.peak());
+        }
         crate::xlog_info!(
             "D3D12.X: console code so far: {} draws with translated pipelines ({} skipped, {} with PC pipelines), {} dispatches ({} skipped); coherent {coherent_used}/{coherent_total} MB, sparse {sparse_used} MB, {blocks} blocks held for {allocators} allocators",
             c[DRAWS], c[DRAWS_SKIPPED], c[DRAWS_PC], c[DISPATCHES], c[DISPATCHES_SKIPPED],
@@ -1953,9 +1956,28 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         trace_fullscreen(this, pso, [x, y, z]);
     }
     bind_abi(this, list, pso, false)?;
+    if let Some((hash, index)) = super::dispatch_timing::take_capture(pso) {
+        capture_dispatch(this, pso, hash, index, [x, y, z]);
+    }
     super::residency::note_list_untracked(this as usize);
     super::dispatch_timing::dispatch(list, pso, [x, y, z]);
     Ok(())
+}
+
+fn capture_dispatch(this: *mut c_void, pso: usize, hash: u64, index: u32, [x, y, z]: [u32; 3]) {
+    let Some((layout, args)) = with(this, |s| s.layout.clone().map(|layout| (layout, s.args.clone()))) else { return };
+    let inline = (console_list::inline_for(&layout, super::real::pso_user_sgprs(pso)) as usize).min(args.len());
+    let params = layout.params.iter().enumerate().map(|(i, p)| match *p {
+        Param::Constants { at, count } => format!("p{i} {count} constants, bytes {at}..{}", at + 4 * count),
+        Param::Descriptor { at } => format!("p{i} descriptor, bytes {at}..{}", at + 8),
+        Param::Table { at } => format!("p{i} table, bytes {at}..{}", at + 4),
+    }).collect::<Vec<_>>().join("; ");
+    crate::xlog_info!("GPU dispatch capture {index}: CS {hash:016x}; thread groups {x} x {y} x {z}");
+    crate::xlog_info!("GPU dispatch capture {index}: inline argument bytes: {inline}");
+    crate::xlog_info!("GPU dispatch capture {index}: root signature layout: {params}");
+    for line in super::hang::arguments(&layout, &args, false) {
+        crate::xlog_info!("GPU dispatch capture {index}: {line}");
+    }
 }
 
 /// `XCL_DS_VALIDATE`: io[`IO_CARRY_AT`], the window 0 offset of a word translated shaders set

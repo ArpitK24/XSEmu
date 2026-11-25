@@ -3939,14 +3939,70 @@ enum Refused {
     NoRoom,
 }
 
-/// The memory a run's background driver compiles leave available (`XCL_PSO_BACKGROUND_FLOOR_MB`,
-/// `URGENT_FLOOR` at least): the floor of the compiles binds wait for, with the expected peaks of
-/// the compiles running counted whole. `KEEP_FREE` is the warm-up's: beside a retail game that
-/// left ~4 GB available it never let one background compile start, and every pipeline was
-/// compiled when a bind already waited for it.
+static HEADROOM: Mutex<(Option<std::time::Instant>, super::pso_sched::Headroom, super::pso_sched::TitleMemory)> =
+    Mutex::new((None, super::pso_sched::Headroom::empty(), super::pso_sched::TitleMemory { backed: 0, commit: 0 }));
+
+/// Count the full coherent window because it is precommitted, and the live, not pooled,
+/// tiled memory. CPU shadows of tiles, VRAM arenas and physical-page VA aliases are not
+/// counted a second time. Untracked title allocations keep the estimate conservative.
+#[cfg(not(test))]
+pub(super) fn sample_background_headroom() {
+    let backed = crate::gpu::uma::get().map_or(0, |u| u.size())
+        + super::sparse::pool_bytes().1
+        + super::vram::page_bytes().0
+        + crate::hle::kernelx::xmem_heap_bytes();
+    let commit = crate::util::process_commit_bytes();
+    let mut sampled = HEADROOM.lock().unwrap_or_else(|e| e.into_inner());
+    let (start, headroom, sample) = &mut *sampled;
+    let now = start.get_or_insert_with(std::time::Instant::now).elapsed().as_millis() as u64;
+    headroom.note(now, commit, super::pso_async::title_loading());
+    *sample = super::pso_sched::TitleMemory { backed: backed as u64, commit };
+}
+
+/// The run's floor for speculative builds: the host cost of the unbacked console budget
+/// plus the emergency floor and the recent commit growth. An actual bind wait still
+/// uses the previous floor without the console budget reserve.
 fn background_floor() -> u64 {
-    static F: OnceLock<u64> = OnceLock::new();
-    *F.get_or_init(|| std::env::var("XCL_PSO_BACKGROUND_FLOOR_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(URGENT_FLOOR, |mb| (mb << 20).max(URGENT_FLOOR)))
+    background_floor_when(super::pso_async::title_held())
+}
+
+fn title_budget() -> u64 {
+    crate::state::config().title_memory_budget_mb().saturating_mul(1 << 20)
+}
+
+pub(super) fn background_memory_summary() -> String {
+    let (floor, reserve, backed, budget) = background_memory(super::pso_async::title_held());
+    format!("{} MB kept available; title budget {} of {} MB backed, projected {} MB more host commit", floor >> 20, backed >> 20, budget >> 20, reserve >> 20)
+}
+
+/// `background_floor` while a bind waits for a pipeline (`pso_sched::Headroom::floor`) or not.
+fn background_floor_when(bind_waits: bool) -> u64 {
+    background_memory(bind_waits).0
+}
+
+fn background_memory(bind_waits: bool) -> (u64, u64, u64, u64) {
+    static LEAST: OnceLock<(u64, u64)> = OnceLock::new();
+    let (calm, loading) = *LEAST.get_or_init(|| {
+        let mb = |name: &str, or: u64| std::env::var(name).ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(or, |mb| mb << 20).max(URGENT_FLOOR);
+        (mb("XCL_PSO_CALM_FLOOR_MB", super::pso_sched::CALM_HEADROOM), mb("XCL_PSO_BACKGROUND_FLOOR_MB", super::pso_sched::MIN_HEADROOM))
+    });
+    let budget = title_budget();
+    let sampled = HEADROOM.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, headroom, sample) = &*sampled;
+    let reserve = sample.host_reserve(budget);
+    (headroom.title_floor(URGENT_FLOOR, calm, loading, bind_waits, reserve), reserve, sample.backed, budget)
+}
+
+/// `XCL_PSO_SMALL_PEAK_PER_BYTE`: the memory expected for each byte of DXIL of a driver compile
+/// under the giant line (`pso_sched::set_small_peak`), read once.
+fn tune_peaks() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Some(per_byte) = std::env::var("XCL_PSO_SMALL_PEAK_PER_BYTE").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            super::pso_sched::set_small_peak(per_byte);
+            crate::xlog_info!("D3D12.X: a driver compile under 1 MB of DXIL is expected to take {} B for each byte (XCL_PSO_SMALL_PEAK_PER_BYTE)", per_byte.clamp(256, 4096));
+        }
+    });
 }
 
 /// Physical memory installed (0 when the system does not say).
@@ -4085,8 +4141,9 @@ impl Governor {
     }
 
     /// `acquire` with a background floor of its own (`verdict`). Without `wait`, a compile
-    /// nothing waits for that does not start now is `Refused::NoRoom` at once: its thread is
-    /// not held, and what is queued behind it goes on.
+    /// that does not start now is `Refused::NoRoom` at once: its thread is not held, and what is
+    /// queued behind it goes on (one a bind waits for is then built again with `wait`:
+    /// `pso_async::build_ahead`).
     #[allow(clippy::too_many_arguments)]
     fn acquire_within(&self, dxil_len: usize, most: usize, cap: Option<u64>, give_up: bool, floor: Option<u64>, wait: bool, waited_on: impl Fn() -> bool) -> Result<GovGuard, Refused> {
         use super::pso_sched::Verdict;
@@ -4113,7 +4170,8 @@ impl Governor {
                 Verdict::Background => break false,
                 Verdict::Hold => {}
             }
-            if !wait && !wanted {
+            if !wait {
+                s.starving -= starving as usize;
                 return Err(Refused::NoRoom);
             }
             if wanted && s.running == 0 {
@@ -4167,10 +4225,11 @@ impl Governor {
 /// waited and the warm driver cache, for the 30 s caches line.
 pub fn driver_compiles_summary() -> String {
     let (n, giants, urgent) = DRIVER_COMPILES.in_flight();
-    let (waits, worst) = super::pso_async::waits();
+    let (bind_waits, use_waits, worst) = super::pso_async::waits();
+    let waits = bind_waits + use_waits;
     let (urgent_builds, window_waits, window_ms, window_skips) = super::pso_async::take_window();
     format!(
-        "failed {} ({} cannot build within memory); driver compiles running {n} ({giants} giants, {urgent} waited for), {} MB available; {}; binds waited {waits} (worst {worst} ms; since the last line {urgent_builds} builds a bind started, {window_waits} binds waited {window_ms} ms in all); draws skipped {} ({window_skips} since the last line; {} at once for the frame wait budget); GPU waits released on the CPU {}; {}",
+        "failed {} ({} cannot build within memory); driver compiles running {n} ({giants} giants, {urgent} waited for), {} MB available; {}; binds waited {waits} ({bind_waits} at bind, {use_waits} at use; worst {worst} ms; since the last line {urgent_builds} builds a bind started, {window_waits} waits took {window_ms} ms in all); draws skipped {} ({window_skips} since the last line; {} at once for the frame wait budget); GPU waits released on the CPU {}; {}",
         COMPILE_FAILURES.load(Ordering::Relaxed),
         CANNOT_BUILD.load(Ordering::Relaxed),
         available_physical() >> 20,
@@ -4188,15 +4247,21 @@ impl Drop for GovGuard {
     }
 }
 
-/// Which background driver compiles of a run (by their bytes of DXIL) would start now, with the
-/// memory and the compiles running as they are now: a build put off for memory
-/// (`pso_async::put_off`) is taken up again when its compile would. `least`: the smallest one
+/// Which background driver compiles of a run (by their bytes of DXIL; true: one a bind asked
+/// for, which starts as the compiles binds wait for do) would start now, with the memory and
+/// the compiles running as they are now: a build put off for memory (`pso_async::put_off`) is
+/// taken up again when its compile would. `least`: the smallest one
 /// asked about – when not even that fits, the files mapped into the process are trimmed first
 /// (`trim_mapped_files`), as before a compile that waits.
-pub fn background_room(least: usize) -> impl Fn(usize) -> bool {
+pub fn background_room(least: usize) -> impl Fn(usize, bool) -> bool {
+    tune_peaks();
     let most = std::thread::available_parallelism().map_or(4, |n| n.get()).saturating_sub(TITLE_THREADS).clamp(1, SMALL_AT_ONCE);
     let (load, available) = DRIVER_COMPILES.look(least, most);
-    move |dxil_len| DRIVER_COMPILES.verdict_in(&load, available, dxil_len, false, most, None, Some(background_floor())) == super::pso_sched::Verdict::Background
+    let floor = background_floor();
+    move |dxil_len, asked| {
+        use super::pso_sched::Verdict;
+        DRIVER_COMPILES.verdict_in(&load, available, dxil_len, asked, most, None, Some(floor)) == if asked { Verdict::Urgent } else { Verdict::Background }
+    }
 }
 
 static DRIVER_COMPILES: Governor = Governor { state: Mutex::new(GovState { running: 0, giants: 0, urgent: 0, starving: 0, reserved: 0 }), cv: std::sync::Condvar::new() };
@@ -4348,6 +4413,7 @@ unsafe fn translated_compute_pso(this: *mut c_void, f: PsoFn, desc: *const c_voi
 /// `WARM_UP_COMMIT`) or while preparing (`warm`) as background compiles, on the title's own
 /// threads as compiles it waits for. Err: not built, logged (`Governor::acquire`).
 fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Result<GovGuard, Refused> {
+    tune_peaks();
     if dxil_len >= GIANT_DXIL && LEAVE_GIANTS.with(|l| l.get()) {
         REFUSED.with(|r| r.set(Some(Refused::Giant)));
         return Err(Refused::Giant);
@@ -5978,6 +6044,22 @@ enum OwnedDesc {
     Stream(Box<[usize; 2]>, Vec<u8>, Vec<Arc<Vec<u8>>>, Vec<D3D12_INPUT_ELEMENT_DESC>, Vec<std::ffi::CString>),
 }
 
+impl OwnedDesc {
+    /// The title's root signature of the pipeline (0: none in it): the pipelines of one pass
+    /// share theirs, and what a title binds next is likely of the pass it binds now
+    /// (`pso_sched::Backlog`).
+    fn root_signature(&self) -> usize {
+        match self {
+            OwnedDesc::Compute(d, _) => unsafe { std::mem::transmute_copy::<_, usize>(&d.pRootSignature) },
+            OwnedDesc::Graphics(d, ..) => unsafe { std::mem::transmute_copy::<_, usize>(&d.pRootSignature) },
+            OwnedDesc::Stream(_, buf, ..) => stream_fields(buf)
+                .and_then(|fields| fields.into_iter().find(|f| f.0 == 0))
+                .and_then(|(_, at, _)| buf.get(at..at + 8))
+                .map_or(0, |p| usize::from_le_bytes(p.try_into().unwrap())),
+        }
+    }
+}
+
 unsafe impl Send for OwnedDesc {}
 // read only once made: a fast-tier and a full build of one pipeline may read it at once
 unsafe impl Sync for OwnedDesc {}
@@ -6345,6 +6427,7 @@ unsafe fn go_background(
     }
     let dev = Dev(this as usize, f as usize);
     let key = owned.shaders_key();
+    let group = owned.root_signature() as u64;
     let kept = owned.record(kind);
     let what = kept.shaders.iter().map(|(at, s)| format!("{} {:016x}", super::pso_manifest::stage_at(&kept, *at), crate::gpu::shader::fnv64(s))).collect::<Vec<_>>().join(" ");
     // (console shaders only: a PC shader's driver compile is not the translated program's)
@@ -6370,7 +6453,7 @@ unsafe fn go_background(
         }
     });
     if super::pso_async::lazy() {
-        super::pso_async::submit_lazy_described(*ppv as usize, compute, job, key, what, shader_bytes);
+        super::pso_async::submit_lazy_described(*ppv as usize, compute, job, key, what, shader_bytes, group);
     } else {
         super::pso_async::submit_described(*ppv as usize, compute, job, what);
     }
@@ -8340,7 +8423,7 @@ mod pipeline_state_console_tests {
         // (the measured sizes: `pso_sched::peak`'s own tests)
         assert_eq!(peak(6 << 20), 6 * 3380 << 20);
         assert_eq!(peak(GIANT_DXIL), 2 << 30);
-        assert_eq!(peak(1000), 256 << 20);
+        assert_eq!(super::super::pso_sched::peak_at(1000, super::super::pso_sched::SMALL_PEAK_PER_BYTE), 128 << 20);
     }
 }
 
@@ -9898,10 +9981,35 @@ mod governor_tests {
         assert_eq!((s.running, s.starving, s.reserved), (0, 0, 0));
     }
 
+    /// … and so is one a bind asked for on a thread that must not be held (a background worker
+    /// that took a parked build up again): it is not counted as waiting for memory afterwards.
+    #[test]
+    fn a_compile_a_bind_asked_for_is_not_waited_for_on_a_thread_that_must_not_be_held() {
+        let g = governor();
+        let too_big = (available_physical() / 1536) as usize + (1 << 20);
+        let t0 = std::time::Instant::now();
+        assert!(matches!(g.acquire_within(too_big, 20, None, false, Some(URGENT_FLOOR), false, || true), Err(Refused::NoRoom)));
+        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        let s = g.state.lock().unwrap();
+        assert_eq!((s.running, s.starving, s.reserved), (0, 0, 0));
+    }
+
+    /// The background floor is the least headroom or more, whatever the process is doing.
+    #[test]
+    fn the_background_floor_is_at_least_the_least_headroom() {
+        // (no pace runs in a test: the title counts as loading)
+        if std::env::var_os("XCL_PSO_BACKGROUND_FLOOR_MB").is_none() {
+            assert!(background_floor_when(false) >= super::super::pso_sched::MIN_HEADROOM);
+        }
+        // while a bind waits it is the bind's floor and the growth: never under that floor
+        assert!(background_floor_when(true) >= URGENT_FLOOR);
+        assert!(background_floor() >= URGENT_FLOOR);
+    }
+
     /// … while one that fits starts as a background compile, a giant counted as one.
     #[test]
     fn a_background_compile_that_fits_starts_without_waiting() {
-        if available_physical() < peak(0) + URGENT_FLOOR + (1 << 30) {
+        if available_physical() < peak(0) + background_floor_when(false) + (2 << 30) {
             return;
         }
         let g = governor();

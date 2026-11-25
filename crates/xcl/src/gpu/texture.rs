@@ -223,6 +223,21 @@ static UPLOADERS: std::sync::Mutex<Option<std::collections::HashMap<usize, Uploa
 
 /// the smallest upload buffer made, and the placement alignment of texture data in it
 const STAGING_MIN: u64 = 4 << 20;
+/// an upload buffer larger than this is as large as its batch, in steps of it (the next power of
+/// two made 256 MiB of a batch of 129; upstream XCL #2024)
+const STAGING_STEP: u64 = 16 << 20;
+/// the largest upload buffer kept between batches: one batch with a larger texture does not
+/// leave its buffer – system memory, resident while it is mapped – for the rest of the run
+const STAGING_KEEP: u64 = 64 << 20;
+
+/// The capacity of an upload buffer made for `bytes` of texels.
+fn staging_capacity(bytes: u64) -> u64 {
+    if bytes <= STAGING_STEP {
+        bytes.max(STAGING_MIN).next_power_of_two()
+    } else {
+        bytes.div_ceil(STAGING_STEP) * STAGING_STEP
+    }
+}
 const PLACEMENT: u64 = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
 
 impl Uploader {
@@ -241,7 +256,9 @@ impl Uploader {
                 return Ok((b.clone(), *p));
             }
         }
-        let cap = bytes.max(STAGING_MIN).next_power_of_two();
+        let cap = staging_capacity(bytes);
+        // the old buffer goes first: both at once were the peak
+        self.staging = None;
         let b = buffer(dev, cap)?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
@@ -324,6 +341,9 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
         // uploader next time) – freeing them under the GPU removed the device
         std::mem::forget(up);
         return Err(copy_error(e));
+    }
+    if up.staging.as_ref().is_some_and(|s| s.2 > STAGING_KEEP) {
+        up.staging = None;
     }
     put_back(key, up);
     Ok(failed)
@@ -517,6 +537,15 @@ mod tests {
             swizzle_mode: mode,
             min_lod: 0.0,
         }
+    }
+
+    /// Upload buffers: powers of two up to 16 MiB, then the batch's size in 16 MiB steps.
+    #[test]
+    fn staging_grows_in_steps_past_16_mib() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!([0, 1, 4 * MIB, 4 * MIB + 1, 9 * MIB, 16 * MIB].map(staging_capacity), [4 * MIB, 4 * MIB, 4 * MIB, 8 * MIB, 16 * MIB, 16 * MIB]);
+        assert_eq!([16 * MIB + 1, 32 * MIB, 33 * MIB, 129 * MIB, 256 * MIB].map(staging_capacity), [32 * MIB, 32 * MIB, 48 * MIB, 144 * MIB, 256 * MIB]);
+        assert!(staging_capacity(STAGING_KEEP) <= STAGING_KEEP && staging_capacity(STAGING_KEEP + 1) > STAGING_KEEP);
     }
 
     #[test]

@@ -966,7 +966,7 @@ pub(super) unsafe fn on_set_pipeline_state(list: *mut c_void, pso: usize) {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(key).or_default();
         // Keep the title-visible base PSO key when `bind_abi` re-binds its resolved background PSO.
-        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve(s.bound_pso) != pso {
+        if s.bound_pso == 0 || pso == s.bound_pso || super::pso_async::resolve_if_ready(s.bound_pso) != pso {
             s.bound_pso = pso;
         }
         let effective = s.bound_pso;
@@ -3324,7 +3324,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
             (if restore { Some(s.bound_pso) } else { None }, target != s.native_bias)
         };
         if let Some(base) = need_restore_base {
-            let resolved = super::pso_async::resolve_for_bind(base);
+            let resolved = super::pso_async::resolve_wait_at_bind(base);
             pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
         }
         if !need_native_call {
@@ -3368,7 +3368,7 @@ pub(super) unsafe extern "system" fn set_depth_bias_x(this: *mut c_void, depth_b
         }
     };
     if let Some(base) = restore {
-        let resolved = super::pso_async::resolve_for_bind(base);
+        let resolved = super::pso_async::resolve_wait_at_bind(base);
         pc::<unsafe extern "system" fn(*mut c_void, usize)>(this, PC_SET_PIPELINE_STATE)(this, resolved);
     }
 }
@@ -3394,6 +3394,9 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
     }
     let (target, is_fallback) = match bias {
         Some(b) => {
+            if super::pso_async::passive_bind() {
+                super::pso_async::resolve_wait(bound_pso);
+            }
             static MISS: AtomicU64 = AtomicU64::new(0);
             let Some(dev) = device_of(list) else { return };
             match device_x::depth_bias_pso(dev.as_raw(), bound_pso, b) {
@@ -3408,7 +3411,7 @@ pub(super) unsafe fn prepare_draw(list: *mut c_void) {
         }
         None => (bound_pso, false),
     };
-    let resolved = super::pso_async::resolve_for_bind(target);
+    let resolved = super::pso_async::resolve_wait(target);
     pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, resolved);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(list as usize))) {
         s.using_fallback_pso = is_fallback;
@@ -4048,6 +4051,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
         super::title_textures::note_gpu_write(r);
+        super::vram::note_gpu_write(r);
         if super::present::trace_frame() {
             if let Some(va) = super::title_textures::address(r) {
                 static N: AtomicU64 = AtomicU64::new(0);
@@ -4180,6 +4184,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
     super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
+    super::vram::note_gpu_write(dst);
     trace_resolve("ResolveSubresource", dst, src, format, "");
     pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
 }
@@ -4191,6 +4196,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
+    super::vram::note_gpu_write(dst);
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
@@ -4203,6 +4209,7 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     super::depth_uav::note_op(this);
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
+    super::vram::note_gpu_write(dst);
     if super::present::trace_frame() {
         trace_watched_copy("CopyResource", dst, src);
     }

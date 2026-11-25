@@ -20,17 +20,22 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock, Weak};
 
 /// The priority of a preload worker: below the title's threads, which keep their cores while
 /// every other core builds pipelines (at `THREAD_PRIORITY_LOWEST` the workers were also behind
 /// every other process's threads).
 const PRELOAD_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIORITY_BELOW_NORMAL;
+/// … and while the title loads (`pso_sched::Tempo::low`): behind title threads that run below
+/// normal themselves, as loaders do.
+const LOADING_PRIORITY: i32 = windows_sys::Win32::System::Threading::THREAD_PRIORITY_LOWEST;
+/// the priority a preload worker has now while no bind waits for what it builds (`pace`)
+static REST_PRIORITY: AtomicI32 = AtomicI32::new(PRELOAD_PRIORITY);
 
-/// Refcounted priority inheritance for a preload worker (`PRELOAD_PRIORITY`): while a guard
+/// Refcounted priority inheritance for a preload worker (`REST_PRIORITY`): while a guard
 /// lives (a bind waits for the pipeline the worker builds), its OS thread runs at normal
-/// priority; the last guard dropped restores its own.
+/// priority, whatever the pace of the others; the last guard dropped restores its own.
 struct BoostToken {
     tid: u32,
     count: Mutex<usize>,
@@ -80,6 +85,15 @@ impl BoostToken {
         *c += 1;
         BoostGuard(self.clone())
     }
+
+    /// The workers' priority is `prio` from now on: this one's too, unless a bind waits for
+    /// what it builds (then when that is built).
+    fn rest(&self, prio: i32) {
+        let c = self.count.lock().unwrap();
+        if *c == 0 {
+            set_thread_priority_by_id(self.tid, prio);
+        }
+    }
 }
 
 impl Drop for BoostGuard {
@@ -87,7 +101,7 @@ impl Drop for BoostGuard {
         let mut c = self.0.count.lock().unwrap();
         *c = c.saturating_sub(1);
         if *c == 0 {
-            set_thread_priority_by_id(self.0.tid, PRELOAD_PRIORITY);
+            set_thread_priority_by_id(self.0.tid, REST_PRIORITY.load(Ordering::Acquire));
         }
     }
 }
@@ -161,6 +175,10 @@ struct Pending {
     /// a build a bind waited for was refused for memory (`wait_for_memory`): binds take the
     /// stand-in at once until a background worker has built it
     starved: std::sync::atomic::AtomicBool,
+    /// the title's root signature of the pipeline (0: unknown): what is bound next is likely of
+    /// the group of what was bound last (`pso_sched::Backlog`)
+    group: u64,
+    preload_seq: AtomicU64,
 }
 
 impl Drop for Pending {
@@ -187,6 +205,7 @@ impl Pending {
     /// A bind (or a lookup for one) takes this pipeline: from now on its real pipeline stays.
     fn note_bind(&self) {
         self.bound.store(true, Ordering::SeqCst);
+        note_bound_group(self.group);
         if self.released_idle.swap(false, Ordering::AcqRel) {
             REBUILT.fetch_add(1, Ordering::Relaxed);
             self.rebuild.store(true, Ordering::Release);
@@ -195,6 +214,28 @@ impl Pending {
             used::note(self.key);
         }
     }
+}
+
+/// the groups (`Pending::group`) of the pipelines bound last, and how many were noted: the last
+/// one is at that number less one, modulo the length
+static RECENT_GROUPS: [AtomicU64; super::pso_sched::RECENT_GROUPS] = [const { AtomicU64::new(0) }; super::pso_sched::RECENT_GROUPS];
+static RECENT_NOTED: AtomicUsize = AtomicUsize::new(0);
+
+/// A pipeline of `group` is bound (every bind comes here: no lock, and a group bound again and
+/// again is noted once).
+fn note_bound_group(group: u64) {
+    let noted = RECENT_NOTED.load(Ordering::Relaxed);
+    if group == 0 || RECENT_GROUPS[noted.wrapping_sub(1) % RECENT_GROUPS.len()].load(Ordering::Relaxed) == group {
+        return;
+    }
+    RECENT_GROUPS[noted % RECENT_GROUPS.len()].store(group, Ordering::Relaxed);
+    RECENT_NOTED.store(noted.wrapping_add(1), Ordering::Relaxed);
+}
+
+/// The groups of the pipelines bound last, the last one first (0: none).
+fn recent_groups() -> [u64; super::pso_sched::RECENT_GROUPS] {
+    let noted = RECENT_NOTED.load(Ordering::Relaxed);
+    std::array::from_fn(|k| RECENT_GROUPS[noted.wrapping_sub(1 + k) % RECENT_GROUPS.len()].load(Ordering::Relaxed))
 }
 
 /// stand-in handed to the title → its real pipeline
@@ -446,7 +487,7 @@ fn wait_for_memory(p: &Arc<Pending>, dxil_len: usize) -> bool {
 /// `p`'s driver compile of `dxil_len` bytes of DXIL waits for memory (`pso_sched::Backlog::park`).
 fn park(q: &Preload, dxil_len: usize, p: &Arc<Pending>) {
     let mut list = q.list.lock().unwrap();
-    list.park(dxil_len, Arc::downgrade(p));
+    list.park(dxil_len, p.starved.load(Ordering::Acquire), p.group, p.preload_seq.load(Ordering::Relaxed), Arc::downgrade(p));
     LEAST_PARKED.store(list.least_parked(), Ordering::Release);
 }
 
@@ -706,7 +747,8 @@ static WINDOW: Mutex<(usize, usize, usize, usize)> = Mutex::new((0, 0, 0, 0));
 /// (builds a bind started, binds that waited, ms they waited in all, draws skipped) since the
 /// last call
 pub fn take_window() -> (usize, usize, usize, usize) {
-    let now = (URGENT_BUILDS.load(Ordering::Relaxed), WAITS.load(Ordering::Relaxed), WAIT_MS.load(Ordering::Relaxed), SKIPS.load(Ordering::Relaxed));
+    let (bind, used, _) = waits();
+    let now = (URGENT_BUILDS.load(Ordering::Relaxed), bind + used, WAIT_MS.load(Ordering::Relaxed), SKIPS.load(Ordering::Relaxed));
     let last = std::mem::replace(&mut *WINDOW.lock().unwrap(), now);
     (now.0 - last.0, now.1 - last.1, now.2 - last.2, now.3 - last.3)
 }
@@ -792,7 +834,8 @@ fn backstop() -> Option<std::time::Duration> {
 /// A bind waits for the pipeline this thread builds now (it may have started as background work
 /// before): its driver compile goes ahead of the memory governor's limits.
 pub fn waited_on() -> bool {
-    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.urgent.load(Ordering::Acquire)))
+    // (`starved`: a bind asked for it and went without – it is built as what binds wait for are)
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.urgent.load(Ordering::Acquire) || p.starved.load(Ordering::Acquire)))
 }
 
 fn enqueue(p: Arc<Pending>) {
@@ -826,12 +869,12 @@ pub fn release(p: usize) {
 
 /// `standin` went to the title; `job` builds the real pipeline on a worker.
 pub fn submit(standin: usize, compute: bool, job: Job) {
-    submit_as(standin, compute, job, true, 0, String::new(), 0);
+    submit_as(standin, compute, job, true, 0, String::new(), 0, 0);
 }
 
 /// `submit` with what the pipeline is made of (`what`: its shaders, for the log).
 pub fn submit_described(standin: usize, compute: bool, job: Job, what: String) {
-    submit_as(standin, compute, job, true, 0, what, 0);
+    submit_as(standin, compute, job, true, 0, what, 0, 0);
 }
 
 /// Lazy pipeline creation (`XCL_LAZY_PSO=0`: off): a title's pipelines with console shaders get
@@ -850,16 +893,17 @@ pub fn lazy() -> bool {
 /// ahead of all of them. (`XCL_PSO_PRELOAD=0`: built at its first `resolve`, its shaders prepared
 /// before.)
 pub fn submit_lazy(standin: usize, compute: bool, job: Job, key: u64) {
-    submit_as(standin, compute, job, false, key, String::new(), 0);
+    submit_as(standin, compute, job, false, key, String::new(), 0, 0);
 }
 
 /// `submit_lazy` with what the pipeline is made of (`what`: its shaders, for the log;
 /// `shader_bytes`: its console shaders' size).
-pub fn submit_lazy_described(standin: usize, compute: bool, job: Job, key: u64, what: String, shader_bytes: usize) {
-    submit_as(standin, compute, job, false, key, what, shader_bytes);
+pub fn submit_lazy_described(standin: usize, compute: bool, job: Job, key: u64, what: String, shader_bytes: usize, group: u64) {
+    submit_as(standin, compute, job, false, key, what, shader_bytes, group);
 }
 
-fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what: String, shader_bytes: usize) {
+#[allow(clippy::too_many_arguments)]
+fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what: String, shader_bytes: usize, group: u64) {
     let p = Arc::new(Pending {
         job: Mutex::new(Some(Arc::from(job))),
         sent: std::sync::atomic::AtomicBool::new(send),
@@ -885,6 +929,8 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what
         what,
         skipped: Default::default(),
         starved: Default::default(),
+        group,
+        preload_seq: Default::default(),
     });
     PENDING.lock().unwrap().get_or_insert_with(HashMap::new).insert(standin, p.clone());
     static ONCE: std::sync::Once = std::sync::Once::new();
@@ -897,7 +943,10 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what
         start_idle_release();
         if let Some(q) = preload() {
             crate::progress::PIPELINES.queue();
-            q.list.lock().unwrap().push(shader_bytes, used::known(key), compute, Arc::downgrade(&p));
+            let mut list = q.list.lock().unwrap();
+            let seq = list.push(shader_bytes, used::known(key), compute, group, Arc::downgrade(&p));
+            p.preload_seq.store(seq, Ordering::Relaxed);
+            drop(list);
             q.cv.notify_one();
         } else if let Some(q) = prepare_queue() {
             crate::progress::PIPELINES.queue();
@@ -1030,7 +1079,8 @@ struct Preload {
 }
 
 /// How many preload workers there are (`XCL_PSO_PRELOAD_THREADS`; `pso_sched::background_workers`
-/// of the cores). Under Wine they cannot run below normal priority and stay few.
+/// of the cores); how many of them build at once is `pace`'s. Under Wine they cannot run below
+/// normal priority and stay few.
 fn preload_threads() -> usize {
     static N: OnceLock<usize> = OnceLock::new();
     *N.get_or_init(|| {
@@ -1040,7 +1090,7 @@ fn preload_threads() -> usize {
         if !can_lower_preload_priority() {
             return (crate::gpu::recomp::dxc::compile_threads() / 4).clamp(2, 4);
         }
-        super::pso_sched::background_workers(std::thread::available_parallelism().map_or(4, |n| n.get()))
+        super::pso_sched::background_workers(std::thread::available_parallelism().map_or(4, |n| n.get()), physical_cores())
     })
 }
 
@@ -1129,11 +1179,11 @@ static LEAST_PARKED: AtomicUsize = AtomicUsize::new(0);
 /// unannounced (the game's own, another process's).
 const PARKED_POLL: std::time::Duration = std::time::Duration::from_millis(200);
 
-/// Which parked driver compiles (by their bytes of DXIL) would start now, with the memory as
-/// it is now – asked once every `PARKED_POLL` by whichever worker comes first, outside the
+/// Which parked driver compiles (by their bytes of DXIL, and whether a bind asked for them)
+/// would start now, with the memory as it is now – asked once every `PARKED_POLL` by whichever worker comes first, outside the
 /// backlog's lock (the title's threads queue their new pipelines under it). None: nothing is
 /// parked, or another worker asked just now.
-fn parked_room() -> Option<Box<dyn Fn(usize) -> bool>> {
+fn parked_room() -> Option<Box<dyn Fn(usize, bool) -> bool>> {
     let least = LEAST_PARKED.load(Ordering::Acquire);
     if least == 0 {
         return None;
@@ -1148,7 +1198,7 @@ fn parked_room() -> Option<Box<dyn Fn(usize) -> bool>> {
     }
     #[cfg(test)]
     {
-        Some(Box::new(room_for))
+        Some(Box::new(|dxil_len, _| room_for(dxil_len)))
     }
     #[cfg(not(test))]
     {
@@ -1156,16 +1206,136 @@ fn parked_room() -> Option<Box<dyn Fn(usize) -> bool>> {
     }
 }
 
-/// For the 30 s line: what the preload workers have built, what waits for them, and what waits
-/// for memory.
+/// Cores of the PC (its hardware threads when the system does not tell them apart).
+fn physical_cores() -> usize {
+    use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION};
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let mut bytes = 0u32;
+    unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut bytes) };
+    let each = std::mem::size_of::<SYSTEM_LOGICAL_PROCESSOR_INFORMATION>();
+    let mut info: Vec<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> = vec![unsafe { std::mem::zeroed() }; bytes as usize / each];
+    let mut bytes = (info.len() * each) as u32;
+    if info.is_empty() || unsafe { GetLogicalProcessorInformation(info.as_mut_ptr(), &mut bytes) } == 0 {
+        return threads;
+    }
+    match info[..(bytes as usize / each).min(info.len())].iter().filter(|i| i.Relationship == RelationProcessorCore).count() {
+        0 => threads,
+        cores => cores.min(threads),
+    }
+}
+
+fn filetime(t: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
+    (t.dwHighDateTime as u64) << 32 | t.dwLowDateTime as u64
+}
+
+/// CPU time this process has used, in 100 ns.
+fn process_cpu() -> u64 {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let mut t = [windows_sys::Win32::Foundation::FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [made, gone, kernel, user] = &mut t;
+    if unsafe { GetProcessTimes(GetCurrentProcess(), made, gone, kernel, user) } == 0 {
+        return 0;
+    }
+    filetime(kernel) + filetime(user)
+}
+
+/// CPU time thread `tid` has used, in 100 ns (0: gone).
+fn thread_cpu(tid: u32) -> u64 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    let mut t = [windows_sys::Win32::Foundation::FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 }; 4];
+    let [made, gone, kernel, user] = &mut t;
+    unsafe {
+        let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+        if h.is_null() {
+            return 0;
+        }
+        let ok = GetThreadTimes(h, made, gone, kernel, user);
+        CloseHandle(h);
+        if ok == 0 {
+            return 0;
+        }
+    }
+    filetime(kernel) + filetime(user)
+}
+
+/// How often the pace of the preload workers is set again (`pso_sched::Pace::step`), and how
+/// long a worker that may not build now rests before it asks again.
+#[cfg(not(test))]
+const PACE_STEP: std::time::Duration = std::time::Duration::from_millis(500);
+const PACE_REST: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// preload workers that may build at once now (`pace`; all of them until it has started), the
+/// ones building, and the CPU the rest of the process used in the last step (thousandths of a
+/// thread)
+static PACE_WORKERS: AtomicUsize = AtomicUsize::new(usize::MAX);
+static BUILDING_AHEAD: AtomicUsize = AtomicUsize::new(0);
+static PACE_OTHERS: AtomicU64 = AtomicU64::new(0);
+/// the title loads through its storage API (`pso_sched::loading`, set by `pace`; until it has
+/// run it does: a title starts by loading)
+static TITLE_LOADING: AtomicBool = AtomicBool::new(true);
+
+/// Whether the title loads now, as far as its storage API tells.
+pub fn title_loading() -> bool {
+    TITLE_LOADING.load(Ordering::Relaxed)
+}
+
+/// The pace of the `pool` preload workers, set every `PACE_STEP` (`pso_sched::Pace`): how many
+/// build at once – from the CPU the process uses apart from them, and whether the title loads
+/// through DirectStorage (`pso_sched::loading`) – and their priority. A worker over the number finishes what it
+/// builds and takes nothing new; one a bind waits on keeps normal priority (`BoostToken`), and a
+/// bind that finds no worker on its pipeline builds it on a thread of its own (`resolve_wait`),
+/// so nothing a bind waits for is held up here. Each step also samples the memory for the
+/// floor of the background compiles (`real::background_floor`).
+#[cfg(not(test))]
+fn pace(pool: usize, workers: mpsc::Receiver<Arc<BoostToken>>) {
+    let workers: Vec<Arc<BoostToken>> = workers.into_iter().take(pool).collect();
+    let mut pace = super::pso_sched::Pace::new(pool, physical_cores());
+    let cpu = |workers: &[Arc<BoostToken>]| (process_cpu(), workers.iter().map(|w| thread_cpu(w.tid)).sum::<u64>());
+    let storage = || {
+        let (requests, bytes, _) = crate::hle::dstorage::counters();
+        (requests, bytes)
+    };
+    let (mut at, mut before, mut ran) = (std::time::Instant::now(), cpu(&workers), storage());
+    super::real::sample_background_headroom();
+    loop {
+        std::thread::sleep(PACE_STEP);
+        let (now, after, read) = (std::time::Instant::now(), cpu(&workers), storage());
+        let wall = ((now - at).as_nanos() / 100).max(1);
+        let others = ((after.0.saturating_sub(before.0)).saturating_sub(after.1.saturating_sub(before.1)) as u128 * 1000 / wall) as u64;
+        let loading = super::pso_sched::loading(read.0.saturating_sub(ran.0), read.1.saturating_sub(ran.1), (now - at).as_millis() as u64);
+        TITLE_LOADING.store(loading, Ordering::Relaxed);
+        let tempo = pace.step(others, loading);
+        let rest = if tempo.low { LOADING_PRIORITY } else { PRELOAD_PRIORITY };
+        if REST_PRIORITY.swap(rest, Ordering::AcqRel) != rest {
+            for w in &workers {
+                w.rest(rest);
+            }
+        }
+        PACE_WORKERS.store(tempo.workers, Ordering::Release);
+        PACE_OTHERS.store(others, Ordering::Relaxed);
+        super::real::sample_background_headroom();
+        (at, before, ran) = (now, after, read);
+    }
+}
+
+/// For the 30 s line: what the preload workers have built, what waits for them, what waits for
+/// memory, and their pace now.
 pub fn ahead_summary() -> String {
     let (waiting, parked) = Q.get().and_then(|q| q.as_ref()).map_or((0, 0), |q| q.list.lock().unwrap().waiting());
+    let pool = if Q.get().is_some_and(|q| q.is_some()) { preload_threads() } else { 0 };
     format!(
-        "built ahead {} on {} workers ({} waiting, {parked} of them for memory; put off {} times)",
+        "built ahead {} on {} workers ({} waiting, {parked} of them for memory; put off {} times; now {} of up to {} building{}, beside {:.1} threads of other work, {}{})",
         AHEAD.load(Ordering::Relaxed),
-        if Q.get().is_some_and(|q| q.is_some()) { preload_threads() } else { 0 },
+        pool,
         waiting,
-        PUT_OFFS.load(Ordering::Relaxed)
+        PUT_OFFS.load(Ordering::Relaxed),
+        BUILDING_AHEAD.load(Ordering::Relaxed),
+        PACE_WORKERS.load(Ordering::Relaxed).min(pool),
+        if REST_PRIORITY.load(Ordering::Relaxed) == LOADING_PRIORITY { " at the lowest priority" } else { "" },
+        PACE_OTHERS.load(Ordering::Relaxed) as f64 / 1000.0,
+        super::real::background_memory_summary(),
+        if title_loading() { ", the title loads" } else { "" }
     )
 }
 
@@ -1183,24 +1353,49 @@ fn preload() -> Option<&'static Preload> {
         .as_ref()?;
     STARTED.call_once(|| {
         let n = preload_threads();
-        crate::xlog_info!("D3D12.X: pipelines are built when the title makes them on {n} background threads");
+        crate::xlog_info!(
+            "D3D12.X: pipelines are built when the title makes them on {n} background threads ({} cores): as many at once as the title's own threads leave cores for, fewer and at the lowest priority while it loads",
+            physical_cores()
+        );
+        let (tokens, started) = mpsc::channel();
+        #[cfg(not(test))]
+        {
+            // (from the least: a title starts by loading)
+            PACE_WORKERS.store(super::pso_sched::least_workers(n), Ordering::Release);
+            let _ = std::thread::Builder::new().name("xcl-pace".into()).spawn(move || pace(n, started));
+        }
+        #[cfg(test)]
+        drop(started);
         for k in 0..n {
+            let tokens = tokens.clone();
             let _ = std::thread::Builder::new().name(format!("xcl-pso-pre-{k}")).stack_size(64 << 20).spawn(move || {
                 if can_lower_preload_priority() {
                     unsafe {
                         use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
-                        SetThreadPriority(GetCurrentThread(), PRELOAD_PRIORITY);
+                        SetThreadPriority(GetCurrentThread(), REST_PRIORITY.load(Ordering::Acquire));
                     }
                 }
                 let token = BoostToken::for_current_thread();
+                let _ = tokens.send(token.clone());
+                drop(tokens);
                 loop {
                     let (p, lane) = loop {
+                        // (not on `cv`: a pipeline queued must wake a worker that may take it)
+                        if BUILDING_AHEAD.load(Ordering::Acquire) >= PACE_WORKERS.load(Ordering::Acquire) {
+                            std::thread::sleep(PACE_REST);
+                            continue;
+                        }
                         let room = parked_room();
                         let mut g = q.list.lock().unwrap();
+                        // (under the backlog's lock, as every take is: never more than the pace allows)
+                        if BUILDING_AHEAD.load(Ordering::Acquire) >= PACE_WORKERS.load(Ordering::Acquire) {
+                            continue;
+                        }
                         let wanted = |p: &Weak<Pending>| p.upgrade().is_some_and(|p| !p.orphan.load(Ordering::Acquire) && !p.full_started.load(Ordering::Acquire) && !*p.done.lock().unwrap());
-                        let next = g.pop(n, wanted, |dxil_len| room.as_ref().is_some_and(|fits| fits(dxil_len)));
+                        let next = g.pop(n, &recent_groups(), wanted, |dxil_len, asked| room.as_ref().is_some_and(|fits| fits(dxil_len, asked)));
                         LEAST_PARKED.store(g.least_parked(), Ordering::Release);
                         if let Some(next) = next {
+                            BUILDING_AHEAD.fetch_add(1, Ordering::AcqRel);
                             break next;
                         }
                         if g.has_parked() {
@@ -1213,6 +1408,7 @@ fn preload() -> Option<&'static Preload> {
                     impl Drop for Taken {
                         fn drop(&mut self) {
                             self.0.list.lock().unwrap_or_else(|e| e.into_inner()).done(self.1);
+                            BUILDING_AHEAD.fetch_sub(1, Ordering::AcqRel);
                         }
                     }
                     let _taken = Taken(q, lane);
@@ -1304,6 +1500,61 @@ mod used_tests {
             CloseHandle(h);
             p
         }
+    }
+
+    /// The pace's change of priority reaches a worker at once, unless a bind waits for what it
+    /// builds: that one stays at normal priority until it is built.
+    #[test]
+    fn a_worker_takes_the_priority_of_the_pace_unless_a_bind_waits_on_it() {
+        use windows_sys::Win32::System::Threading::THREAD_PRIORITY_NORMAL;
+        if !can_lower_preload_priority() {
+            return;
+        }
+        let (tok_tx, tok_rx) = mpsc::channel();
+        let (end_tx, end_rx) = mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            tok_tx.send(BoostToken::for_current_thread()).unwrap();
+            let _ = end_rx.recv();
+        });
+        let tok: Arc<BoostToken> = tok_rx.recv().unwrap();
+        tok.rest(LOADING_PRIORITY);
+        assert_eq!(thread_priority_of(tok.tid), LOADING_PRIORITY);
+        tok.rest(PRELOAD_PRIORITY);
+        assert_eq!(thread_priority_of(tok.tid), PRELOAD_PRIORITY);
+        let waited_on = tok.boost();
+        tok.rest(LOADING_PRIORITY);
+        assert_eq!(thread_priority_of(tok.tid), THREAD_PRIORITY_NORMAL, "a bind waits on it: not lowered");
+        drop(waited_on);
+        assert_eq!(thread_priority_of(tok.tid), REST_PRIORITY.load(Ordering::Acquire), "the workers' priority once its bind has it");
+        drop(end_tx);
+        t.join().unwrap();
+    }
+
+    /// What the pace is set from: the CPU a thread used is in the CPU the process used, and the
+    /// PC has no more cores than hardware threads.
+    #[test]
+    fn the_cpu_of_a_thread_is_part_of_the_cpu_of_the_process() {
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (p0, started) = (process_cpu(), std::time::Instant::now());
+        let t = std::thread::spawn(move || {
+            tid_tx.send(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }).unwrap();
+            let mut x = 1u64;
+            while started.elapsed() < std::time::Duration::from_millis(300) {
+                x = std::hint::black_box(x.wrapping_mul(6364136223846793005).wrapping_add(1));
+            }
+            // (its times are read while it lives)
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        });
+        let tid = tid_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(350));
+        let (thread, process) = (thread_cpu(tid), process_cpu() - p0);
+        t.join().unwrap();
+        // (100 ns units; a busy PC may give the thread less than its 300 ms)
+        assert!(thread >= 500_000, "the thread's CPU time is read: {thread}");
+        assert!(process >= thread * 9 / 10, "process {process}, thread {thread}");
+        assert_eq!(thread_cpu(u32::MAX - 3), 0, "no such thread");
+        let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+        assert!((1..=threads).contains(&physical_cores()), "{} cores, {threads} threads", physical_cores());
     }
 
     #[test]
@@ -1436,8 +1687,8 @@ mod used_tests {
             }
             real
         };
-        submit_lazy_described(standin, false, Box::new(move || held(&g, 0x4331)), 0, "VS 1 PS 2".into(), 0);
-        submit_lazy_described(compute, true, Box::new(move || held(&gc, 0x4332)), 0, "CS 3".into(), 0);
+        submit_lazy_described(standin, false, Box::new(move || held(&g, 0x4331)), 0, "VS 1 PS 2".into(), 0, 0);
+        submit_lazy_described(compute, true, Box::new(move || held(&gc, 0x4332)), 0, "CS 3".into(), 0, 0);
         let skipped_before = skips();
         let t0 = std::time::Instant::now();
         assert_eq!(resolve_wait(standin), standin, "the draw is skipped: the stand-in");
@@ -1544,6 +1795,33 @@ mod ahead_tests {
         }
     }
 
+    #[test]
+    fn a_passive_bind_leaves_pending_compute_to_the_first_use() {
+        let standin = 0x7E57_D001usize;
+        let real = 0x4701usize;
+        let (finish, gate) = mpsc::channel();
+        let gate = Mutex::new(gate);
+        submit_lazy(standin, true, Box::new(move || {
+            gate.lock().unwrap().recv().unwrap();
+            real
+        }), 0);
+        let pending = entry(standin).unwrap();
+        assert_eq!(resolve_bind(standin, true), standin);
+        assert!(!pending.urgent.load(Ordering::Acquire));
+        assert!(!pending.bound.load(Ordering::Acquire));
+
+        let used = std::thread::spawn(move || {
+            let count = AtomicUsize::new(0);
+            (resolve_wait_from(standin, &count), count.load(Ordering::Relaxed))
+        });
+        wait_until("compute use makes the unfinished build urgent", || pending.urgent.load(Ordering::Acquire));
+        assert!(!used.is_finished());
+        finish.send(()).unwrap();
+        assert_eq!(used.join().unwrap(), (real, 1));
+        assert_eq!(resolve_bind(standin, true), real);
+        assert_eq!(released(standin), real);
+    }
+
     /// A build with a big driver compile of `dxil_len` bytes, as `real::driver_slot` treats it:
     /// with no memory for it (`NO_ROOM`) a preload worker nothing waits on leaves it; any other
     /// thread would wait for the memory (here: builds it).
@@ -1573,7 +1851,7 @@ mod ahead_tests {
         NO_ROOM.lock().unwrap().push(len);
         let runs = Arc::new(AtomicUsize::new(0));
         let (big_one, small) = (0x7E57_A001usize, 0x7E57_A100usize);
-        submit_lazy_described(big_one, true, big(len, 0x4401, runs.clone()), 0, "CS big".into(), super::super::pso_sched::HEAVY_SHADER_BYTES);
+        submit_lazy_described(big_one, true, big(len, 0x4401, runs.clone()), 0, "CS big".into(), super::super::pso_sched::HEAVY_SHADER_BYTES, 0);
         for k in 0..64 {
             submit_lazy(small + k, k % 2 == 0, Box::new(move || 0x4500 + k), 0);
         }
@@ -1590,6 +1868,59 @@ mod ahead_tests {
         }
     }
 
+    /// The groups of the pipelines bound last are kept, the last one first; one bound again and
+    /// again is noted once, and a pipeline of no group changes nothing.
+    #[test]
+    fn the_groups_bound_last_are_kept_the_last_one_first() {
+        // (the other tests' pipelines have no group: only this one notes any)
+        let (a, b, c) = (0x7E57_0000_0000_00A1u64, 0x7E57_0000_0000_00B2u64, 0x7E57_0000_0000_00C3u64);
+        for group in [a, a, 0, a, b, 0, b, a, c, c] {
+            note_bound_group(group);
+        }
+        assert_eq!(recent_groups()[..4], [c, a, b, a]);
+        for _ in 0..super::super::pso_sched::RECENT_GROUPS {
+            note_bound_group(b);
+            note_bound_group(c);
+        }
+        assert!(recent_groups().iter().all(|g| *g == b || *g == c), "the older ones are gone");
+        assert_eq!(recent_groups()[..2], [c, b]);
+    }
+
+    /// No more background workers build at once than the pace allows (`PACE_WORKERS`): the
+    /// others take nothing until one is done.
+    #[test]
+    fn the_workers_build_no_more_at_once_than_the_pace_allows() {
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                PACE_WORKERS.store(usize::MAX, Ordering::Release);
+            }
+        }
+        let (at_once, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let first = 0x7E57_C100usize;
+        let _restore = Restore;
+        PACE_WORKERS.store(2, Ordering::Release);
+        for k in 0..24 {
+            let (at_once, most) = (at_once.clone(), most.clone());
+            submit_lazy(
+                first + k,
+                k % 2 == 0,
+                Box::new(move || {
+                    most.fetch_max(at_once.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(15));
+                    at_once.fetch_sub(1, Ordering::SeqCst);
+                    0x4600 + k
+                }),
+                0,
+            );
+        }
+        wait_until("all of them are built, two at a time", || (0..24).all(|k| !is_pending(first + k)));
+        assert!((1..=2).contains(&most.load(Ordering::SeqCst)), "{} at once", most.load(Ordering::SeqCst));
+        for k in 0..24 {
+            assert_eq!(released(first + k), 0x4600 + k);
+        }
+    }
+
     /// A bind promotes a build that waits for memory: its build starts at once on a thread of
     /// its own, ahead of everything queued, and waits for the memory itself.
     #[test]
@@ -1598,7 +1929,7 @@ mod ahead_tests {
         NO_ROOM.lock().unwrap().push(len);
         let runs = Arc::new(AtomicUsize::new(0));
         let standin = 0x7E57_A002usize;
-        submit_lazy_described(standin, true, big(len, 0x4402, runs.clone()), 0, "CS big".into(), 0);
+        submit_lazy_described(standin, true, big(len, 0x4402, runs.clone()), 0, "CS big".into(), 0, 0);
         wait_until("the build was put off", || runs.load(Ordering::SeqCst) >= 1 && parked(standin));
         let urgent_before = URGENT_BUILDS.load(Ordering::SeqCst);
         assert_eq!(resolve_wait(standin), 0x4402, "the bind's own build");
@@ -1633,7 +1964,7 @@ mod ahead_tests {
             }
             0
         };
-        submit_lazy_described(standin, true, Box::new(job), 0, "CS giant".into(), 0);
+        submit_lazy_described(standin, true, Box::new(job), 0, "CS giant".into(), 0, 0);
         wait_until("the build was put off", || runs.load(Ordering::SeqCst) >= 1 && parked(standin));
         assert_eq!(resolve_wait(standin), standin, "refused for memory: the stand-in");
         let t = Instant::now();
@@ -1678,6 +2009,7 @@ mod ahead_tests {
             }),
             0,
             "CS big".into(),
+            0,
             0,
         );
         started_rx.recv_timeout(Duration::from_secs(10)).expect("a preload worker builds it");
@@ -1726,6 +2058,14 @@ static WORST_WAIT: AtomicUsize = AtomicUsize::new(0);
 /// binds now), and the bind waits until it is built (`LONG_WAIT`). A build that failed leaves
 /// the stand-in (its failure is logged where it failed).
 pub fn resolve_wait(pso: usize) -> usize {
+    resolve_wait_from(pso, &USE_WAITS)
+}
+
+pub(super) fn resolve_wait_at_bind(pso: usize) -> usize {
+    resolve_wait_from(pso, &BIND_WAITS)
+}
+
+fn resolve_wait_from(pso: usize, site_waits: &AtomicUsize) -> usize {
     let Some(p) = entry(pso) else { return pso };
     p.note_bind();
     if p.starved.load(Ordering::Acquire) {
@@ -1763,7 +2103,7 @@ pub fn resolve_wait(pso: usize) -> usize {
                 drop(done);
                 add_frame_wait(t0.elapsed());
                 let ms = t0.elapsed().as_millis() as usize;
-                WAITS.fetch_add(1, Ordering::Relaxed);
+                site_waits.fetch_add(1, Ordering::Relaxed);
                 WAIT_MS.fetch_add(ms, Ordering::Relaxed);
                 SKIPS.fetch_add(1, Ordering::Relaxed);
                 if over_budget && !p.skipped.load(Ordering::Acquire) {
@@ -1808,7 +2148,7 @@ pub fn resolve_wait(pso: usize) -> usize {
         let waited = t0.elapsed();
         add_frame_wait(waited);
         let kind = if p.compute { "compute" } else { "graphics" };
-        WAITS.fetch_add(1, Ordering::Relaxed);
+        site_waits.fetch_add(1, Ordering::Relaxed);
         if waited >= LONG_WAIT {
             crate::xlog_warn!("D3D12.X: a bind waited {:.1} s for {kind} pipeline {pso:#x} (binds wait for every pipeline)", waited.as_secs_f32());
         }
@@ -1832,16 +2172,55 @@ pub fn resolve_wait(pso: usize) -> usize {
 }
 
 /// binds that waited for a pipeline still being built
-static WAITS: AtomicUsize = AtomicUsize::new(0);
+static BIND_WAITS: AtomicUsize = AtomicUsize::new(0);
+static USE_WAITS: AtomicUsize = AtomicUsize::new(0);
 
-/// (binds that waited, the longest wait in ms) so far
-pub fn waits() -> (usize, usize) {
-    (WAITS.load(Ordering::Relaxed), WORST_WAIT.load(Ordering::Relaxed))
+/// (bind-time waits, use-time waits, the longest wait in ms) so far
+pub fn waits() -> (usize, usize, usize) {
+    (BIND_WAITS.load(Ordering::Relaxed), USE_WAITS.load(Ordering::Relaxed), WORST_WAIT.load(Ordering::Relaxed))
 }
 
-/// For binding: every pipeline is waited for (`resolve_wait`).
+pub(super) fn passive_bind() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| lazy() && std::env::var("XCL_PSO_PASSIVE_BIND").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// Resolve without enqueuing or pinning a pipeline for a bookkeeping-only lookup.
+pub(super) fn resolve_if_ready(pso: usize) -> usize {
+    if !passive_bind() {
+        return resolve(pso);
+    }
+    entry(pso).map_or(pso, |p| match p.real.load(Ordering::Acquire) {
+        0 => pso,
+        real => real,
+    })
+}
+
+/// Opt-in passive binds keep the stand-in until an actual draw or dispatch asks for the PSO.
 pub fn resolve_for_bind(pso: usize) -> usize {
-    resolve_wait(pso)
+    resolve_bind(pso, passive_bind())
+}
+
+fn resolve_bind(pso: usize, passive: bool) -> usize {
+    if !passive {
+        return resolve_wait_at_bind(pso);
+    }
+    let Some(p) = entry(pso) else { return pso };
+    if p.real.load(Ordering::Acquire) != 0 {
+        p.bound.store(true, Ordering::SeqCst);
+        match p.real.load(Ordering::SeqCst) {
+            0 => (),
+            real => return real,
+        }
+    }
+    let seq = p.preload_seq.load(Ordering::Relaxed);
+    if seq != 0 {
+        if let Some(Some(q)) = Q.get() {
+            q.list.lock().unwrap().promote(seq);
+            q.cv.notify_one();
+        }
+    }
+    pso
 }
 
 /// The title released stand-in `pso` for good: forget it (its address may come back for
@@ -1975,6 +2354,8 @@ mod tests {
             what: String::new(),
             skipped: Default::default(),
             starved: Default::default(),
+            group: 0,
+            preload_seq: Default::default(),
         });
         let (c1, c2, g1, g2) = (pending(true), pending(true), pending(false), pending(false));
         let mut queue = BuildQueue::default();

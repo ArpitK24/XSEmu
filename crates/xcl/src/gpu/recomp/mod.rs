@@ -1528,6 +1528,16 @@ fn decode_program<'a>(code: &'a [u8], opt: &Options) -> Result<DecodedProgram<'a
     Ok(DecodedProgram { code, insts, starts, leaders, branches, gs_jump, static_samplers, fmt_regs, max_vgpr, long_loops })
 }
 
+fn needs_coherent_mem(insts: &[Decoded]) -> bool {
+    insts.iter().any(|d| {
+        let name = d.inst.name;
+        matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV")
+            || ["BUFFER_ATOMIC_", "GLOBAL_ATOMIC_", "FLAT_ATOMIC_"].iter().any(|prefix| name.starts_with(prefix))
+            || (matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
+                && ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1)))
+    })
+}
+
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     emit_program(&decode_program(code, opt)?, opt)
 }

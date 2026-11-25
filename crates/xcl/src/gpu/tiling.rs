@@ -345,6 +345,16 @@ impl Chain {
         Chain { layout, levels, slice_bytes: offset }
     }
 
+    /// The bytes of a slice that level `i`'s elements are in: the tail block for a level of the
+    /// mip tail, else from the level's offset to the next larger level's (mip 0: the slice's end).
+    pub fn level_span(&self, i: usize) -> std::ops::Range<usize> {
+        let l = &self.levels[i];
+        if l.tail.is_some() {
+            return 0..self.layout.block_bytes.min(self.slice_bytes);
+        }
+        l.offset..if i == 0 { self.slice_bytes } else { self.levels[i - 1].offset }
+    }
+
     /// Slices a 3D texture takes (depth slices, or thick layers of `block_d` of them).
     pub fn layers(&self) -> usize {
         self.levels[0].depth.div_ceil(self.layout.block_d)
@@ -517,6 +527,38 @@ mod tests {
     /// `detile_level` (offsets split by row and column) gives the bytes element-by-element
     /// `element_at` does: every mode, element size and pipe configuration, every level (mip
     /// tails too), a base swizzle and a slice, and a source cut short (bytes past it read as 0).
+    #[test]
+    fn every_element_of_a_level_is_in_its_span() {
+        for mode in MODES {
+            for e in 0..5u32 {
+                for cfg in configs() {
+                    let lay = Layout::new(mode, e, cfg).unwrap();
+                    for (w, h, mips) in [(77, 45, 7), (256, 256, 9), (1, 1, 1), (2048, 512, 12)] {
+                        let c = Chain::new(lay.clone(), w, h, 1, mips);
+                        let es = 1usize << e;
+                        let mut covered = 0;
+                        for (k, l) in c.levels.iter().enumerate() {
+                            let span = c.level_span(k);
+                            assert!(span.start < span.end && span.end <= c.slice_bytes, "mode {mode} e {e} {w}x{h} level {k}: {span:?}");
+                            if l.tail.is_none() {
+                                covered += span.len();
+                            }
+                            for (x, y) in [(0, 0), (l.width - 1, 0), (0, l.height - 1), (l.width - 1, l.height - 1), (l.width / 2, l.height / 3)] {
+                                for slice in [0, 3] {
+                                    let o = c.element_at(l, x, y, slice);
+                                    assert!(span.start <= o && o + es <= span.end, "mode {mode} e {e} {w}x{h} level {k} ({x}, {y}) slice {slice}: {o:#x} not in {span:?}");
+                                }
+                            }
+                        }
+                        // the levels outside the tail and the tail block are the slice
+                        let tail = if c.levels.iter().any(|l| l.tail.is_some()) { c.layout.block_bytes } else { 0 };
+                        assert_eq!(covered + tail, c.slice_bytes, "mode {mode} e {e} {w}x{h}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn detile_level_matches_element_by_element() {
         for mode in MODES {

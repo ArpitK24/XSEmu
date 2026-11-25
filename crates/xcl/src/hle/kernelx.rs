@@ -324,18 +324,19 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
     // the GPU reads where it is – one copy (a retail game's 4.4 GB; as plain memory its shaders
     // read zeros, in the sparse windows video memory would have doubled them). The window is as
-    // large as what the title asked for last time (`uma::coherent_hint`).
+    // large as what was in use in it at once in earlier runs (`uma::coherent_hint`).
     if addr.is_null() && t & 0x1000 != 0 && p & PAGE_GRAPHICS_ANY != 0 && size <= crate::gpu::uma::MAX_SIZE && std::env::var("XCL_COHERENT_HEAPS").map_or(true, |v| v != "0") {
-        static ASKED: AtomicUsize = AtomicUsize::new(0);
-        let asked = ASKED.fetch_add(size, Ordering::Relaxed) + size;
-        crate::gpu::uma::note_coherent_need(asked);
         if let Some(u) = uma {
             let align = if t & 0x2000_0000 != 0 && t & 0x0040_0000 == 0 { 2 << 20 } else { crate::gpu::uma::GRAIN };
             // what XCL keeps of the window for itself (readback heaps; its per-draw arguments have
             // a pool of their own)
             const KEEP: usize = 96 << 20;
             let fits = u.size().saturating_sub(u.used()) >= size + KEEP;
-            if let Some(q) = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align)) {
+            let got = u.committed_window().filter(|_| fits).and_then(|k| u.alloc_in(k, size, align));
+            // what the window had to hold at its fullest – with this allocation, when it had no
+            // room for it (the sum of all that was asked for counted what the title freed again)
+            crate::gpu::uma::note_coherent_need(u.peak().max(if got.is_some() { 0 } else { u.used().saturating_add(size) }));
+            if let Some(q) = got {
                 trace_mem("VirtualAlloc (graphics, coherent window)", 0, size, t as u64, p, q as usize);
                 return q as *mut c_void;
             }

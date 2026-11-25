@@ -394,6 +394,70 @@ fn gpu_packed_compute_cross_half_exchange_in_a_branch_and_partial_wave() {
 }
 
 #[test]
+fn compute_flat_memory_is_coherent_only_for_flagged_accesses_atomics_or_invalidation() {
+    let plain = ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 0), ("SOFFSET", 125)][..], None);
+    let cases: &[(&str, &str, &[(&str, u64)], Option<u32>)] = &[
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 9), ("SBASE", 0), ("SOFFSET", 125), ("GLC", 1)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 9), ("SBASE", 0), ("SOFFSET", 125), ("DLC", 1)], None),
+        ("BUFFER_LOAD_DWORD", "ENC_MUBUF", &[("SLC", 1), ("SOFFSET", 128)], None),
+        ("GLOBAL_ATOMIC_ADD", "ENC_FLAT_GLBL", &[("SADDR", 0x7d)], None),
+        ("FLAT_ATOMIC_ADD", "ENC_FLAT", &[], None),
+        ("BUFFER_ATOMIC_ADD", "ENC_MUBUF", &[("SOFFSET", 128)], None),
+        ("S_DCACHE_INV", "ENC_SMEM", &[], None),
+        ("S_GL1_INV", "ENC_SMEM", &[], None),
+        ("BUFFER_GL0_INV", "ENC_MUBUF", &[], None),
+        ("BUFFER_GL1_INV", "ENC_MUBUF", &[], None),
+    ];
+    let cs = super::CsInterface { threads: [64, 1, 1], user_sgprs: 4, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    for mem_windows in [1, 4] {
+        let opt = Options { mode: Mode::Compute(cs.clone()), wave64: true, split_wave64: true, mem_windows, ..Default::default() };
+        let hlsl = translate(&prog(&[plain]), &opt).unwrap().hlsl;
+        assert!(!hlsl.contains("globallycoherent RWByteAddressBuffer"));
+        for &op in cases {
+            let t = translate(&prog(&[plain, op]), &opt).unwrap();
+            assert!(t.complete(), "{}: {:?}", op.0, t.unsupported_why);
+            assert!(t.hlsl.contains("globallycoherent RWByteAddressBuffer"), "{}", op.0);
+        }
+    }
+}
+
+#[test]
+fn gpu_packed_compute_scalar_load_chain() {
+    let code = prog(&[
+        ("S_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 8), ("SBASE", 1), ("SOFFSET", 125)], None),
+        ("S_BUFFER_LOAD_DWORDX4", "ENC_SMEM", &[("SDATA", 12), ("SBASE", 4), ("SOFFSET", 125)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 16), ("SBASE", 1), ("OFFSET", 16), ("SOFFSET", 125), ("GLC", 1)], None),
+        ("S_LOAD_DWORD", "ENC_SMEM", &[("SDATA", 17), ("SBASE", 1), ("OFFSET", 20), ("SOFFSET", 125), ("DLC", 1)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 12), ("SSRC1", 13)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 14)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 15)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 16)], None),
+        ("S_ADD_U32", "ENC_SOP2", &[("SDST", 18), ("SSRC0", 18), ("SSRC1", 17)], None),
+        ("V_LSHL_ADD_U32", "ENC_VOP3", &[("VDST", 1), ("SRC0", V), ("SRC1", 130), ("SRC2", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 2), ("SRC0", 128)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 3), ("SRC0", 18)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 1), ("DATA", 3), ("SADDR", 0x7D)], None),
+    ]);
+    let hlsl = packed_compute_source(&code, [96, 1, 1]);
+    for s in 8..16 {
+        assert!(!hlsl.contains(&format!("s{s} = WaveReadLaneFirst(")));
+    }
+    assert!(hlsl.contains("s16 = WaveReadLaneFirst("));
+    assert!(hlsl.contains("s17 = WaveReadLaneFirst("));
+    if !gpu_ready() {
+        return;
+    }
+    let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap();
+    let mut io = vec![0u32; 128];
+    io[0] = 0x100;
+    let mut mem = vec![0u32; 160];
+    mem[..6].copy_from_slice(&[64, 0, 12, 0, 17, 23]);
+    mem[16..20].copy_from_slice(&[101, 103, 107, 1009]);
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &mem).unwrap();
+    assert_eq!(out[64..160], [351; 96]);
+}
+
+#[test]
 fn gpu_packed_compute_lds_orders_both_slots_at_the_guest_barrier() {
     if !gpu_ready() {
         return;

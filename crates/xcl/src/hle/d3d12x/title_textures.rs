@@ -918,8 +918,17 @@ fn content_hash(b: &[u8]) -> u64 {
     h.iter().fold(tail, |a, &l| (a ^ l).wrapping_mul(K).rotate_left(27))
 }
 
-/// staging bytes of one batch at most
-const BATCH_BYTES: usize = 256 << 20;
+/// staging bytes and textures of one batch at most (a texture larger than that is a batch of
+/// its own). 256 MiB a batch kept an upload buffer of that size, and as much of detiled texels
+/// on the heap while the batch was made (upstream XCL fb9d059: a count and 32 MiB).
+const BATCH_BYTES: usize = 32 << 20;
+const BATCH_COUNT: usize = 256;
+
+/// Whether a batch of `picked` textures of `bytes` in all is closed before a texture of `next`
+/// bytes: the textures of a batch, and the batches, are in the order the uploads were in.
+fn batch_full(picked: usize, bytes: usize, next: usize) -> bool {
+    picked != 0 && (picked >= BATCH_COUNT || bytes.saturating_add(next) > BATCH_BYTES)
+}
 
 /// The uploads `todo`, in batches of up to `BATCH_BYTES` (one list and one wait each).
 unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
@@ -938,7 +947,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         while let Some((_, (dev, va, tex, _))) = todo.peek() {
             let end = va.saturating_add((tex.size() as usize).max(1));
             let overlaps = spans.range(..end).next_back().is_some_and(|(_, &previous_end)| previous_end > *va);
-            if !picked.is_empty() && (bytes.saturating_add(tex.size() as usize) > BATCH_BYTES || *dev != device || overlaps) {
+            if batch_full(picked.len(), bytes, tex.size() as usize) || (!picked.is_empty() && (*dev != device || overlaps)) {
                 break;
             }
             let (r, (dev, va, tex, states)) = todo.next().unwrap();
@@ -963,9 +972,13 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
         }
         let subs = subresources_of_all(&picked, bytes);
         let mut batch = Vec::with_capacity(picked.len());
-        for ((r, va, _, states), subs) in picked.into_iter().zip(subs) {
+        for ((r, va, tex, states), subs) in picked.into_iter().zip(subs) {
             if super::present::trace_frame() {
                 note_content(va, &r, &subs);
+            }
+            // video memory under the mips that have texels, before the copies into them
+            if !subs.is_empty() && super::vram::wants_content(r.as_raw() as usize) {
+                super::vram::note_content(&r, &with_texels(va, &tex, super::vram::zero_is_unmapped(r.GetDesc().Format), &subs));
             }
             batch.push((r, subs, states));
         }
@@ -1182,24 +1195,16 @@ unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
     copy_rec(GetCurrentProcess(), src, dst, len);
 }
 
-/// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
-/// has only some of its pages mapped).
-unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+/// The committed, readable runs (start, end) of `len` bytes at `at`.
+unsafe fn committed_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
     use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    let mut out = vec![0u8; len];
-    let Some(limit) = at.checked_add(len) else { return out };
-    // (the coherent window is committed as a whole: no `VirtualQuery`, which sizes a region by
-    // walking it)
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
-    }
+    let Some(limit) = at.checked_add(len) else { return Vec::new() };
+    // (the coherent window is committed as a whole, and what XCL recorded needs no
+    // `VirtualQuery`, which sizes a region by walking it)
     if let Some(runs) = crate::memmap::readable_runs(at, len) {
-        for (lo, hi) in runs {
-            copy_committed_region(lo, out.as_mut_ptr().add(lo - at), hi - lo);
-        }
-        return out;
+        return runs;
     }
+    let mut out = Vec::new();
     let mut p = at;
     while p < limit {
         let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
@@ -1210,13 +1215,53 @@ unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
         if end <= p {
             break;
         }
-        let readable = m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0; // R / RW / WC / X-R…, no guard
-        if readable {
-            copy_committed_region(p, out.as_mut_ptr().add(p - at), end - p);
+        // R / RW / WC / X-R…, no guard
+        if m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0 {
+            out.push((p, end));
         }
         p = end;
     }
     out
+}
+
+/// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
+/// has only some of its pages mapped).
+unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; len];
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
+        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
+        return out;
+    }
+    for (lo, hi) in committed_runs(at, len) {
+        copy_committed_region(lo, out.as_mut_ptr().add(lo - at), hi - lo);
+    }
+    out
+}
+
+/// Which subresources of the texture at `va` (`subs`: all of them, as read from there) have
+/// texels that a tile without video memory would not read as (`vram::note_content`): those
+/// with a byte that is not zero – and, when zero texels of its format are not what such a tile
+/// reads as (`zero_is_unmapped` false), those the title has memory under at all.
+unsafe fn with_texels(va: usize, tex: &xg::Texture, zero_is_unmapped: bool, subs: &[Subresource]) -> Vec<bool> {
+    let surface = tex.texels();
+    subs.iter().enumerate().map(|(k, s)| {
+        if super::vram::any_nonzero(&s.data) {
+            return true;
+        }
+        if zero_is_unmapped {
+            return false;
+        }
+        // where the subresource is in the title's memory: its level's span of its slice (a 3D
+        // texture's levels are in every layer: all of it)
+        let (at, len) = match surface {
+            Some(t) if t.depth == 0 && !t.chain.levels.is_empty() => {
+                let span = t.chain.level_span(k % t.chain.levels.len());
+                (va + (k / t.chain.levels.len()) * t.chain.slice_bytes + span.start, span.len())
+            }
+            _ => (va, tex.size() as usize),
+        };
+        !committed_runs(at, len).is_empty()
+    }).collect()
 }
 
 /// Batches of at least this many bytes are detiled on several threads (`subresources_of_all`)
@@ -1948,10 +1993,17 @@ mod tests {
             for k in 0..16usize {
                 leaked_refs.push(place_tex(base + k * (1 << 20), &stream_desc));
             }
+            // (a sampled texture has pages where it has texels: none before its first upload)
+            assert!(dev_pages() <= pages0, "a texture without texels takes no pages");
+            for k in 0..16usize {
+                write_tiled(base + k * (1 << 20), &stream_desc, 1 + k as u8);
+            }
+            refresh(queue.as_raw());
             let (pages16, vram16) = (dev_pages(), local_vram());
             for k in 16..512usize {
                 leaked_refs.push(place_tex(base + (k % 16) * (1 << 20), &stream_desc));
             }
+            refresh(queue.as_raw());
             let (pages_delta, vram_delta, vram_after_fill, kept_delta) = (
                 dev_pages() - pages0,
                 local_vram().saturating_sub(vram0) as usize,
@@ -2113,7 +2165,123 @@ mod tests {
                 }
                 drop(res);
             }
+
+            // 5. A sampled texture has video memory only where it has texels. A streamed texture
+            // whose largest mip the title has not loaded takes none for it and reads zeros there;
+            // the mip gets its memory with its texels and gives it back when they are zero again.
+            // BC1, whose zero texels are opaque black, keeps memory under the zeros the title has
+            // memory for. And the first GPU copy into a texture gives it all its memory.
+            let backing = |r: &ID3D12Resource| super::super::vram::tile_backing(r.as_raw() as usize).map(|(local, non_local, none)| (local + non_local, none)).unwrap();
+            let zero_top = |va: usize, desc: &[u8; 0x38]| {
+                let tex = xg::Texture::new(desc).unwrap();
+                let s = tex.texels().unwrap();
+                let l = s.chain.levels[0];
+                s.chain.tile_level(std::slice::from_raw_parts_mut(va as *mut u8, s.chain.slice_bytes), 0, 0, &vec![0u8; l.width * l.height * s.bpe as usize]);
+            };
+            let check = |r: &ID3D12Resource, desc: &[u8; 0x38], what: &str| {
+                for (sub, exp) in subresources(base, &xg::Texture::new(desc).unwrap()).iter().enumerate() {
+                    assert_eq!(read_sub(r, sub as u32), exp.data, "{what}: subresource {sub}");
+                }
+            };
+            // 1024x1024 BC7: 16 tiles of mip 0 (tier 2: a mip of whole tiles is not packed)
+            let bc7 = console_desc(3, 1024, 1024, 1, 11, 98, 0x109);
+            let res = place_tex(base, &bc7);
+            write_tiled(base, &bc7, 0x21);
+            zero_top(base, &bc7);
+            refresh(queue.as_raw());
+            let (held, none) = backing(&res);
+            println!("1024x1024 BC7 without its largest mip: {held} tiles with memory, {none} without");
+            assert_eq!(none, 16, "the mip without texels has no memory");
+            assert!(held >= 5, "the mips with texels have theirs");
+            assert!(read_sub(&res, 0).iter().all(|&b| b == 0), "a mip without memory reads zeros");
+            check(&res, &bc7, "largest mip not loaded");
+            write_tiled(base, &bc7, 0x22);
+            refresh(queue.as_raw());
+            assert_eq!(backing(&res), (held + 16, 0), "the mip has memory when it has texels");
+            check(&res, &bc7, "largest mip loaded");
+            zero_top(base, &bc7);
+            refresh(queue.as_raw());
+            assert_eq!(backing(&res), (held, 16), "and gives it back when they are zero again");
+            check(&res, &bc7, "largest mip let go");
+            // the title's GPU copies into it: every tile from then on, whatever the CPU's bytes
+            super::super::vram::note_gpu_write(res.as_raw() as usize);
+            assert_eq!(backing(&res).1, 0, "a GPU-written texture has all its memory");
+            write_tiled(base, &bc7, 0x23);
+            zero_top(base, &bc7);
+            refresh(queue.as_raw());
+            assert_eq!(backing(&res).1, 0, "a GPU-written texture keeps all its memory");
+            check(&res, &bc7, "GPU-written");
+            drop(res);
+            // 1024x1024 BC1: zeros the title has memory under are texels (opaque black)
+            let bc1 = console_desc(3, 1024, 1024, 1, 11, 71, 0x109);
+            let res = place_tex(base, &bc1);
+            write_tiled(base, &bc1, 0x31);
+            zero_top(base, &bc1);
+            refresh(queue.as_raw());
+            assert_eq!(backing(&res).1, 0, "BC1 zeros in the title's memory keep their video memory");
+            check(&res, &bc1, "BC1 with a zero mip");
+            drop(res);
             uma.free(base);
+        }
+    }
+
+    /// Upload batches keep the uploads' order and hold at most 32 MiB and 256 textures – a
+    /// larger texture alone; each batch is one upload buffer of its size and one wait.
+    #[test]
+    fn upload_batches_keep_order_within_the_caps() {
+        const MIB: usize = 1 << 20;
+        let split = |sizes: &[usize]| {
+            let mut batches: Vec<Vec<usize>> = Vec::new();
+            let (mut current, mut bytes) = (Vec::new(), 0usize);
+            for (i, &size) in sizes.iter().enumerate() {
+                if batch_full(current.len(), bytes, size) {
+                    batches.push(std::mem::take(&mut current));
+                    bytes = 0;
+                }
+                current.push(i);
+                bytes += size;
+            }
+            batches.push(current);
+            batches
+        };
+        // 10 MiB, 20 MiB | 5 MiB | 40 MiB alone | 1 MiB
+        assert_eq!(split(&[10 * MIB, 20 * MIB, 5 * MIB, 40 * MIB, MIB]), [vec![0, 1], vec![2], vec![3], vec![4]]);
+        assert_eq!(split(&[32 * MIB, 1]), [vec![0], vec![1]]);
+        // small textures: 256 a batch
+        let small = split(&[4096; 600]);
+        assert_eq!(small.iter().map(Vec::len).collect::<Vec<_>>(), [256, 256, 88]);
+        assert_eq!(small.concat(), (0..600).collect::<Vec<_>>(), "in order, each once");
+        // a world load's burst of 1.4 MiB textures (256 MiB of them): 8 waits where one batch
+        // of 256 MiB – and its upload buffer – was 1
+        let burst = split(&[1_398_101; 192]);
+        assert_eq!(burst.len(), 8);
+        assert!(burst.iter().all(|b| b.len() * 1_398_101 <= BATCH_BYTES));
+    }
+
+    /// Which mips need video memory: those with a byte that is not zero, and – for a format
+    /// whose zero texels are not what a tile without memory reads as – those the title has
+    /// memory under at all.
+    #[test]
+    fn mips_have_texels_where_bytes_are_set_or_zero_is_a_texel() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let tex = xg::Texture::new(&console_desc(3, 1024, 1024, 1, 11, 71, 0x109)).unwrap();
+            let s = tex.texels().unwrap();
+            // a streamed texture: the title has memory under every mip but the largest
+            let top = s.chain.level_span(0);
+            assert!(top.start > 0 && top.start % 0x1000 == 0 && top.end == s.chain.slice_bytes, "{top:?}");
+            let base = VirtualAlloc(std::ptr::null(), (tex.size() as usize).next_multiple_of(0x1_0000), MEM_RESERVE, PAGE_READWRITE) as usize;
+            assert_ne!(base, 0);
+            assert!(!VirtualAlloc(base as *const c_void, top.start, MEM_COMMIT, PAGE_READWRITE).is_null());
+            let l = s.chain.levels[2];
+            s.chain.tile_level(std::slice::from_raw_parts_mut(base as *mut u8, top.start), 2, 0, &vec![0x5Au8; l.width * l.height * s.bpe as usize]);
+            let subs = subresources(base, &tex);
+            assert_eq!(subs.len(), 11);
+            let set: Vec<bool> = (0..11).map(|k| k == 2).collect();
+            assert_eq!(with_texels(base, &tex, true, &subs), set, "zero reads as no memory: the mips with bytes set");
+            let memory: Vec<bool> = (0..11).map(|k| k != 0).collect();
+            assert_eq!(with_texels(base, &tex, false, &subs), memory, "zero is a texel: every mip the title has memory under");
+            assert_ne!(VirtualFree(base as *mut c_void, 0, MEM_RELEASE), 0);
         }
     }
 

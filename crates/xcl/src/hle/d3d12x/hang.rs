@@ -70,7 +70,7 @@ fn hex(w: impl IntoIterator<Item = u32>) -> String {
 }
 
 /// The root arguments `args` of `layout` (a draw's when `gfx`) and what is behind each now.
-fn arguments(layout: &Layout, args: &[u8], gfx: bool) -> Vec<String> {
+pub(super) fn arguments(layout: &Layout, args: &[u8], gfx: bool) -> Vec<String> {
     let word = |at: usize| args.get(at..at + 4).map_or(0, |w| u32::from_le_bytes(w.try_into().unwrap()));
     let (first, inline) = if gfx { (8, layout.inline_gfx) } else { (4, layout.inline) };
     let words: Vec<String> = (0..args.len().min(4096) / 4)

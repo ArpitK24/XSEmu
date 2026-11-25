@@ -74,6 +74,7 @@ pub(super) struct Em {
     dynamic_f16_rm: bool,
     /// Multi-wave code with a barrier not proven convergent uses an LDS arrival count.
     safe_barrier: bool,
+    coherent_mem: bool,
     mesh_export_barriers: bool,
     group_sync_edges: Vec<(u64, u64)>,
     group_sync_end: Option<u64>,
@@ -644,6 +645,7 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
+            coherent_mem: false,
             mesh_export_barriers: false,
             group_sync_edges: Vec::new(),
             group_sync_end: None,
@@ -675,6 +677,7 @@ impl Em {
         let mut reads_dp = false;
         let mesh = matches!(self.opt.mode, Mode::Mesh(_));
         let compute = matches!(self.opt.mode, Mode::Compute(_));
+        self.coherent_mem = compute && super::needs_coherent_mem(insts);
         let mut has_s_barrier = false;
         let mut barriers = Vec::new();
         let mut branches = Vec::new();
@@ -1954,7 +1957,7 @@ impl Em {
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
-            if self.packed_compute() {
+            if self.packed_compute() && coherent {
                 self.line(&format!("{s} = WaveReadLaneFirst({v});"));
             } else {
                 self.line(&format!("{s} = {v};"));
@@ -5018,10 +5021,7 @@ impl Em {
             h.push_str("#define XCL_PIXEL 1\n");
         }
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
-        // compute work across workgroups (bottom-up BVH builds: atomics, then reading what
-        // other groups wrote) relies on GLC / cache invalidation on the console: keep the flat
-        // memory coherent across the GPU there; graphics keeps the cached (faster) view
-        let coherent = if matches!(self.opt.mode, Mode::Compute(_)) { "globallycoherent " } else { "" };
+        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
         let windows = self.opt.mem_windows.clamp(1, 4);
         h.push_str("static uint xcl_mem_views = 0u;\n");
         if windows > 1 {

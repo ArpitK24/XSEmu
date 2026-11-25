@@ -64,6 +64,8 @@ struct Inner {
     /// live allocations: offset → length
     used: BTreeMap<usize, usize>,
     used_bytes: usize,
+    /// the most `used_bytes` was
+    peak_bytes: usize,
     reserved: BTreeSet<usize>,
 }
 
@@ -164,6 +166,7 @@ impl Uma {
             }
             g.used.insert(at, bytes);
             g.used_bytes += bytes;
+            g.peak_bytes = g.peak_bytes.max(g.used_bytes);
             at
         };
         let p = self.base + at;
@@ -596,6 +599,7 @@ impl Uma {
         }
         g.used.insert(at, size);
         g.used_bytes += size;
+        g.peak_bytes = g.peak_bytes.max(g.used_bytes);
         if !zero {
             g.reserved.insert(at);
         }
@@ -648,6 +652,11 @@ impl Uma {
     /// Bytes handed out.
     pub fn used(&self) -> usize {
         self.inner.lock().unwrap().used_bytes
+    }
+
+    /// The most bytes that were handed out at once.
+    pub fn peak(&self) -> usize {
+        self.inner.lock().unwrap().peak_bytes
     }
 }
 
@@ -708,12 +717,37 @@ impl Arena {
 
 static GLOBAL: OnceLock<Option<Uma>> = OnceLock::new();
 
-/// The title's graphics memory XCL places in the coherent window (`note_coherent_need`) is
-/// known only once it asks for it, and the window is committed when it is made: its size is
-/// what the title asked for in its last run (`<data>/cache/uma_coherent.txt`) and XCL's own
-/// 512 MB, at most a window. `XCL_COHERENT_MB` chooses it.
-fn coherent_file() -> std::path::PathBuf {
-    crate::state::data_dir().join("cache").join("uma_coherent.txt")
+/// What the coherent window has to hold (the title's GPU heaps, XCL's per-draw arguments and
+/// readback buffers) is known only as the title runs, and the window is committed when it is
+/// made – and resident from then on: D3D12 opens it as a heap. Its size is the most that was in
+/// use in it at once in earlier runs (`<data>/cache/uma_coherent_peak.txt`,
+/// `note_coherent_need`) and `COHERENT_HEADROOM`, at most a window. Until a run has written
+/// that file it is what `<data>/cache/uma_coherent.txt` gives: every byte the title asked for
+/// in an earlier run and 512 MB – a sum that counted memory the title had freed again (a retail
+/// game asked for 4.6 GB, held 3.0 GB at once and got a window of 4095 MB, 1 GB of it resident
+/// for nothing). `XCL_COHERENT_MB` chooses it.
+fn coherent_file(name: &str) -> std::path::PathBuf {
+    crate::state::data_dir().join("cache").join(name)
+}
+
+const COHERENT_PEAK: &str = "uma_coherent_peak.txt";
+const COHERENT_ASKED: &str = "uma_coherent.txt";
+/// room in the coherent window past the most an earlier run used (a run that goes further than
+/// any before it has that much more before its GPU heaps no longer fit)
+const COHERENT_HEADROOM: usize = 512 << 20;
+
+fn coherent_read(name: &str) -> Option<usize> {
+    std::fs::read_to_string(coherent_file(name)).ok().and_then(|s| s.trim().parse::<usize>().ok()).filter(|&b| b > 0)
+}
+
+/// Bytes of the coherent window for the most an earlier run used of it at once (`peak`), else
+/// for the sum of what the title asked for in one (`asked`), else XCL's own share.
+fn coherent_bytes(peak: Option<usize>, asked: Option<usize>) -> usize {
+    match (peak, asked) {
+        (Some(peak), _) => peak.saturating_add(COHERENT_HEADROOM).clamp(RUNTIME_COMMITTED_CAP, MAX_SIZE),
+        (None, Some(asked)) => asked.saturating_add(RUNTIME_COMMITTED_CAP).min(MAX_SIZE),
+        (None, None) => RUNTIME_COMMITTED_CAP,
+    }
 }
 
 /// Bytes the coherent window is made with.
@@ -721,12 +755,12 @@ pub fn coherent_hint() -> usize {
     if let Some(mb) = std::env::var("XCL_COHERENT_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         return (mb << 20).clamp(GRAIN, MAX_SIZE);
     }
-    let title = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
+    let (peak, asked) = (coherent_read(COHERENT_PEAK), coherent_read(COHERENT_ASKED));
     // only with the commit for all of it: the title's ~13 GB, video memory for its render targets
     // and textures (WDDM charges commit for each video-memory allocation too) and the window
     // itself – a retail game took ~18 GB; with less free it runs without (its GPU heaps outside
     // unified memory: no image) rather than taking the system's commit
-    if title > 0 && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
+    if (peak.is_some() || asked.is_some()) && free_commit() < NEEDS_FOR_COHERENT_HEAPS {
         crate::xlog_warn!(
             "UMA: {} MB of commit free, under {} MB: the title's GPU heaps stay outside unified memory (a larger page file gives them the coherent window)",
             free_commit() >> 20,
@@ -734,7 +768,7 @@ pub fn coherent_hint() -> usize {
         );
         return RUNTIME_COMMITTED_CAP;
     }
-    (title + RUNTIME_COMMITTED_CAP).min(MAX_SIZE)
+    coherent_bytes(peak, asked)
 }
 
 /// Commit free before the title starts for its GPU heaps to go to the coherent window.
@@ -750,18 +784,25 @@ fn free_commit() -> usize {
     m.ullAvailPageFile as usize
 }
 
-/// The title has asked for `bytes` of graphics memory XCL places in the coherent window: the
-/// next run makes the window that large (this one has the size it was made with).
+/// The coherent window has had to hold `bytes` at once (the most that was in use in it, or what
+/// was in use and an allocation it had no room for): a later run makes the window for that (this
+/// one has the size it was made with). Kept in steps of 16 MiB, and only as it grows.
 pub fn note_coherent_need(bytes: usize) {
     static NOTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let before = std::fs::read_to_string(coherent_file()).ok().and_then(|s| s.trim().parse::<usize>().ok()).unwrap_or(0);
-    if bytes > before && NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) < bytes {
-        let f = coherent_file();
+    let bytes = bytes.next_multiple_of(16 << 20);
+    if NOTED.fetch_max(bytes, std::sync::atomic::Ordering::Relaxed) >= bytes {
+        return;
+    }
+    let before = coherent_read(COHERENT_PEAK).unwrap_or(0);
+    if bytes > before {
+        let f = coherent_file(COHERENT_PEAK);
         if let Some(d) = f.parent() {
             let _ = std::fs::create_dir_all(d);
         }
         let _ = std::fs::write(&f, bytes.to_string());
-        crate::xlog_info!("UMA: the title's graphics memory for the coherent window: {} MB (a window of up to {} MB from the next run)", bytes >> 20, (bytes + RUNTIME_COMMITTED_CAP).min(MAX_SIZE) >> 20);
+        if bytes >> 28 != before >> 28 {
+            crate::xlog_info!("UMA: {} MB in use in the coherent window at once (a window of {} MB from the next run)", bytes >> 20, coherent_bytes(Some(bytes), None) >> 20);
+        }
     }
 }
 
@@ -799,6 +840,35 @@ pub fn get() -> Option<&'static Uma> {
 
 #[cfg(test)]
 mod tests {
+    /// The coherent window is made for the most an earlier run had in it at once; the sum of
+    /// what a title asked for sizes it only until a run has measured that.
+    #[test]
+    fn the_coherent_window_is_sized_by_peak_use() {
+        const MIB: usize = 1 << 20;
+        // a title that asked for 4582 MB in all and held 3033 MB at once
+        assert_eq!(coherent_bytes(None, Some(4582 * MIB)), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(3033 * MIB), Some(4582 * MIB)), 3545 * MIB);
+        // XCL's own share at least, a window at most
+        assert_eq!(coherent_bytes(None, None), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_bytes(Some(64 * MIB), None), 576 * MIB);
+        assert_eq!(coherent_bytes(Some(3700 * MIB), None), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(usize::MAX), Some(1)), MAX_SIZE);
+    }
+
+    /// `peak` is the most that was handed out at once, whatever was freed since.
+    #[test]
+    fn peak_use_outlives_frees() {
+        let u = Uma::with_windows(1, 64 << 20).unwrap();
+        let a = u.alloc(8 << 20, GRAIN).unwrap() as usize;
+        let b = u.alloc(16 << 20, GRAIN).unwrap() as usize;
+        assert_eq!((u.used(), u.peak()), (24 << 20, 24 << 20));
+        assert!(u.free(a));
+        let c = u.alloc(4 << 20, GRAIN).unwrap() as usize;
+        assert_eq!((u.used(), u.peak()), (20 << 20, 24 << 20));
+        assert!(u.free(b) && u.free(c));
+        assert_eq!((u.used(), u.peak()), (0, 24 << 20));
+    }
+
     #[test]
     fn sparse_first_fit_checks_the_hole_straddling_the_lower_bound() {
         let lo = WINDOW;
