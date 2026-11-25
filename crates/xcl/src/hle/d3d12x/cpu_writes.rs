@@ -33,11 +33,19 @@ pub(super) enum Write {
     /// (`src`), copied atomically to `va` once the queue's fence completes. Holding `_buf` keeps
     /// the mapping alive until the worker finishes.
     ReadbackU64 { va: usize, src: usize, _buf: ID3D12Resource },
+    DispatchTiming {
+        shader: u64,
+        at: Option<(usize, u32, usize)>,
+        groups: [u32; 3],
+        src: usize,
+        _buf: ID3D12Resource,
+    },
 }
 
 struct Job {
     value: u64,
     writes: Vec<Write>,
+    timestamp_hz: u64,
 }
 
 struct QueueFence {
@@ -72,7 +80,7 @@ fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> std::io::Result<
                 }
             }
             for w in job.writes {
-                write_now(w);
+                write_now(w, job.timestamp_hz);
             }
         }
     })?;
@@ -100,7 +108,7 @@ fn access(va: usize, bytes: usize) -> Access {
 }
 
 /// `w`, if its memory is still there.
-unsafe fn write_now(w: Write) {
+unsafe fn write_now(w: Write, timestamp_hz: u64) {
     match w {
         Write::Immediate(va, words) => {
             if access(va, 4 * words.len()) != Access::Write {
@@ -136,6 +144,20 @@ unsafe fn write_now(w: Write) {
                 (va as *mut u64).write_unaligned(value);
             }
         }
+        Write::DispatchTiming { shader, at, groups: [x, y, z], src, .. } => {
+            if timestamp_hz == 0 {
+                return;
+            }
+            let ticks = src as *const u64;
+            let start = ticks.read_volatile();
+            let end = ticks.add(1).read_volatile();
+            if start == 0 || end < start {
+                return;
+            }
+            let ms = (end - start) as f64 * 1000.0 / timestamp_hz as f64;
+            let at = at.map_or(String::new(), |(slot, generation, op)| format!(" slot {slot}/{generation} op {}", op + 1));
+            crate::xlog_info!("GPU dispatch timing: CS {shader:016x}{at} groups {x}x{y}x{z}: {ms:.3} ms");
+        }
     }
 }
 
@@ -157,6 +179,11 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
         return;
     }
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&queue) else { return };
+    let timestamp_hz = if writes.iter().any(|w| matches!(w, Write::DispatchTiming { .. })) {
+        q.GetTimestampFrequency().unwrap_or(0)
+    } else {
+        0
+    };
     let mut g = FENCES.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     let entry = match m.entry(queue as usize) {
@@ -180,7 +207,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
     };
     entry.value += 1;
     if q.Signal(&entry.fence, entry.value).is_ok() {
-        let _ = entry.tx.send(Job { value: entry.value, writes });
+        let _ = entry.tx.send(Job { value: entry.value, writes, timestamp_hz });
     }
 }
 

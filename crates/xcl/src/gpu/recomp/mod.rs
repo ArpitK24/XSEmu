@@ -194,11 +194,10 @@ pub const IO_TRIP_AT: usize = 115;
 /// window, which is not window 0 in the runtime layout).
 pub const IO_TRIP_WINDOW: usize = 116;
 /// What the counters at io[`IO_TRIP_AT`] count, in their order: lanes whose loop budget
-/// (`XCL_LOOP_GUARD`) ran out, whose split-wave64 meet gave up (`xcl_x_meet`), whose bounded
-/// barrier gave up (`xcl_s_barrier`) and whose compare-exchange loop ran out of retries. A
-/// meet and a barrier give up when no wave of their group got anywhere for 1024 polls
-/// (`xcl_tick`); the barrier's count is the one wave that then lets the whole group through.
-pub const TRIP_KINDS: [&str; 4] = ["loop guard", "wave64 meet", "barrier", "compare-exchange retries"];
+/// (`XCL_LOOP_GUARD`) ran out, whose split-wave64 meet gave up (`xcl_x_meet`), whose
+/// compare-exchange ran out of retries. The third counter counts waves whose barrier
+/// waited without progress for 1024 polls, not an abandoned barrier.
+pub const TRIP_KINDS: [&str; 4] = ["loop guard", "wave64 meet", "barrier long-wait waves", "compare-exchange retries"];
 /// The view after the four windows' (at io[`IO_MEM_VIEWS`] + 4): a null view, which shaders
 /// with several windows select for an address outside them (reads 0, writes dropped).
 pub const MEM_NULL_VIEW: u32 = 4;

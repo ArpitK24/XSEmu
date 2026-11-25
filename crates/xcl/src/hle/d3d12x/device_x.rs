@@ -1005,9 +1005,10 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
     // console-only state bits (Unicorn Overlord's 4K display target: 0x100000) are not the
     // PC's: the PC refused the resource (E_INVALIDARG) and the title threw
     let mut state = state & real::PC_RESOURCE_STATES;
-    // (a depth buffer placed for unordered access – no longer one on the PC: written as depth)
-    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 && state & 0x8 != 0 {
-        state = (state & !0x8) | 0x10;
+    // (a depth buffer placed for unordered access – not a state the PC depth buffer has: the one
+    // it is in while its shadow takes the unordered access, `depth_uav`)
+    if u32::from_le_bytes(x[0x30..0x34].try_into().unwrap()) & 2 != 0 {
+        state = super::depth_uav::pc_state(state);
     }
     let mut clear_buf = D3D12_CLEAR_VALUE::default();
     let clear = pc_clear(clear, &mut clear_buf, Some((&x, &d)));

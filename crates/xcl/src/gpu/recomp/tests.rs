@@ -9554,8 +9554,10 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
     for wave64 in [true, false] {
         let t = translate(&p_all, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
         assert!(t.complete(), "wave64={wave64}: {:?}", t.unsupported_why);
-        if std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0") {
-            assert!(t.hlsl.contains("xcl_s_barrier();"), "wave64={wave64}: expected xcl_s_barrier()");
+        if !t.hlsl.contains("#define XCL_X_THREADS") {
+            let body = t.hlsl.split_once("void main(").unwrap().1;
+            assert_eq!(body.matches("GroupMemoryBarrierWithGroupSync();").count(), 2);
+            assert!(!body.contains("xcl_s_barrier();"));
         }
         let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
         let out = runner::dispatch(&dxil, [1, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
@@ -9589,15 +9591,17 @@ fn gpu_safe_s_barrier_multi_warp_and_early_endpgm() {
         ("V_MOV_B32", "ENC_VOP1", &[("VDST", 8), ("SRC0", 128)], None),
         ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 7), ("DATA", 5), ("SADDR", 0x7D)], None),
     ]);
-    let t = translate(&p_early, &on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() })).unwrap();
-    assert!(t.complete(), "{:?}", t.unsupported_why);
-    let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
-    let out = runner::dispatch(&dxil, [2, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
-    for tid in 0..64usize {
-        assert_eq!(out[(base + tid * 4) / 4], (tid + 0x207) as u32, "tid={tid}: surviving warps must pass 2 s_barriers after upper wave early s_endpgm");
-    }
-    for tid in 64..128usize {
-        assert_eq!(out[(base + tid * 4) / 4], 0, "tid={tid}: exited wave must not store");
+    for wave64 in [true, false] {
+        let t = translate(&p_early, &on_gpu(Options { mode: Mode::Compute(cs.clone()), wave64, ..Default::default() })).unwrap();
+        assert!(t.complete(), "{:?}", t.unsupported_why);
+        let dxil = dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl));
+        let out = runner::dispatch(&dxil, [2, 1, 1], &io, &vec![0u32; (base + 128 * 4) / 4]).unwrap();
+        for tid in 0..64usize {
+            assert_eq!(out[(base + tid * 4) / 4], (tid + 0x207) as u32, "wave64={wave64} tid={tid}: surviving warps must pass 2 s_barriers after upper waves retire");
+        }
+        for tid in 64..128usize {
+            assert_eq!(out[(base + tid * 4) / 4], 0, "wave64={wave64} tid={tid}: exited wave must not store");
+        }
     }
 }
 
@@ -9648,29 +9652,57 @@ fn gpu_split_waves_wait_for_a_long_live_barrier_phase() {
 }
 
 #[test]
-fn gpu_split_wait_gives_up_when_one_half_never_arrives() {
+fn gpu_counted_barrier_sorts_with_thirty_two_waves_after_a_long_wait() {
     if !gpu_ready() || std::env::var("XCL_SAFE_BARRIER").is_ok_and(|v| v.trim() == "0") {
         return;
     }
-    let (hlsl, io) = split_wait_fixture();
-    let (head, tail) = hlsl.split_once("    xcl_s_barrier();\n").unwrap();
-    let (tail, exit) = tail.rsplit_once("    xcl_s_barrier_exit();").unwrap();
-    let hlsl = format!("{head}
-    if (xcl_tid < 96u) {{
-        if (xcl_tid < 64u) xcl_s_barrier();
-{tail}
-    }} else {{
-        [loop] for (uint i = 0u; i < 8192u; i++) {{
-            if (WaveIsFirstLane()) {{ uint seen; InterlockedAdd(XCL_BAR_STATE, 0u, seen); if ((int)seen < 0) break; }}
+    let code = prog(&[
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("S_CBRANCH_SCC1", "ENC_SOPP", &[("SIMM16", 0xFFFE)], None),
+    ]);
+    let cs = super::CsInterface { threads: [1024, 1, 1], user_sgprs: 0, tgid: [false; 3], tg_size: false, tid_components: 1 };
+    let t = translate(&code, &Options { mode: Mode::Compute(cs), wave64: false, ..Default::default() }).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    let (prelude, _) = t.hlsl.split_once("[WaveSize(").unwrap();
+    let report = "if (_still == 1024u) xcl_trip(2u);";
+    assert!(prelude.contains(report));
+    let prelude = prelude.replace(report, "if (_still == 1024u) { uint o; InterlockedExchange(test_release, 1u, o); xcl_trip(2u); }");
+    let hlsl = format!("groupshared uint test_release;
+{prelude}
+groupshared uint keys[1024];
+[WaveSize(32)]
+[numthreads(1024, 1, 1)]
+void main(uint gi : SV_GroupIndex) {{
+    if (gi == 0u) test_release = 0u;
+    xcl_s_barrier_init(gi);
+    if (WaveActiveAnyTrue(gi == 1023u)) {{
+        uint release = 0u;
+        [loop] while (release == 0u) {{
+            if (WaveIsFirstLane()) InterlockedAdd(test_release, 0u, release);
+            release = WaveReadLaneFirst(release);
         }}
     }}
-    xcl_s_barrier_exit();{exit}");
+    keys[gi] = (gi * 37u) & 1023u;
+    xcl_s_barrier();
+    [loop] for (uint width = 2u; width <= 1024u; width *= 2u) {{
+        [loop] for (uint step = width / 2u; step != 0u; step /= 2u) {{
+            uint a = keys[gi];
+            uint b = keys[gi ^ step];
+            xcl_s_barrier();
+            keys[gi] = ((gi & width) == 0u) == ((gi & step) == 0u) ? min(a, b) : max(a, b);
+            xcl_s_barrier();
+        }}
+    }}
+    RWByteAddressBuffer mem = ResourceDescriptorHeap[io.Load(452u)];
+    mem.Store(256u + 4u * gi, keys[gi]);
+    xcl_s_barrier_exit();
+}}");
+    let mut io = vec![0u32; 128];
+    io[super::IO_TRIP_AT] = 0x40;
     let dxil = super::dxc::compile(&hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{hlsl}"));
-    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &[0u32; 192]).unwrap();
-    assert_eq!(out[16..20], [0, 32, 32, 0]);
-    for tid in 0..96 {
-        assert_eq!(out[64 + tid], tid as u32 + (tid >= 64) as u32);
-    }
+    let out = runner::dispatch(&dxil, [1, 1, 1], &io, &[0u32; 64 + 1024]).unwrap();
+    assert!(out[18] > 0, "the first barrier must report a long wait");
+    assert_eq!(&out[64..64 + 1024], &(0..1024u32).collect::<Vec<_>>());
 }
 
 /// `XCL_SAMPLE_FSPX=<folder>`: every `*.bin` there that is an FSPX (driver) compute container –

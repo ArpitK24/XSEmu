@@ -72,14 +72,12 @@ pub(super) struct Em {
     has_f64_round_op: bool,
     /// program writes a non-default `MODE[3:2]` and uses f16 ops or reads those bits back
     dynamic_f16_rm: bool,
-    /// multi-warp Compute/Mesh shader containing `s_barrier`: use early-exit-safe, bounded
-    /// LDS arrival barrier (`xcl_s_barrier`) so RDNA2 early `s_endpgm`, `LOOP_GUARD` exits,
-    /// or split-wave64 desyncs cannot permanently hang an NVIDIA SM at `bar.sync`.
+    /// Multi-wave code with a barrier not proven convergent uses an LDS arrival count.
     safe_barrier: bool,
     mesh_export_barriers: bool,
-    mesh_sync_edges: Vec<(u64, u64)>,
-    mesh_sync_end: Option<u64>,
-    mesh_sync_indirect: bool,
+    group_sync_edges: Vec<(u64, u64)>,
+    group_sync_end: Option<u64>,
+    group_sync_indirect: bool,
     packed_mask: Option<(usize, usize, String, String)>,
     packed_cross_lane_write: Option<usize>,
     mesh_memory_barrier: bool,
@@ -647,9 +645,9 @@ impl Em {
             dynamic_f16_rm: false,
             safe_barrier: false,
             mesh_export_barriers: false,
-            mesh_sync_edges: Vec::new(),
-            mesh_sync_end: None,
-            mesh_sync_indirect: false,
+            group_sync_edges: Vec::new(),
+            group_sync_end: None,
+            group_sync_indirect: false,
             packed_mask: None,
             packed_cross_lane_write: None,
             mesh_memory_barrier: false,
@@ -671,11 +669,12 @@ impl Em {
     }
 
     /// Pre-scan the program for f16/f64 rounding-sensitive ops, non-default `MODE[3:2]` writes,
-    /// and multi-warp `s_barrier` usage (for early-exit-safe, bounded `xcl_s_barrier`).
+    /// and multi-warp `s_barrier` usage and convergence.
     pub fn configure_round_modes(&mut self, insts: &[Decoded], stop_at_endpgm: bool) {
         let mut writes_nonzero_dp = false;
         let mut reads_dp = false;
         let mesh = matches!(self.opt.mode, Mode::Mesh(_));
+        let compute = matches!(self.opt.mode, Mode::Compute(_));
         let mut has_s_barrier = false;
         let mut barriers = Vec::new();
         let mut branches = Vec::new();
@@ -685,12 +684,13 @@ impl Em {
         let mut lds_sites = Vec::new();
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
-            if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
+            let ends = matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done");
+            if stop_at_endpgm && ends {
                 break;
             }
             if name == "s_barrier" {
                 has_s_barrier = true;
-                if mesh {
+                if mesh || compute {
                     barriers.push(d.pc);
                 }
             }
@@ -700,12 +700,15 @@ impl Em {
                 } else {
                     memory_writes |= name.contains("_store") || name.contains("_atomic") || name.starts_with("s_dcache_");
                 }
-                if matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
+            }
+            if mesh || compute {
+                if ends {
                     endpgm.get_or_insert(d.pc);
                 }
                 match d.far_target.or_else(|| rdna2::branch_target(d)) {
                     Some(t) => branches.push((d.pc, t)),
-                    None => indirect |= matches!(name.as_str(), "s_setpc_b64" | "s_swappc_b64"),
+                    None => indirect |= matches!(name.as_str(), "s_setpc_b64" | "s_swappc_b64")
+                        || (compute && !ends && d.inst.flags & rdna2::F_TERMINATOR != 0),
                 }
             }
             if is_f16_rounded_op(&name) {
@@ -744,22 +747,22 @@ impl Em {
             }
         }
         self.dynamic_f16_rm = writes_nonzero_dp && (self.has_f16_round_op || reads_dp) && !self.has_f64_round_op;
-        self.mesh_sync_edges = branches;
-        self.mesh_sync_end = endpgm;
-        self.mesh_sync_indirect = indirect;
+        self.group_sync_edges = branches;
+        self.group_sync_end = endpgm;
+        self.group_sync_indirect = indirect;
         self.mesh_export_barriers = mesh && self.opt.mesh_native.is_some() && !memory_writes;
         self.mesh_memory_barrier = self.opt.mesh_native.is_some() && has_s_barrier && memory_writes;
         self.mesh_divergent_lds = self.opt.mesh_native.is_some() && !lds_sites.is_empty()
-            && lds_sites.iter().chain(&barriers).any(|&p| !self.mesh_sync_converges(p));
-        let converged_mesh = mesh && barriers.iter().all(|&p| self.mesh_sync_converges(p));
+            && lds_sites.iter().chain(&barriers).any(|&p| !self.group_sync_converges(p));
+        let converged = (mesh || (compute && !self.x64())) && barriers.iter().all(|&p| self.group_sync_converges(p));
         self.safe_barrier = has_s_barrier && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
-            && !self.mesh_export_barriers && !converged_mesh
+            && !self.mesh_export_barriers && !converged
             && (self.opt.mesh_native.is_some() || std::env::var("XCL_SAFE_BARRIER").map_or(true, |v| v.trim() != "0"));
     }
 
-    fn mesh_sync_converges(&self, pc: u64) -> bool {
-        !self.mesh_sync_indirect && self.mesh_sync_end.is_none_or(|end| pc < end)
-            && self.mesh_sync_edges.iter().all(|&(a, b)| !(a < pc && pc < b || b <= a && b <= pc))
+    fn group_sync_converges(&self, pc: u64) -> bool {
+        !self.group_sync_indirect && self.group_sync_end.is_none_or(|end| pc < end)
+            && self.group_sync_edges.iter().all(|&(a, b)| !(a < pc && pc < b || b <= a && b <= pc))
     }
 
     pub fn take(&mut self) -> String {
@@ -1254,7 +1257,7 @@ impl Em {
                     // wave: nothing to wait for), a group barrier there would wait for the other
                     self.line("if (xcl_es_phase) GroupMemoryBarrierWithGroupSync();");
                 } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
-                    if self.safe_barrier {
+                    if self.safe_barrier && (self.x64() || !matches!(self.opt.mode, Mode::Compute(_)) || !self.group_sync_converges(d.pc)) {
                         self.line("xcl_s_barrier();");
                     } else if !self.packed_compute() && self.compute_or_mesh_hw_waves() == Some(1) {
                         self.line("GroupMemoryBarrier();");
@@ -6534,10 +6537,8 @@ uint xcl_x_rla_half(uint v, uint l) { return WaveReadLaneAt(v, l & 31u); }
 /// The group's progress word (`Em::waits`; the emitter defines `XCL_PROG` before it).
 const PRELUDE_TICK: &str = r#"
 // The group's progress: a hardware wave adds one at every loop iteration, at every meet and
-// barrier it reaches, and every 64 console instructions in between. What waits for other
-// waves by polling (`xcl_x_meet`, `xcl_s_barrier`) gives up after 1024 polls during which
-// this word stood still – no wave of the group runs any more, so what it waits for cannot
-// come – and never while another wave still works, however long that takes.
+// barrier it reaches, and every 64 console instructions in between. After 1024 unchanged
+// polls the split-wave meet gives up, but the group barrier only reports the delay.
 void xcl_tick() {
     if (WaveIsFirstLane()) { uint _o; InterlockedAdd(XCL_PROG, 1u, _o); }
 }
@@ -6546,7 +6547,7 @@ void xcl_tick() {
 /// Console instructions between two `xcl_tick`s of straight-line code (`Em::waits`).
 const TICK_EVERY: u32 = 64;
 
-/// Early-exit-safe, bounded workgroup barrier for multi-warp Compute / Mesh `s_barrier`
+/// Early-exit-safe workgroup barrier for multi-warp Compute / Mesh `s_barrier`
 /// (after `PRELUDE_TICK`; mesh barriers proven convergent use the group's own instead).
 ///
 /// On RDNA2, `S_ENDPGM` decrements the CU's active wave count so remaining waves executing
@@ -6555,15 +6556,11 @@ const TICK_EVERY: u32 = 64;
 /// (`s_endpgm`), exhausts `xcl_budget` (`LOOP_GUARD`), or diverges after a split-wave64 desync.
 ///
 /// `XCL_BAR_ALIVE` counts live warps (decremented once on exit); `XCL_BAR_STATE` packs
-/// `(disabled: 1 bit, gen: 19 bits, arrived: 12 bits)`. Advancing the generation
+/// `(gen: 20 bits, arrived: 12 bits)`. Advancing the generation
 /// atomically resets the arrival count.
 ///
-/// A barrier waits as long as the slowest wave works, so it gives up by the group's progress
-/// (`xcl_tick`), not by a count of its own polls: after 1024 polls during which no wave of the
-/// group got anywhere. The wave that gives up then sets the disabled bit for the whole
-/// group – every wave passes this barrier and the later ones without a wait, together, so the
-/// two halves of a console wave stay in step (one of them waiting where the other does not is
-/// what made their meets give up) and a group with a wave that never arrives pays one wait.
+/// An unchanged progress counter is diagnostic only. The barrier releases when every
+/// still-live wave has arrived, including when a missing wave legitimately retires.
 const PRELUDE_SAFE_BARRIER: &str = r#"
 static bool xcl_bar_alive = true;
 void xcl_s_barrier_init(uint gi) {
@@ -6586,39 +6583,42 @@ void xcl_s_barrier_exit() {
 void xcl_s_barrier() {
     GroupMemoryBarrier();
     uint _lanes = WaveActiveCountBits(true);
-    uint _ok = 1u;
-    if (WaveIsFirstLane() && _lanes != 0u) {
-        uint _old;
-        InterlockedAdd(XCL_BAR_STATE, 0u, _old);
-        if ((int)_old >= 0) InterlockedAdd(XCL_BAR_STATE, 1u, _old);
-        uint _gen = _old >> 12;
-        uint _next = ((_gen + 1u) & 0x7FFFFu) << 12;
-        uint _seen;
+    bool _leader = WaveIsFirstLane() && _lanes != 0u;
+    uint _old = 0u, _seen = 0u;
+    if (_leader) {
+        InterlockedAdd(XCL_BAR_STATE, 1u, _old);
         InterlockedAdd(XCL_PROG, 1u, _seen);
         _seen = _seen + 1u;
-        uint _still = 0u;
-        [loop] while ((int)_old >= 0) {
-            uint _s, _alive;
+    }
+    uint _gen = WaveReadLaneFirst(_old) >> 12;
+    uint _next = (_gen + 1u) << 12;
+    uint _still = 0u;
+    [loop] while (true) {
+        uint _released = 0u;
+        if (_leader) {
+            uint _s;
             InterlockedAdd(XCL_BAR_STATE, 0u, _s);
-            if ((_s >> 12) != _gen) break;
-            InterlockedAdd(XCL_BAR_ALIVE, 0u, _alive);
-            if ((int)_alive <= 0 || (_s & 0xFFFu) >= _alive) {
-                uint _orig;
-                InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
-                if (_orig == _s) break;
-            }
-            uint _p;
-            InterlockedAdd(XCL_PROG, 0u, _p);
-            if (_p != _seen) _still = 0u; else _still++;
-            _seen = _p;
-            if (_still >= 1024u) {
-                uint _orig;
-                InterlockedCompareExchange(XCL_BAR_STATE, _s, 0x80000000u, _orig);
-                if (_orig == _s) { _ok = 0u; break; }
+            if ((_s >> 12) != _gen) {
+                _released = 1u;
+            } else {
+                uint _alive;
+                InterlockedAdd(XCL_BAR_ALIVE, 0u, _alive);
+                if ((_s & 0xFFFu) == _alive) {
+                    uint _orig;
+                    InterlockedCompareExchange(XCL_BAR_STATE, _s, _next, _orig);
+                    _released = uint(_orig == _s);
+                }
+                if (_released == 0u) {
+                    uint _p;
+                    InterlockedAdd(XCL_PROG, 0u, _p);
+                    if (_p != _seen) _still = 0u; else _still++;
+                    _seen = _p;
+                    if (_still == 1024u) xcl_trip(2u);
+                }
             }
         }
+        if (WaveReadLaneFirst(_released) != 0u) break;
     }
-    if (WaveReadLaneFirst(_ok) == 0u) xcl_trip(2u);
     GroupMemoryBarrier();
 }
 "#;

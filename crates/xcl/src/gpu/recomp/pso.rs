@@ -118,16 +118,18 @@ pub fn translation_era() -> u64 {
 /// `console_to_dxil_for` with the title's memory windows given (`xcl shaders --precompile`
 /// fills the caches without a title: the same keys as at its run).
 pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+    let hash = crate::gpu::shader::fnv64(blob);
+    let legacy = super::legacy_compute_wave64() || (stage == Stage::Compute && split_wave64 && legacy_compute_selected(hash));
     // the direct DXIL backend's fallback lines name the program (`dxc::for_program`)
-    let label = format!("{stage:?} {:016x}", crate::gpu::shader::fnv64(blob));
-    let compile_one = || dxc::for_program(&label, || compile_console_shader(blob, stage, sampler_base, windows, split_wave64));
+    let label = format!("{stage:?} {hash:016x}");
+    let compile_one = || dxc::for_program(&label, || compile_console_shader(blob, stage, sampler_base, windows, split_wave64, legacy));
     if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
         return compile_one();
     }
     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ShaderCache::new(64 << 20)));
     let key = ShaderKey {
-        hash: crate::gpu::shader::fnv64(blob),
+        hash,
         stage,
         sampler_base,
         windows,
@@ -135,8 +137,16 @@ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wa
         cache_dir: dxc::cache_dir(),
     };
     let profile = stage == Stage::Compute && super::loop_profile::enabled_for(blob);
-    let from_disk = || translated::cached_in(&dxc::cache_dir(), translated::identity_for_layout(super::legacy_compute_wave64(), profile), blob, stage, sampler_base, windows, split_wave64, compile_one);
+    let from_disk = || translated::cached_in(&dxc::cache_dir(), translated::identity_for_layout(legacy, profile), blob, stage, sampler_base, windows, split_wave64, compile_one);
     cached_shader(cache, key, blob, from_disk).map(|shader| shader.as_ref().clone())
+}
+
+fn legacy_compute_selected(hash: u64) -> bool {
+    static SHADERS: OnceLock<Vec<u64>> = OnceLock::new();
+    SHADERS.get_or_init(|| {
+        std::env::var("XCL_COMPUTE_WAVE64_LEGACY_ONLY").unwrap_or_default().split(',')
+            .filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()
+    }).contains(&hash)
 }
 
 /// Translations on disk: a console program's (DXIL, static samplers) by its bytes, so a run
@@ -328,8 +338,9 @@ fn packed_dxil_fallback(packed: usize, legacy: usize, ratio: usize, giant: usize
     }
 }
 
-fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool) -> Result<Compiled, String> {
-    with_console_code(blob, stage, sampler_base, windows, split_wave64, |code, options, profile| {
+fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, legacy: bool) -> Result<Compiled, String> {
+    with_console_code(blob, stage, sampler_base, windows, split_wave64, |code, mut options, profile| {
+        options.legacy_compute_wave64 = legacy;
         let (ratio, giant) = packed_dxil_limits();
         if stage == Stage::Compute && options.wave64 && options.split_wave64 && !options.legacy_compute_wave64 && (ratio != 0 || giant != 0) && dxc::defer() {
             return Err("packed DXIL selection is not cached yet".into());

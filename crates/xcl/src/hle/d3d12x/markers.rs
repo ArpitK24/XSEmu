@@ -363,6 +363,7 @@ pub(super) fn frontier() -> Vec<String> {
     let g = MARKERS.lock().unwrap();
     let Some(m) = g.as_ref() else { return vec!["no GPU markers (XCL_GPU_MARKERS=1)".into()] };
     let mut open = Vec::new();
+    let mut selected = Vec::new();
     for (slot, r) in m.slots.iter().enumerate() {
         let Some(r) = r else { continue };
         let Some(&(q, submission, _)) = r.submissions.last() else { continue };
@@ -373,13 +374,31 @@ pub(super) fn frontier() -> Vec<String> {
         }
         let at = progress(words.map(|word| word.map(|n| n.min(total))));
         let k = at.2.max(at.0 + 1);
+        if at.2 > at.0 && r.ops.get(k as usize - 1).is_some_and(|o| {
+            matches!(o.kind, "dispatch" | "ExecuteIndirect(dispatch)")
+                && super::dispatch_timing::shader(super::pso_async::resolve(o.title_pso)).is_some()
+        }) {
+            selected.push((slot, r.generation, at.0, k));
+        }
         let op = r.ops.get(k as usize - 1).map_or(format!("op {k} (none)"), |o| format!("op {k} {} with {}", o.kind, pipeline(o.title_pso)));
         open.push(Begun { queue: super::list_x::queue_id(q), submission, slot, generation: r.generation, at, total, op });
     }
+    drop(g);
     open.sort_by_key(|b| (b.queue, b.submission, b.slot));
     let mut before = BEFORE.lock().unwrap();
     let lines = frontier_lines(&open, before.as_ref().unwrap_or(&HashMap::new()));
+    let newly_active: Vec<_> = selected.into_iter().filter(|&(slot, generation, done, _)| {
+        before.as_ref().is_some_and(|b| b.get(&slot).is_none_or(|&(previous_generation, previous_done, _)| {
+            previous_generation != generation || previous_done != done
+        }))
+    }).collect();
     *before = Some(open.iter().map(|b| (b.slot, (b.generation, b.at.0, b.total))).collect());
+    drop(before);
+    for (slot, generation, _, op) in newly_active {
+        for line in super::bind::describe_dispatch(slot, generation, op as usize - 1) {
+            crate::xlog_info!("GPU dispatch became active: slot {slot}/{generation} op {op}: {line}");
+        }
+    }
     lines
 }
 
@@ -482,7 +501,7 @@ pub(super) fn dump() -> Vec<String> {
                     crate::xlog_error!("GPU markers: slot {} op {}: {line}", o.slot, op + 1);
                 }
             } else {
-                let trips = super::bind::trips_of_draws(p.title_pso).map_or("not watched".into(), |t| format!("{t} gave up"));
+                let trips = super::bind::trips_of_draws(p.title_pso).unwrap_or_else(|| "not watched".into());
                 crate::xlog_error!("GPU markers: slot {} op {}: {} with {}; guard tripwire now, in all draws of the pipeline so far: {trips}", o.slot, op + 1, p.kind, pipeline(p.title_pso));
             }
             // what the first of them were given, in full: every root argument and what is
@@ -498,10 +517,10 @@ pub(super) fn dump() -> Vec<String> {
     // the guard tripwire in every op of the open recordings, begun or not
     let slots: Vec<(usize, u32)> = open.iter().map(|o| (o.slot, o.generation)).collect();
     let tripped = super::bind::trips_in(&slots);
-    crate::xlog_error!("GPU markers: guard tripwire now: lanes gave up in {} dispatches of the {} open recordings", tripped.len(), open.len());
+    crate::xlog_error!("GPU markers: guard tripwire now: events in {} dispatches of the {} open recordings", tripped.len(), open.len());
     for (slot, op, lanes) in &tripped {
         let p = m.slots[*slot].as_ref().and_then(|r| r.ops.get(*op)).map_or("an op not recorded".into(), |p| format!("{} with {}", p.kind, pipeline(p.title_pso)));
-        crate::xlog_error!("GPU markers: guard tripwire now: slot {slot} op {}: {lanes} gave up in {p}", op + 1);
+        crate::xlog_error!("GPU markers: guard tripwire now: slot {slot} op {}: {lanes} in {p}", op + 1);
         if !described.contains(&(*slot, *op)) {
             let generation = slots.iter().find(|s| s.0 == *slot).map_or(0, |s| s.1);
             for line in super::bind::describe_dispatch(*slot, generation, *op) {

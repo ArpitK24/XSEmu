@@ -985,6 +985,7 @@ unsafe fn pc_dispatch_mesh(this: *mut c_void) -> Option<unsafe extern "system" f
 /// program numbers its groups on one axis (it finds its group in one register), so y and z fold
 /// into x in both forms.
 pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    super::depth_uav::note_op(this);
     let title_pso = with(this, |s| s.pso);
     let pso = super::pso_async::resolve_wait(title_pso);
     note_named_use(title_pso, pso, "mesh dispatch");
@@ -1057,6 +1058,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
 /// form; its indirect mesh work goes through ExecuteIndirect). A payload is not passed on –
 /// a console mesh program without an amplification shader declares none.
 pub(super) unsafe extern "system" fn dispatch_mesh_x(this: *mut c_void, x: u32, _flags: u64, indirect: u64, payload: u64) {
+    super::depth_uav::note_op(this);
     if indirect != 0 {
         count(DRAWS_SKIPPED);
         mesh_skipped(this, with(this, |s| s.pso), "a DispatchMeshX", "it takes its group count from memory");
@@ -1283,6 +1285,20 @@ fn buffer_dword_address(words: &[u32; 8], offset: u32) -> Option<u64> {
         .then(|| (desc.address + offset as u64) & !3)
 }
 
+fn dispatch_backing(resource: Option<usize>, address: Option<u64>) -> String {
+    let mut kind = Vec::new();
+    if let Some((local, non_local, unmapped)) = resource.and_then(super::vram::tile_backing) {
+        kind.push(format!("tiled {local} local / {non_local} non-local / {unmapped} unmapped tiles"));
+    }
+    if let Some(s) = resource.and_then(super::residency::describe_backing) {
+        kind.push(s);
+    }
+    if address.is_some_and(|va| super::real::uma_window_buffer(va as usize, 1).is_some()) {
+        kind.push("address in imported host UMA window".into());
+    }
+    if kind.is_empty() { "backing unknown".into() } else { kind.join("; ") }
+}
+
 fn note_dispatch_binding(this: *mut c_void, title_pso: usize, groups: Option<[u32; 3]>) {
     if !super::markers::enabled() {
         return;
@@ -1316,6 +1332,10 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
     let word = |at: usize| b.args.get(at..at + 4).map(|w| u32::from_le_bytes(w.try_into().unwrap())).unwrap_or(0);
     let hex = |w: &[u32]| w.iter().map(|x| format!("{x:x}")).collect::<Vec<_>>().join(" ");
     let mut out = vec![format!("{}; thread groups {}", super::markers::pipeline(b.title_pso), b.groups.map_or("from an argument buffer".into(), |g| format!("{} x {} x {}", g[0], g[1], g[2])))];
+    if let Some([local, non_local]) = super::real::video_memory_info() {
+        out.push(format!("DXGI budget now: local {} / {} MiB, non-local {} / {} MiB",
+            local.CurrentUsage >> 20, local.Budget >> 20, non_local.CurrentUsage >> 20, non_local.Budget >> 20));
+    }
     // the registers the shader was given: s0:s1 the argument table, from s4 the first `inline`
     // bytes of the packed arguments (`console_list::user_data_for`)
     let (io, user_sgprs, inline) = &b.io;
@@ -1357,18 +1377,20 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
             Some(va) => format!("at {va:#x} not readable by the CPU"),
             None => "not an in-bounds buffer dword".into(),
         };
-        out.push(format!("{label}: descriptor {}; {value}", hex(&words)));
+        let backing = dispatch_backing(None, buffer_dword_address(&words, offset));
+        out.push(format!("{label}: descriptor {}; {value}; {backing}", hex(&words)));
     }
     if let Some(t) = TRIPS.lock().unwrap().as_ref().filter(|t| !t.pieces.is_empty()) {
         if let Some(i) = (0..TRIP_RING).find(|&i| t.slots[i].0 != 0 && t.slots[i].1 == b.at) {
-            out.push(format!("guard tripwire now: {} gave up", trip_text(&t.words(i).map(|w| w as u64))));
+            out.push(format!("guard tripwire now: {}", trip_text(&t.words(i).map(|w| w as u64))));
             out.extend(t.loop_lines(i));
         }
     }
     for BoundImage { table, param, slot, srv, resource, view } in &b.images {
         let owner = resource.map_or_else(|| "owner untracked".into(), |r| format!("resource {r:#x}"));
+        let backing = dispatch_backing(*resource, None);
         out.push(format!(
-            "p{param} table {table:#x} slot {slot} image {:?} {}x{}x{}, GFX10 format {}, {} view mips, SRV index {srv}, companion UAV index {}, {owner}",
+            "p{param} table {table:#x} slot {slot} image {:?} {}x{}x{}, GFX10 format {}, {} view mips, SRV index {srv}, companion UAV index {}, {owner}; {backing}",
             view.ty, view.width, view.height, view.depth, view.format, view.last_level + 1, srv.saturating_add(1)
         ));
     }
@@ -1381,7 +1403,8 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
         let before = d.iter().take(i).rev().enumerate().find(|(_, e)| e.buffers.iter().any(|&(eb, es, ..)| overlaps(*base, *size, eb, es))).map_or("; no dispatch kept before it was bound to it".to_string(), |(n, e)| {
             format!("; bound before by {}, {} dispatches earlier{}", super::markers::pipeline(e.title_pso), n + 1, e.at.map_or(String::new(), |(s, _, o)| format!(" (op {} of slot {s})", o + 1)))
         });
-        out.push(format!("{what}: {base:#x}+{:#x}{}: now {now}{skipped}{mesh}{before}", span(*size), if *res == 0 { String::new() } else { format!(" (resource {res:#x})") }));
+        let backing = dispatch_backing((*res != 0).then_some(*res), Some(*base));
+        out.push(format!("{what}: {base:#x}+{:#x}{}: now {now}; {backing}{skipped}{mesh}{before}", span(*size), if *res == 0 { String::new() } else { format!(" (resource {res:#x})") }));
     }
     out
 }
@@ -1475,7 +1498,7 @@ impl Trips {
         if self.told <= 64 || self.told.is_power_of_two() {
             let place = at.map_or(String::new(), |(s, _, op)| format!(" (op {} of slot {s})", op + 1));
             crate::xlog_warn!(
-                "guard tripwire: lanes gave up – {} – in {} with {}{place} (#{})",
+                "guard tripwire: {} in {} with {}{place} (#{})",
                 trip_text(&delta),
                 if i < TRIP_RING { "a dispatch" } else { "draws" },
                 super::markers::pipeline(pso),
@@ -1514,7 +1537,7 @@ impl Trips {
         let mut v: Vec<(usize, [u64; 4], u64)> = self.totals.iter().map(|(&p, &(lanes, hits))| (p, lanes, hits)).collect();
         v.sort_by_key(|&(_, lanes, _)| std::cmp::Reverse(lanes.iter().sum::<u64>()));
         let all: [u64; 4] = std::array::from_fn(|k| v.iter().map(|e| e.1[k]).sum());
-        let mut out = vec![format!("guard tripwire: {} gave up in {} pipelines ({} dispatches and {} graphics pipelines watched)", trip_text(&all), v.len(), self.next, self.gfx.len())];
+        let mut out = vec![format!("guard tripwire: {} in {} pipelines ({} dispatches and {} graphics pipelines watched)", trip_text(&all), v.len(), self.next, self.gfx.len())];
         for (p, lanes, hits) in v.into_iter().take(most) {
             out.push(format!("guard tripwire: {} in {hits} {} with {}", trip_text(&lanes), if self.gfx.contains_key(&p) { "looks at draws" } else { "dispatches" }, super::markers::pipeline(p)));
         }
@@ -1931,7 +1954,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
     }
     bind_abi(this, list, pso, false)?;
     super::residency::note_list_untracked(this as usize);
-    list.Dispatch(x, y, z);
+    super::dispatch_timing::dispatch(list, pso, [x, y, z]);
     Ok(())
 }
 
@@ -2204,7 +2227,7 @@ mod tests {
         set(&t, 0, 0, 640);
         set(&t, 0, 3, 2);
         let lines = t.lines(8);
-        assert!(lines[0].contains("loop guard 640, compare-exchange retries 2 gave up in 1 pipelines (2 dispatches"), "{lines:?}");
+        assert!(lines[0].contains("loop guard 640, compare-exchange retries 2 in 1 pipelines (2 dispatches"), "{lines:?}");
         assert!(lines[1].contains("in 1 dispatches with pipeline 0x71000910"), "{lines:?}");
         assert_eq!(t.lines(8), lines, "a slot already counted is not counted again");
 

@@ -135,6 +135,7 @@ unsafe fn in_flight(last: &LastUse, completed: &mut HashMap<usize, u64>) -> bool
 
 struct Object {
     bytes: u64,
+    heap_type: Option<D3D12_HEAP_TYPE>,
     local: bool,
     high: bool,
     evictable: bool,
@@ -206,7 +207,7 @@ impl State {
 
     unsafe fn track(&mut self, raw: usize, bytes: u64, local: bool, high: bool) {
         let previous = self.objects.insert(raw, Object {
-            bytes, local, high, evictable: local, resident: true, last_used: self.serial, last: Vec::new(), pins: 0, releasing: 0,
+            bytes, heap_type: None, local, high, evictable: local, resident: true, last_used: self.serial, last: Vec::new(), pins: 0, releasing: 0,
         });
         if let Some(old) = previous.filter(|o| !o.resident) {
             self.evicted_local = self.evicted_local.saturating_sub(old.bytes);
@@ -461,7 +462,37 @@ pub(super) unsafe fn track(dev: &ID3D12Device, raw: usize, props: D3D12_HEAP_PRO
     let s = state(&mut g, dev);
     s.track(raw, bytes, local, high);
     let gpu_only = props.Type == D3D12_HEAP_TYPE_DEFAULT || props.CPUPageProperty == D3D12_CPU_PAGE_PROPERTY_NOT_AVAILABLE;
-    s.objects.get_mut(&raw).unwrap().evictable = local && evictable && gpu_only;
+    let o = s.objects.get_mut(&raw).unwrap();
+    o.heap_type = Some(if spilled { D3D12_HEAP_TYPE_CUSTOM } else { props.Type });
+    o.evictable = local && evictable && gpu_only;
+}
+
+pub(super) fn describe_backing(resource: usize) -> Option<String> {
+    let g = REGISTRY.get()?.lock().unwrap();
+    let describe = |id: usize| {
+        let &(dev, _) = g.objects.get(&id)?;
+        let o = g.devices.get(&dev)?.objects.get(&id)?;
+        let kind = match o.heap_type {
+            Some(D3D12_HEAP_TYPE_DEFAULT) => "default",
+            Some(D3D12_HEAP_TYPE_UPLOAD) => "upload",
+            Some(D3D12_HEAP_TYPE_READBACK) => "readback",
+            Some(D3D12_HEAP_TYPE_CUSTOM) => "custom",
+            Some(D3D12_HEAP_TYPE_GPU_UPLOAD) => "gpu-upload",
+            _ => "unknown type",
+        };
+        let pool = if o.local { "local" } else { "non-local" };
+        let state = if o.resident { "resident" } else { "evicted" };
+        Some(format!("{kind}/{pool}/{state}"))
+    };
+    if let Some(l) = g.links.get(&resource) {
+        let mut heaps: Vec<_> = l.heaps.iter().filter_map(|&id| describe(id)).collect();
+        heaps.sort_unstable();
+        heaps.dedup();
+        if !heaps.is_empty() {
+            return Some(format!("tracked backing heaps {}", heaps.join(", ")));
+        }
+    }
+    describe(resource).map(|o| format!("tracked allocation {o}"))
 }
 
 pub(super) unsafe fn create_heap(dev: &ID3D12Device, desc: &D3D12_HEAP_DESC, prefer_local: bool) -> Result<ID3D12Heap> {

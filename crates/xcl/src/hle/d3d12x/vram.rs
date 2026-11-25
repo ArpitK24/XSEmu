@@ -415,6 +415,21 @@ unsafe impl Send for Pages {}
 /// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
 static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
+pub(super) fn tile_backing(resource: usize) -> Option<(usize, usize, usize)> {
+    let g = PAGES.lock().unwrap();
+    let (p, t) = g.values().flatten().find_map(|p| p.targets.get(&resource).map(|t| (p, t)))?;
+    let mut local = 0;
+    let mut non_local = 0;
+    for page in t.used.iter().filter_map(|k| p.pages.get(k)).chain(t.used_extra.iter().filter_map(|k| p.extra_pages.get(k))) {
+        if p.system_pools.contains(&page.tile.0) {
+            non_local += 1;
+        } else {
+            local += 1;
+        }
+    }
+    Some((local, non_local, (t.total as usize).saturating_sub(local + non_local)))
+}
+
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
         let mut o = D3D12_FEATURE_DATA_D3D12_OPTIONS::default();

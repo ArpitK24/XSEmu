@@ -2144,6 +2144,15 @@ pub(super) unsafe fn readback_sparse_writes(queue: *mut c_void, lists: &[*mut c_
 }
 
 /// After `lists` went to `queue`: their writes into memory the GPU does not see (`cpu_writes`).
+pub(super) fn note_dispatch_timing(list: usize, readback: usize, write: super::cpu_writes::Write) -> bool {
+    let mut g = LISTS.lock().unwrap();
+    let Some(s) = g.as_mut().and_then(|m| m.get_mut(&list)) else { return false };
+    s.cpu_writes.push(write);
+    drop(g);
+    super::residency::note_list_resources(list, [readback]);
+    true
+}
+
 pub(super) unsafe fn cpu_writes_after(queue: *mut c_void, lists: &[*mut c_void]) {
     let writes: Vec<super::cpu_writes::Write> = {
         let g = LISTS.lock().unwrap();
@@ -2674,6 +2683,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
     drop(old_next);
     super::title_textures::list_reset(next_pc as usize);
     super::residency::list_reset(next_pc as usize);
+    super::depth_uav::list_reset(next_pc as usize);
     super::bind::inherit_for_split(list, next_pc, alloc);
     restore_bindings(next_pc, &bindings, ty);
 
@@ -2888,6 +2898,45 @@ unsafe fn predication_buffer(list: *mut c_void) -> Option<usize> {
     };
     drop(extra);
     Some(raw)
+}
+
+/// Before one of XCL's own passes in the middle of `list`'s recording (`depth_uav`): the title's
+/// predication does not hold for it. True: it was on (`after_own_pass` turns it on again).
+pub(super) unsafe fn before_own_pass(list: *mut c_void) -> bool {
+    if !PREDICATION_USED.load(Ordering::Acquire) {
+        return false;
+    }
+    let on = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize))).is_some_and(|s| s.predication.is_some() && s.pred_in_state);
+    if on {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(list, PC_SET_PREDICATION)(list, 0, 0, D3D12_PREDICATION_OP_EQUAL_ZERO);
+    }
+    on
+}
+
+/// After one of XCL's own passes on `list`: what the pass set in place of the title's is set
+/// again – the descriptor heaps, the pipeline, the predication and, after a pass that drew
+/// (`drew`), the fixed-function state. Root signatures and root arguments are bound by every
+/// draw and dispatch of the title's (`bind`).
+pub(super) unsafe fn after_own_pass(list: *mut c_void, drew: bool, predicated: bool) {
+    let ty = list_type(list);
+    let (pso, predication) = {
+        let mut g = LISTS.lock().unwrap();
+        let Some(s) = g.as_mut().and_then(|m| m.get_mut(&(list as usize))) else { return };
+        if drew {
+            restore_bindings(list, &s.bindings, ty);
+        } else if !s.bindings.heaps.is_empty() {
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(list, 28)(list, s.bindings.heaps.len() as u32, s.bindings.heaps.as_ptr());
+        }
+        // a pipeline derived for a depth bias is bound again by the next draw
+        s.pso_dirty = true;
+        (s.bound_pso, s.predication.zip(s.pred_buf.as_ref().map(|r| r.as_raw() as usize)))
+    };
+    if pso != 0 {
+        pc::<unsafe extern "system" fn(*mut c_void, usize)>(list, PC_SET_PIPELINE_STATE)(list, super::pso_async::resolve_for_bind(pso));
+    }
+    if let (true, Some((op, pb))) = (predicated, predication) {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, D3D12_PREDICATION_OP)>(list, PC_SET_PREDICATION)(list, pb, 0, op);
+    }
 }
 
 /// Before `Close()` on a command list: return `pred_buf` to `COMMON` if it is currently in
@@ -3172,6 +3221,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
     super::residency::list_reset(target as usize);
+    super::depth_uav::list_reset(target as usize);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
     if let Some(b) = bindings {
         restore_bindings(target, &b, ty);
@@ -3776,6 +3826,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
     };
     super::title_textures::list_reset(this as usize);
     super::residency::list_reset(this as usize);
+    super::depth_uav::list_reset(this as usize);
     super::bind::reset(this, alloc, pso);
     if !is_bundle && pso != 0 {
         if let Some((true, static_bias)) = device_x::base_depth_bias_info(pso) {
@@ -3803,6 +3854,8 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     let mut out: Vec<[u32; 8]> = Vec::with_capacity(n as usize + 1);
     // a UAV barrier for all resources is in `out` / a transition from or to UNORDERED_ACCESS
     let (mut any_uav, mut uav_transition) = (false, false);
+    // copies to the shadow textures of depth buffers that follow these barriers (`depth_uav`)
+    let mut depth_copies = Vec::new();
     for k in 0..n as usize {
         let mut b = barriers.add(k).read_unaligned();
         let (ty, flags) = (b[0], b[1]);
@@ -3860,8 +3913,13 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
             if b[5] == b[6] {
                 continue;
             }
+            // a depth buffer the console also gives unordered access: its shadow texture is
+            // brought in step, and the PC depth buffer takes a state it has
             // UAV writes before (or after) the transition: the same holds for the window buffers
             uav_transition |= (b[5] | b[6]) & UNORDERED_ACCESS != 0;
+            if (super::depth_uav::active() || (b[5] | b[6]) & UNORDERED_ACCESS != 0) && !super::depth_uav::on_transition(this, &mut b, &mut depth_copies) {
+                continue;
+            }
         }
         out.push(b);
     }
@@ -3892,6 +3950,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
     }
     if !out.is_empty() {
         pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+    }
+    if !depth_copies.is_empty() {
+        super::depth_uav::after_barriers(this, depth_copies);
     }
 }
 
@@ -3982,6 +4043,7 @@ unsafe fn trace_watched_copy(what: &str, dst: usize, src: usize) {
 
 /// CopyTextureRegion(dst, x, y, z, src, box) (PC #16; DMA list #12)
 pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, bx: *const D3D12_BOX) {
+    super::depth_uav::note_op(this);
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
@@ -4068,6 +4130,7 @@ const PC_CLEAR_DEPTH_STENCIL_VIEW: usize = 47;
 
 /// command list #51 ClearDepthStencilView(dsv, flags, depth, stencil, rects, rect list) (PC #47)
 pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const windows::Win32::Foundation::RECT) {
+    super::depth_uav::note_op(this);
     super::residency::note_list_untracked(this as usize);
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
@@ -4114,6 +4177,7 @@ unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: 
 
 /// command list #19 ResolveSubresource(dst, dst sub, src, src sub, format) (PC #19)
 pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, dst: usize, dst_sub: u32, src: usize, src_sub: u32, format: i32) {
+    super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
     trace_resolve("ResolveSubresource", dst, src, format, "");
@@ -4124,6 +4188,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
 /// mode) (PC #64)
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_void, dst: usize, dst_sub: u32, x: u32, y: u32, src: usize, src_sub: u32, rect: *const windows::Win32::Foundation::RECT, format: i32, mode: i32) {
+    super::depth_uav::note_op(this);
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
     if super::present::trace_frame() {
@@ -4135,6 +4200,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
 /// are copied as their own bytes (the PC resources also hold what lies before them)
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
+    super::depth_uav::note_op(this);
     super::present::note_use(dst, super::present::USE_COPY);
     super::title_textures::note_gpu_write(dst);
     if super::present::trace_frame() {
