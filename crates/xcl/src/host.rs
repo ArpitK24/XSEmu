@@ -98,8 +98,13 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let unbacked = crate::hle::d3d12x::vram::unbacked_bytes();
                 let (slab_used, slabs) = crate::hle::d3d12x::vram::slab_bytes();
                 let mb = |b: u64| b >> 20;
+                // non-local video memory by owner: the coherent window is system memory D3D12
+                // opened as a heap (the title's own heaps; all of it counted, used or not)
+                let (window, window_used, pool) = crate::gpu::uma::made()
+                    .map_or((0, 0, (0, 0)), |u| (u.size() as u64, u.used() as u64, u.pool_bytes()));
+                let (window, other_non_local) = crate::gpu::uma::non_local_split(non_local, window);
                 crate::xlog_info!(
-                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB; {} MB of texture tiles without texels have none); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); small-texture slabs {} KB ({} KB in use)",
+                    "memory: {} MB committed by the process; video memory {} MB local, {} MB non-local; target pages {} MB (pools {} MB; {} MB of texture tiles without texels have none); arenas {} MB in use, {} MB made; sparse pools {} MB ({} MB mapped); small-texture slabs {} KB ({} KB in use); non-local is the coherent window {} MB ({} MB in use, XCL's pool {} MB of that with {} MB handed out) and {} MB of upload and readback memory",
                     mb(private),
                     mb(local),
                     mb(non_local),
@@ -111,7 +116,12 @@ pub fn host_main(boot_path: &Path) -> i32 {
                     mb(pools as u64),
                     mb(pools_mapped as u64),
                     slabs >> 10,
-                    slab_used >> 10
+                    slab_used >> 10,
+                    mb(window),
+                    mb(window_used),
+                    pool.0 >> 20,
+                    pool.1 >> 20,
+                    mb(other_non_local)
                 );
                 last = now;
             }

@@ -5303,6 +5303,210 @@ fn gpu_arena_partial_commit_probe() {
     }
 }
 
+/// Experiment (vram61): what a heap opened from an address costs in RAM – before and after the
+/// open, after the working set is emptied, with a buffer placed, evicted – and whether the tiles
+/// of a reserved buffer can be mapped onto such heaps (a window committed in pieces).
+#[test]
+#[ignore]
+fn gpu_imported_heap_residency_probe() {
+    use windows::core::Interface;
+    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::Win32::Graphics::Dxgi::*;
+    use windows_sys::Win32::System::Memory::*;
+    #[repr(C)]
+    struct MemStatus {
+        len: u32,
+        load: u32,
+        total_phys: u64,
+        avail_phys: u64,
+        rest: [u64; 5],
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn K32QueryWorkingSetEx(process: isize, pv: *mut [u64; 2], cb: u32) -> i32;
+        fn K32EmptyWorkingSet(process: isize) -> i32;
+        fn GlobalMemoryStatusEx(m: *mut MemStatus) -> i32;
+        fn GetLastError() -> u32;
+    }
+    const MIB: usize = 1 << 20;
+    // (resident MiB, with the locked bit MiB) of a range, MiB of RAM available to the system
+    unsafe fn look(p: usize, len: usize) -> (usize, usize, u64) {
+        let mut v: Vec<[u64; 2]> = (0..len / 4096).map(|i| [(p + i * 4096) as u64, 0]).collect();
+        let (mut valid, mut locked) = (0usize, 0usize);
+        for c in v.chunks_mut(1 << 14) {
+            if K32QueryWorkingSetEx(-1, c.as_mut_ptr(), (c.len() * 16) as u32) == 0 {
+                return (usize::MAX, usize::MAX, 0);
+            }
+            for e in c.iter() {
+                if e[1] & 1 != 0 {
+                    valid += 1;
+                    locked += usize::from(e[1] & 0x40_0000 != 0);
+                }
+            }
+        }
+        let mut m = MemStatus { len: 64, load: 0, total_phys: 0, avail_phys: 0, rest: [0; 5] };
+        GlobalMemoryStatusEx(&mut m);
+        (valid * 4096 / MIB, locked * 4096 / MIB, m.avail_phys >> 20)
+    }
+    unsafe fn trim() {
+        K32EmptyWorkingSet(-1);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+    }
+    unsafe {
+        let mut dev: Option<ID3D12Device> = None;
+        D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut dev).unwrap();
+        let dev = dev.unwrap();
+        let dev3: ID3D12Device3 = dev.cast().unwrap();
+        let factory: IDXGIFactory4 = CreateDXGIFactory1().unwrap();
+        let adapter: IDXGIAdapter3 = factory.EnumAdapterByLuid(dev.GetAdapterLuid()).unwrap();
+        let video = || {
+            let (mut l, mut n) = (DXGI_QUERY_VIDEO_MEMORY_INFO::default(), DXGI_QUERY_VIDEO_MEMORY_INFO::default());
+            let _ = adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut l);
+            let _ = adapter.QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut n);
+            (l.CurrentUsage >> 20, n.CurrentUsage >> 20)
+        };
+        let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+        let mut fence_value = 0u64;
+        let buffer = |bytes: usize, flags: D3D12_RESOURCE_FLAGS| D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: bytes as u64,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut readback: Option<ID3D12Resource> = None;
+        dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &buffer(4096, D3D12_RESOURCE_FLAG_NONE), D3D12_RESOURCE_STATE_COPY_DEST, None, &mut readback).unwrap();
+        let readback = readback.unwrap();
+        // copies of 4 bytes (source, offset) to the readback buffer; what the GPU read, or why not
+        let mut read = |srcs: &[(&ID3D12Resource, usize)]| -> Result<Vec<u32>, String> {
+            let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(|e| e.to_string())?;
+            let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(|e| e.to_string())?;
+            for (i, (r, at)) in srcs.iter().enumerate() {
+                list.CopyBufferRegion(&readback, 4 * i as u64, *r, *at as u64, 4);
+            }
+            list.Close().map_err(|e| format!("Close: {e}"))?;
+            queue.ExecuteCommandLists(&[Some(list.cast::<ID3D12CommandList>().unwrap())]);
+            fence_value += 1;
+            queue.Signal(&fence, fence_value).map_err(|e| format!("Signal: {e}"))?;
+            crate::gpu::fence::wait(&fence, fence_value, &dev, None, 5000).map_err(|e| format!("wait: {e}"))?;
+            let mut m = std::ptr::null_mut();
+            readback.Map(0, None, Some(&mut m)).map_err(|e| format!("Map: {e}"))?;
+            let got = std::slice::from_raw_parts(m as *const u32, srcs.len()).to_vec();
+            readback.Unmap(0, None);
+            Ok(got)
+        };
+        let cross = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER;
+
+        // 0. control: plain memory the CPU wrote, trimmed – how fast the system gets it back
+        let size = 1024 * MIB;
+        let watch = |what: &str, p: usize| {
+            K32EmptyWorkingSet(-1);
+            let line: Vec<String> = (0..7).map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let (r, _, a) = look(p, size);
+                format!("{r}/{a}")
+            }).collect();
+            println!("{what}: resident/available each second after the working set is emptied: {}", line.join(" "));
+        };
+        let c = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+        for at in (0..size).step_by(4096) {
+            ((c + at) as *mut u32).write_volatile(at as u32 | 1);
+        }
+        println!("control, 1024 MiB written:     {:?}", look(c, size));
+        watch("control (plain written memory)", c);
+        VirtualFree(c as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        // 1. what the open costs
+
+        println!("(resident MiB, locked-bit MiB, system available MiB); video (local, non-local) MiB");
+        println!("start:                         available {} video {:?}", look(0x10000, 4096).2, video());
+        let p = VirtualAlloc(std::ptr::null(), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+        println!("1024 MiB committed, untouched: {:?} video {:?}", look(p, size), video());
+        let heap: ID3D12Heap = dev3.OpenExistingHeapFromAddress(p as *const std::ffi::c_void).unwrap();
+        let hd = heap.GetDesc();
+        println!("heap: type {} cpu page {} pool {} flags {:#x} size {}", hd.Properties.Type.0, hd.Properties.CPUPageProperty.0, hd.Properties.MemoryPoolPreference.0, hd.Flags.0, hd.SizeInBytes);
+        println!("opened as a heap:              {:?} video {:?}", look(p, size), video());
+        watch("opened heap", p);
+        let mut placed: Option<ID3D12Resource> = None;
+        let made = dev.CreatePlacedResource(&heap, 0, &buffer(size, cross), D3D12_RESOURCE_STATE_COMMON, None, &mut placed);
+        println!("buffer placed over it ({:?}):  {:?} video {:?}", made.is_ok(), look(p, size), video());
+        (p as *mut u32).add(1024).write_volatile(0xC0FF_EE00);
+        if let Some(b) = &placed {
+            println!("the GPU reads the CPU's word:  {:x?}", read(&[(b, 4096)]));
+        }
+        trim();
+        println!("used, working set emptied:     {:?} video {:?}", look(p, size), video());
+        let pageable: ID3D12Pageable = heap.cast().unwrap();
+        println!("Evict: {:?}", dev.Evict(&[Some(pageable.clone())]));
+        trim();
+        println!("evicted, working set emptied:  {:?} video {:?}", look(p, size), video());
+        println!("MakeResident: {:?}", dev.MakeResident(&[Some(pageable.clone())]));
+        println!("resident again:                {:?} video {:?}", look(p, size), video());
+        if let Some(b) = &placed {
+            println!("the GPU reads the word again:  {:x?}", read(&[(b, 4096)]));
+        }
+        drop(placed);
+        drop(pageable);
+        drop(heap);
+        trim();
+        println!("heap released, emptied:        {:?} video {:?}", look(p, size), video());
+        VirtualFree(p as *mut std::ffi::c_void, 0, MEM_RELEASE);
+
+        // 2. a reserved buffer over two heaps opened from adjacent allocations
+        let piece = 64 * MIB;
+        let b = VirtualAlloc(std::ptr::null(), 2 * piece, MEM_RESERVE, PAGE_NOACCESS) as usize;
+        VirtualFree(b as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        let c0 = VirtualAlloc(b as *const std::ffi::c_void, piece, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+        let c1 = VirtualAlloc((b + piece) as *const std::ffi::c_void, piece, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+        println!("pieces at {c0:#x} and {c1:#x} (asked {b:#x}, {:#x})", b + piece);
+        if c0 != 0 && c1 != 0 {
+            let h0: windows::core::Result<ID3D12Heap> = dev3.OpenExistingHeapFromAddress(c0 as *const std::ffi::c_void);
+            let h1: windows::core::Result<ID3D12Heap> = dev3.OpenExistingHeapFromAddress(c1 as *const std::ffi::c_void);
+            println!("piece heaps: {:?} {:?}", h0.as_ref().map(|h| h.GetDesc().SizeInBytes), h1.as_ref().map(|h| h.GetDesc().SizeInBytes));
+            if let (Ok(h0), Ok(h1)) = (h0, h1) {
+                for (name, flags) in [("cross-adapter", cross)] {
+                    let mut reserved: Option<ID3D12Resource> = None;
+                    let made = dev.CreateReservedResource(&buffer(2 * piece, flags), D3D12_RESOURCE_STATE_COMMON, None, &mut reserved);
+                    println!("reserved buffer ({name}): {:?}", made.as_ref().map(|_| ()));
+                    let Some(reserved) = reserved else { continue };
+                    let tiles = (piece >> 16) as u32;
+                    for (k, h) in [&h0, &h1].into_iter().enumerate() {
+                        let coord = D3D12_TILED_RESOURCE_COORDINATE { X: k as u32 * tiles, ..Default::default() };
+                        let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles, UseBox: false.into(), ..Default::default() };
+                        let (flag, offset, count) = (D3D12_TILE_RANGE_FLAG_NONE, 0u32, tiles);
+                        queue.UpdateTileMappings(&reserved, 1, Some(&coord), Some(&region), h, 1, Some(&flag), Some(&offset), Some(&count), D3D12_TILE_MAPPING_FLAG_NONE);
+                    }
+                    println!("  after UpdateTileMappings: device removed reason {:?}", dev.GetDeviceRemovedReason());
+                    (c0 as *mut u32).add(1024).write_volatile(0xC0FF_EE10);
+                    ((c0 + piece - 4) as *mut u32).write_volatile(0xC0FF_EE11);
+                    (c1 as *mut u32).add(2048).write_volatile(0xC0FF_EE12);
+                    println!("  the GPU reads through the tiles (want c0ffee10, c0ffee11, c0ffee12): {:x?}", read(&[(&reserved, 4096), (&reserved, piece - 4), (&reserved, piece + 8192)]));
+                    println!("  device removed reason {:?}", dev.GetDeviceRemovedReason());
+                    if dev.GetDeviceRemovedReason().is_err() {
+                        break;
+                    }
+                }
+                // 3. pages of an opened heap given back
+                let freed = VirtualFree((c1 + 16 * MIB) as *mut std::ffi::c_void, 16 * MIB, MEM_DECOMMIT);
+                println!("decommit inside an opened heap: {freed} (error {})", GetLastError());
+                drop(h1);
+                let freed = VirtualFree((c1 + 32 * MIB) as *mut std::ffi::c_void, 16 * MIB, MEM_DECOMMIT);
+                println!("decommit after its release: {freed} (error {})", GetLastError());
+                drop(h0);
+            }
+        }
+        VirtualFree(c0 as *mut std::ffi::c_void, 0, MEM_RELEASE);
+        VirtualFree(c1 as *mut std::ffi::c_void, 0, MEM_RELEASE);
+    }
+}
+
 /// Decoded GFX10 T#s give resource descriptions the driver accepts.
 #[test]
 fn gpu_tsharp_to_d3d12_resources() {

@@ -145,6 +145,42 @@ pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
     }
 }
 
+pub const IDLE_BREAK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+pub struct IdleBreaker {
+    queued: VecDeque<std::thread::ThreadId>,
+    idle_since: Option<std::time::Instant>,
+}
+
+impl IdleBreaker {
+    pub const fn new() -> Self {
+        Self { queued: VecDeque::new(), idle_since: None }
+    }
+
+    pub fn hold(&mut self, id: std::thread::ThreadId, blocking: bool, running: usize, available: u64, floor: u64, now: std::time::Instant) -> bool {
+        if !blocking {
+            self.queued.retain(|&queued| queued != id);
+            if self.queued.is_empty() {
+                self.idle_since = None;
+            }
+            return false;
+        }
+        if !self.queued.contains(&id) {
+            self.queued.push_back(id);
+        }
+        if running != 0 {
+            return false;
+        }
+        let idle = now.duration_since(*self.idle_since.get_or_insert(now));
+        idle >= IDLE_BREAK_GRACE && self.queued.front() == Some(&id) && available > floor
+    }
+
+    pub fn started(&mut self, id: std::thread::ThreadId) {
+        self.queued.retain(|&queued| queued != id);
+        self.idle_since = None;
+    }
+}
+
 /// Where a pipeline made for later waits for a background worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
@@ -680,6 +716,40 @@ mod tests {
         let needed = GB + load.reserved + peak(len);
         assert_eq!(admit(&ask(len, true), &load, &room(needed - 1)), Verdict::Hold);
         assert_eq!(admit(&ask(len, true), &load, &room(needed)), Verdict::Urgent);
+    }
+
+    #[test]
+    fn an_idle_governor_unblocks_the_oldest_waited_for_compile() {
+        let mut breaker = IdleBreaker::new();
+        let newer = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+        let oldest = std::thread::current().id();
+        let now = std::time::Instant::now();
+        let available = 4_608 << 20;
+        let giant = 3_241_524;
+        assert!(fits_on_machine(peak(giant), GB, 32 * GB));
+        assert_eq!(admit(&ask(giant, true), &Load::default(), &room(available)), Verdict::Hold);
+        assert!(!breaker.hold(oldest, true, 0, available, GB, now));
+        assert!(!breaker.hold(newer, true, 0, available, GB, now));
+        let stalled = now + IDLE_BREAK_GRACE;
+        assert!(!breaker.hold(newer, true, 0, available, GB, stalled));
+        assert!(!breaker.hold(oldest, true, 0, GB, GB, stalled));
+        assert!(breaker.hold(oldest, true, 0, available, GB, stalled));
+        breaker.started(oldest);
+        assert!(!breaker.hold(newer, true, 1, available, GB, stalled + IDLE_BREAK_GRACE));
+        assert!(!breaker.hold(newer, true, 0, available, GB, stalled + IDLE_BREAK_GRACE));
+    }
+
+    #[test]
+    fn a_timed_out_waiter_does_not_force_a_compile_or_block_the_next_waiter() {
+        let mut breaker = IdleBreaker::new();
+        let first = std::thread::current().id();
+        let second = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
+        let now = std::time::Instant::now();
+        assert!(!breaker.hold(first, true, 0, 4 * GB, GB, now));
+        assert!(!breaker.hold(second, true, 0, 4 * GB, GB, now));
+        let stalled = now + IDLE_BREAK_GRACE;
+        assert!(!breaker.hold(first, false, 0, 4 * GB, GB, stalled));
+        assert!(breaker.hold(second, true, 0, 4 * GB, GB, stalled));
     }
 
     fn ask(dxil_len: usize, wanted: bool) -> Ask {

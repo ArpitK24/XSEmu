@@ -154,6 +154,7 @@ struct Pending {
     real_fast: std::sync::atomic::AtomicBool,
     /// a bind started a build of its own (`resolve_wait`)
     urgent: std::sync::atomic::AtomicBool,
+    active_waiters: AtomicUsize,
     /// counted in `COMPUTE_BOUND_PENDING` until its build is done
     counted: std::sync::atomic::AtomicBool,
     /// the fast-tier pipeline the optimized one replaced, kept until the stand-in goes (lists
@@ -470,17 +471,19 @@ pub fn title_held() -> bool {
 }
 
 /// A bind's wait for a pipeline still being built (`title_held`).
-struct Held;
+struct Held<'a>(&'a Pending);
 
-impl Held {
-    fn new() -> Held {
+impl<'a> Held<'a> {
+    fn new(p: &'a Pending) -> Self {
         HELD.fetch_add(1, Ordering::AcqRel);
-        Held
+        p.active_waiters.fetch_add(1, Ordering::AcqRel);
+        Self(p)
     }
 }
 
-impl Drop for Held {
+impl Drop for Held<'_> {
     fn drop(&mut self) {
+        self.0.active_waiters.fetch_sub(1, Ordering::AcqRel);
         HELD.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -714,6 +717,8 @@ thread_local! {
     /// (tests) this thread's frame wait budget instead of `XCL_FRAME_STALL_BUDGET_MS`
     pub(super) static FRAME_BUDGET: Cell<Option<Option<std::time::Duration>>> = const { Cell::new(None) };
     pub(super) static COMPUTE_SKIP_LIMIT: Cell<Option<std::time::Duration>> = const { Cell::new(None) };
+    /// (tests) this thread's `lazy_mesh` instead of `XCL_LAZY_MESH_PSO`
+    pub(super) static LAZY_MESH: Cell<Option<bool>> = const { Cell::new(None) };
 }
 
 thread_local! {
@@ -787,6 +792,10 @@ pub fn waited_on() -> bool {
     BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.urgent.load(Ordering::Acquire)))
 }
 
+pub(super) fn blocking_waiter() -> bool {
+    BUILDING.with(|b| b.borrow().as_ref().is_some_and(|p| p.active_waiters.load(Ordering::Acquire) != 0))
+}
+
 fn enqueue(p: Arc<Pending>) {
     start_workers();
     crate::progress::PIPELINES.queue();
@@ -836,6 +845,27 @@ pub fn lazy() -> bool {
     *L.get_or_init(|| enabled() && std::env::var("XCL_LAZY_PSO").map_or(true, |v| v != "0"))
 }
 
+/// Console mesh pipelines are lazy too (`XCL_LAZY_MESH_PSO=1`; off unless set): the title gets a
+/// stand-in, and the pipeline is built when first bound or by the background workers. Without
+/// it a mesh pipeline is built in the title's call and kept until the title releases it: a
+/// retail game made 24 600 while it loaded, before it drew with any (two driver pipelines each
+/// when made in two passes, ~150 KB of an NVIDIA driver's memory a pair, which that driver
+/// keeps when the pipelines are released).
+pub fn lazy_mesh() -> bool {
+    #[cfg(test)]
+    if let Some(on) = LAZY_MESH.with(Cell::get) {
+        return on;
+    }
+    static L: OnceLock<bool> = OnceLock::new();
+    *L.get_or_init(|| lazy() && std::env::var("XCL_LAZY_MESH_PSO").is_ok_and(|v| v == "1"))
+}
+
+/// (tests) `pso` is a stand-in the title holds, built or not.
+#[cfg(test)]
+pub(super) fn is_standin(pso: usize) -> bool {
+    entry(pso).is_some()
+}
+
 /// `submit`, built by the background workers (`preload`) below normal priority, in the order of
 /// `pso_sched::Backlog`: the ones with the most console code first, then the ones of shaders an
 /// earlier run used (`key`, 0 = none; `used`), then compute, then graphics. A bind sends it
@@ -869,6 +899,7 @@ fn submit_as(standin: usize, compute: bool, job: Job, send: bool, key: u64, what
         tiered_started: Default::default(),
         real_fast: Default::default(),
         urgent: Default::default(),
+        active_waiters: Default::default(),
         counted: Default::default(),
         retired: Default::default(),
         bound: Default::default(),
@@ -1795,6 +1826,7 @@ mod ahead_tests {
         assert!(waited_ms >= 10);
         assert_eq!(count.load(Ordering::Relaxed), 1);
         assert!(entry(standin).unwrap().urgent.load(Ordering::Acquire));
+        assert_eq!(entry(standin).unwrap().active_waiters.load(Ordering::Acquire), 0);
         assert!(is_pending(standin));
         finish.send(()).unwrap();
         assert_eq!(resolve_wait(standin), real);
@@ -2131,7 +2163,7 @@ fn resolve_with_deadline(pso: usize, site_waits: &AtomicUsize, compute_limit: Op
             return Err(PendingComputeSkip::ImageOnly);
         }
         // (the title's thread is held from here until the pipeline is built or the bind gives up)
-        let _held = Held::new();
+        let _held = Held::new(&p);
         if !p.urgent.swap(true, Ordering::AcqRel) {
             if p.compute && !*p.done.lock().unwrap() && !p.counted.swap(true, Ordering::AcqRel) {
                 COMPUTE_BOUND_PENDING.fetch_add(1, Ordering::AcqRel);
@@ -2425,6 +2457,7 @@ mod tests {
             tiered_started: Default::default(),
             real_fast: Default::default(),
             urgent: Default::default(),
+            active_waiters: Default::default(),
             counted: Default::default(),
             retired: Default::default(),
             bound: Default::default(),

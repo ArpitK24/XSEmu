@@ -666,6 +666,21 @@ impl Uma {
     pub fn peak(&self) -> usize {
         self.inner.lock().unwrap().peak_bytes
     }
+
+    /// Bytes of XCL's arena pool: (kept for it, handed out as arena blocks).
+    pub fn pool_bytes(&self) -> (usize, usize) {
+        let g = self.pool.lock().unwrap();
+        let kept = g.1 - g.0;
+        (kept, kept - g.2.len() * ARENA_BLOCK)
+    }
+}
+
+/// Non-local video memory by owner: (the coherent window, the rest). The window is system memory
+/// D3D12 opened as a heap – all of it counts as non-local from then on, used or not; the rest is
+/// what the CPU sees of everything else (upload and readback buffers: XCL's, the driver's).
+pub fn non_local_split(non_local: u64, coherent_window: u64) -> (u64, u64) {
+    let window = coherent_window.min(non_local);
+    (window, non_local - window)
 }
 
 impl Drop for Uma {
@@ -741,8 +756,16 @@ fn coherent_file(name: &str) -> std::path::PathBuf {
 const COHERENT_PEAK: &str = "uma_coherent_peak.txt";
 const COHERENT_ASKED: &str = "uma_coherent.txt";
 /// room in the coherent window past the most an earlier run used (a run that goes further than
-/// any before it has that much more before its GPU heaps no longer fit)
-const COHERENT_HEADROOM: usize = 512 << 20;
+/// any before it has that much more before its GPU heaps no longer fit). All of it is RAM from
+/// the start whether the title ever takes it: D3D12 opens the window as a heap, which makes
+/// every page of it resident (1024 MiB of untouched memory took 1040 MiB of the system's
+/// available RAM when opened), refuses a block that is only partly committed, and lets no page
+/// of an opened heap be decommitted (`gpu_imported_heap_residency_probe`) – the window cannot
+/// grow or shrink as the title runs, so what it does not use is held for nothing. A retail
+/// game's most in use differed by 27 MB between three runs and grew by 53 MB in the last 470 s
+/// of one; 512 MB of room were 539 MB resident and unused. 256 MB leave the title's largest
+/// allocation its 96 MB of XCL's own (`kernelx`) and 160 MB more than any earlier run took.
+const COHERENT_HEADROOM: usize = 256 << 20;
 
 fn coherent_read(name: &str) -> Option<usize> {
     std::fs::read_to_string(coherent_file(name)).ok().and_then(|s| s.trim().parse::<usize>().ok()).filter(|&b| b > 0)
@@ -821,6 +844,11 @@ impl Uma {
     }
 }
 
+/// The title's graphics memory if it has been made (`get` makes it).
+pub fn made() -> Option<&'static Uma> {
+    GLOBAL.get().and_then(|u| u.as_ref())
+}
+
 /// The title's graphics memory (created on first use; `XCL_UMA_MB`, default 2048).
 pub fn get() -> Option<&'static Uma> {
     GLOBAL
@@ -855,12 +883,36 @@ mod tests {
         const MIB: usize = 1 << 20;
         // a title that asked for 4582 MB in all and held 3033 MB at once
         assert_eq!(coherent_bytes(None, Some(4582 * MIB)), MAX_SIZE);
-        assert_eq!(coherent_bytes(Some(3033 * MIB), Some(4582 * MIB)), 3545 * MIB);
+        assert_eq!(coherent_bytes(Some(3033 * MIB), Some(4582 * MIB)), 3289 * MIB);
         // XCL's own share at least, a window at most
         assert_eq!(coherent_bytes(None, None), RUNTIME_COMMITTED_CAP);
-        assert_eq!(coherent_bytes(Some(64 * MIB), None), 576 * MIB);
-        assert_eq!(coherent_bytes(Some(3700 * MIB), None), MAX_SIZE);
+        assert_eq!(coherent_bytes(Some(64 * MIB), None), RUNTIME_COMMITTED_CAP);
+        assert_eq!(coherent_bytes(Some(400 * MIB), None), 656 * MIB);
+        assert_eq!(coherent_bytes(Some(3900 * MIB), None), MAX_SIZE);
         assert_eq!(coherent_bytes(Some(usize::MAX), Some(1)), MAX_SIZE);
+    }
+
+    /// The window is non-local video memory in full; before D3D12 has opened it (and without
+    /// one) nothing of non-local is its.
+    #[test]
+    fn non_local_video_memory_is_the_window_first() {
+        const MIB: u64 = 1 << 20;
+        assert_eq!(non_local_split(4291 * MIB, 3552 * MIB), (3552 * MIB, 739 * MIB));
+        assert_eq!(non_local_split(0, 3552 * MIB), (0, 0));
+        assert_eq!(non_local_split(23 * MIB, 0), (0, 23 * MIB));
+    }
+
+    /// XCL's pool counts as in use from the start; what it handed out is known apart.
+    #[test]
+    fn the_pool_reports_what_it_handed_out() {
+        let u = Uma::with_windows(1, 64 << 20).unwrap();
+        assert_eq!(u.pool_bytes(), (0, 0));
+        u.reserve_pool(4 * ARENA_BLOCK);
+        assert_eq!(u.pool_bytes(), (4 * ARENA_BLOCK, 0));
+        let mut arena = Arena::default();
+        let mut blocks = Vec::new();
+        arena.take(&u, 64, 16, &mut blocks).unwrap();
+        assert_eq!(u.pool_bytes(), (4 * ARENA_BLOCK, ARENA_BLOCK));
     }
 
     /// `peak` is the most that was handed out at once, whatever was freed since.
