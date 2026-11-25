@@ -69,7 +69,58 @@ const GPU_WAIT_WATCHDOG_TIMEOUT: Duration = Duration::from_millis(5000);
 /// written yet.
 fn gpu_wait_watchdog_timeout() -> Duration {
     static T: OnceLock<Duration> = OnceLock::new();
-    *T.get_or_init(|| release_after(std::env::var("XCL_GPU_WAIT_RELEASE_MS").ok().as_deref()))
+    *T.get_or_init(|| gpu_wait_watch().unwrap_or_else(|| release_after(std::env::var("XCL_GPU_WAIT_RELEASE_MS").ok().as_deref())))
+}
+
+/// `XCL_GPU_WAIT_WATCH_MS=<ms>` (a run that asks whether the GPU is stuck or slow): a GPU wait is
+/// given that long, and from the age at which a run without it gives up
+/// (`GPU_WAIT_WATCHDOG_TIMEOUT`) the ops the GPU completes are logged every second
+/// (`watch_gpu_waits`). A value no longer than that timeout is none.
+fn gpu_wait_watch() -> Option<Duration> {
+    static T: OnceLock<Option<Duration>> = OnceLock::new();
+    *T.get_or_init(|| watch_for(std::env::var("XCL_GPU_WAIT_WATCH_MS").ok().as_deref()))
+}
+
+fn watch_for(ms: Option<&str>) -> Option<Duration> {
+    ms.and_then(|v| v.trim().parse::<u64>().ok()).map(Duration::from_millis).filter(|&d| d > GPU_WAIT_WATCHDOG_TIMEOUT)
+}
+
+/// `XCL_GPU_WAIT_WATCH_MS`: `oldest` is the age of the oldest GPU wait still armed. Once one is
+/// as old as `GPU_WAIT_WATCHDOG_TIMEOUT` the state is logged as at a stop (`markers::snapshot`:
+/// the ops the GPU is in and what they were given), then every second the ops and recordings the
+/// GPU completed since (`markers::frontier`) – until no wait is that old any more (the GPU was
+/// slow, not stuck) or one is `most` old (the stop or release of any run).
+fn watch_gpu_waits(oldest: Duration, most: Duration) {
+    // (since when a wait is that old, the last line)
+    static WATCH: Mutex<Option<(Instant, Instant)>> = Mutex::new(None);
+    let mut w = WATCH.lock().unwrap();
+    if oldest < GPU_WAIT_WATCHDOG_TIMEOUT {
+        if let Some((since, _)) = w.take() {
+            crate::xlog_error!(
+                "D3D12.X: GPU wait watch: no GPU wait is {} ms old any more, {:.1} s after the first was – the GPU was slow, not stuck; {}",
+                GPU_WAIT_WATCHDOG_TIMEOUT.as_millis(),
+                since.elapsed().as_secs_f64(),
+                super::markers::frontier().join(" | ")
+            );
+        }
+        return;
+    }
+    let Some((since, last)) = w.as_mut() else {
+        *w = Some((Instant::now(), Instant::now()));
+        drop(w);
+        crate::xlog_error!(
+            "D3D12.X: GPU wait watch: a GPU wait is {} ms old – a run without XCL_GPU_WAIT_WATCH_MS gives up here; this one waits up to {} ms and logs every second what the GPU completes",
+            oldest.as_millis(),
+            most.as_millis()
+        );
+        super::markers::snapshot("a GPU wait as old as the watchdog timeout, watched on");
+        crate::xlog_error!("D3D12.X: GPU wait watch +0 s: {}", super::markers::frontier().join(" | "));
+        return;
+    };
+    if last.elapsed() >= Duration::from_secs(1) {
+        *last = Instant::now();
+        crate::xlog_error!("D3D12.X: GPU wait watch +{:.0} s (the oldest wait {} ms): {}", since.elapsed().as_secs_f64(), oldest.as_millis(), super::markers::frontier().join(" | "));
+    }
 }
 
 fn release_after(ms: Option<&str>) -> Duration {
@@ -1460,10 +1511,14 @@ fn wake_sync_watchdog() {
             let (lock, cv) = SYNC_WATCHDOG_WAKE.get().unwrap();
             let guard = lock.lock().unwrap();
             if ARMED_GPU_WAITS.load(Ordering::Acquire) == 0 {
+                if let Some(most) = gpu_wait_watch() {
+                    watch_gpu_waits(Duration::ZERO, most);
+                }
                 let _g = cv.wait(guard).unwrap();
                 continue;
             }
             let _ = cv.wait_timeout(guard, Duration::from_millis(50)).unwrap();
+            let mut oldest = Duration::ZERO;
             let (expired, rewinds, producers) = {
                 let mut g = SYNC_GRAPH.lock().unwrap();
                 let mut out: Vec<(u64, u64, ID3D12Fence, usize, i32, Option<usize>, Option<i32>, u64, u64, u64)> = Vec::new();
@@ -1488,6 +1543,7 @@ fn wake_sync_watchdog() {
                         if cell.armed_waits.is_empty() {
                             continue;
                         }
+                        oldest = cell.armed_waits.iter().map(|aw| aw.armed_at.elapsed()).fold(oldest, Duration::max);
                         let mut max_exp = 0u64;
                         let mut waiter_q = 0usize;
                         let mut waiter_ty = -1i32;
@@ -1532,6 +1588,9 @@ fn wake_sync_watchdog() {
                 }
                 (out, rew, producers)
             };
+            if let Some(most) = gpu_wait_watch() {
+                watch_gpu_waits(oldest, most);
+            }
             if !expired.is_empty() && !wait_release() {
                 let lines: Vec<String> = expired
                     .iter()
@@ -4178,6 +4237,16 @@ mod tests {
         assert_eq!(release_after(Some(" 750 ")), Duration::from_millis(750));
         assert_eq!(release_after(Some("0")), GPU_WAIT_WATCHDOG_TIMEOUT, "0 keeps the default");
         assert_eq!(release_after(Some("soon")), GPU_WAIT_WATCHDOG_TIMEOUT);
+    }
+
+    /// `XCL_GPU_WAIT_WATCH_MS` is a watch only when it gives a GPU wait longer than the default.
+    #[test]
+    fn a_gpu_wait_is_watched_only_for_longer_than_the_default() {
+        assert_eq!(watch_for(None), None);
+        assert_eq!(watch_for(Some(" 60000 ")), Some(Duration::from_secs(60)));
+        assert_eq!(watch_for(Some("5000")), None, "no longer than the default: nothing to watch");
+        assert_eq!(watch_for(Some("0")), None);
+        assert_eq!(watch_for(Some("long")), None);
     }
 
     static RESET_TEST_HR: AtomicU32 = AtomicU32::new(0);

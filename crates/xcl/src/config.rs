@@ -199,11 +199,13 @@ const HEADER: &str = "# XCL – title configuration. Created automatically; you 
 # aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
 # stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
 
-/// What XSystemGetConsoleId returns on a PC and in RETAIL (the default sandbox): the console id
-/// format, 38 characters, which titles size their buffer for (XSystemConsoleIdBytes).
-pub const CONSOLE_ID: &str = "00000000.00000000.00000000.00000000.00";
-/// The default before: 41 characters, too long for that buffer.
-const OLD_CONSOLE_ID: &str = "XCL00000000000000000000000000000000000001";
+/// What XSystemGetConsoleId returns: a made-up id in the console id format, 38 characters
+/// (four groups of 8 hex digits and one of 2), which titles size their buffer for
+/// (XSystemConsoleIdBytes, 39 with the terminator). No group is zero: a title may take the id
+/// for a number.
+pub const CONSOLE_ID: &str = "F4000001.58434C01.58434C02.58434C03.A5";
+/// The defaults before: 41 characters, too long for that buffer, and an id of zeros only.
+const OLD_CONSOLE_IDS: [&str; 2] = ["XCL00000000000000000000000000000000000001", "00000000.00000000.00000000.00000000.00"];
 
 impl Config {
     pub fn load_or_create(path: &Path) -> Result<Config, String> {
@@ -215,7 +217,7 @@ impl Config {
                     c.mounts.entry(k).or_insert(v);
                 }
                 // the old default console id, written into every xcl.toml created before
-                if c.console_id == OLD_CONSOLE_ID {
+                if OLD_CONSOLE_IDS.contains(&c.console_id.as_str()) {
                     c.console_id = CONSOLE_ID.into();
                 }
                 Ok(c)
@@ -315,9 +317,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("xcl_cfg_console_id_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("xcl.toml");
-        // an xcl.toml written with the old default gets the new one; a user's own id is kept
-        std::fs::write(&path, format!("console_id = \"{OLD_CONSOLE_ID}\"\n")).unwrap();
-        assert_eq!(Config::load_or_create(&path).unwrap().console_id, CONSOLE_ID);
+        // five groups of hex digits, none of them zero
+        let groups: Vec<&str> = CONSOLE_ID.split('.').collect();
+        assert_eq!(groups.iter().map(|g| g.len()).collect::<Vec<_>>(), [8, 8, 8, 8, 2]);
+        assert!(groups.iter().all(|g| u32::from_str_radix(g, 16).is_ok_and(|v| v != 0) && !g.contains(|c: char| c.is_ascii_lowercase())));
+        // an xcl.toml written with an old default gets the new one; a user's own id is kept
+        for old in OLD_CONSOLE_IDS {
+            std::fs::write(&path, format!("console_id = \"{old}\"\n")).unwrap();
+            assert_eq!(Config::load_or_create(&path).unwrap().console_id, CONSOLE_ID);
+        }
         std::fs::write(&path, "console_id = \"12345678.12345678.12345678.12345678.12\"\n").unwrap();
         assert_eq!(Config::load_or_create(&path).unwrap().console_id, "12345678.12345678.12345678.12345678.12");
         let _ = std::fs::remove_dir_all(&dir);

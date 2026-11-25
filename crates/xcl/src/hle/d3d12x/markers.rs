@@ -254,6 +254,7 @@ pub(super) fn snapshot(why: &str) {
     });
     crate::xlog_error!("GPU snapshot: XCL's own fences on each queue ({}): {}", waits.len(), if waits.is_empty() { "none".into() } else { waits.join("; ") });
     super::indirect::log_captures(true);
+    crate::xlog_error!("GPU snapshot: {}", super::bind::mesh_counts());
     for line in super::bind::trips(24) {
         crate::xlog_error!("GPU snapshot: {line}");
     }
@@ -309,6 +310,77 @@ fn state(done: u32, started: u32, reached: u32, total: u32) -> String {
         s.push(format!("op {} not reached{}", started + 1, if started == done { format!(" (the GPU is between op {done} and op {}, in commands that carry no marker, or its queue is not running)", done + 1) } else { String::new() }));
     }
     s.join("; ")
+}
+
+/// A recording the GPU has not completed, as `frontier` finds it.
+struct Begun {
+    queue: usize,
+    submission: u64,
+    slot: usize,
+    generation: u32,
+    /// ops completed, started, the op reached (`progress`)
+    at: (u32, u32, u32),
+    total: u32,
+    /// the op the GPU is in, or would begin next
+    op: String,
+}
+
+/// `frontier` in words: a line for each recording the GPU has begun – its ops completed, with
+/// those completed since `was` (slot → generation, ops completed, ops in all), and where it is
+/// now –, the recordings completed since, and how many the GPU has not begun.
+fn frontier_lines(open: &[Begun], was: &HashMap<usize, (u32, u32, u32)>) -> Vec<String> {
+    let mut lines: Vec<String> = open
+        .iter()
+        .filter(|b| b.at.2 > 0)
+        .map(|b| {
+            let (done, started, reached) = b.at;
+            let since = match was.get(&b.slot) {
+                Some(&(generation, d, _)) if generation == b.generation && done > d => format!(" (op{} completed since)", if done == d + 1 { format!(" {done}") } else { format!("s {}-{done}", d + 1) }),
+                Some(&(generation, _, _)) if generation == b.generation => String::new(),
+                _ => " (new)".into(),
+            };
+            format!("q{} submission {} slot {}: {done} of {} ops completed{since}; {}; {}", b.queue, b.submission, b.slot, b.total, state(done, started, reached, b.total), b.op)
+        })
+        .collect();
+    let mut gone: Vec<(usize, String)> = was
+        .iter()
+        .filter(|(slot, (generation, _, _))| !open.iter().any(|b| b.slot == **slot && b.generation == *generation))
+        .map(|(slot, (_, done, total))| (*slot, format!("slot {slot} (its ops {}-{total})", done + 1)))
+        .collect();
+    gone.sort();
+    if !gone.is_empty() {
+        lines.push(format!("recordings completed since: {}", gone.into_iter().map(|g| g.1).collect::<Vec<_>>().join(", ")));
+    }
+    lines.push(format!("{} submitted recordings not begun", open.iter().filter(|b| b.at.2 == 0).count()));
+    lines
+}
+
+/// (`list_x::watch_gpu_waits`) Where the GPU is in the recordings it has not completed, and what
+/// it completed since the call before (`frontier_lines`): called every second while a GPU wait
+/// is watched, the log's times say when each op and recording was done.
+pub(super) fn frontier() -> Vec<String> {
+    static BEFORE: Mutex<Option<HashMap<usize, (u32, u32, u32)>>> = Mutex::new(None);
+    let g = MARKERS.lock().unwrap();
+    let Some(m) = g.as_ref() else { return vec!["no GPU markers (XCL_GPU_MARKERS=1)".into()] };
+    let mut open = Vec::new();
+    for (slot, r) in m.slots.iter().enumerate() {
+        let Some(r) = r else { continue };
+        let Some(&(q, submission, _)) = r.submissions.last() else { continue };
+        let total = (r.ops.len() as u32).min(OP_MASK);
+        let words = m.words(slot, r.generation);
+        if words[1] == Some(total) || total == 0 {
+            continue;
+        }
+        let at = progress(words.map(|word| word.map(|n| n.min(total))));
+        let k = at.2.max(at.0 + 1);
+        let op = r.ops.get(k as usize - 1).map_or(format!("op {k} (none)"), |o| format!("op {k} {} with {}", o.kind, pipeline(o.title_pso)));
+        open.push(Begun { queue: super::list_x::queue_id(q), submission, slot, generation: r.generation, at, total, op });
+    }
+    open.sort_by_key(|b| (b.queue, b.submission, b.slot));
+    let mut before = BEFORE.lock().unwrap();
+    let lines = frontier_lines(&open, before.as_ref().unwrap_or(&HashMap::new()));
+    *before = Some(open.iter().map(|b| (b.slot, (b.generation, b.at.0, b.total))).collect());
+    lines
 }
 
 /// The first GPU wait that timed out: every submitted recording that has not completed, by
@@ -404,13 +476,21 @@ pub(super) fn dump() -> Vec<String> {
         let r = m.slots[o.slot].as_ref().unwrap();
         for op in o.at.0 as usize..r.ops.len().min(o.at.2 as usize + 1) {
             let p = r.ops[op];
-            if p.kind == "dispatch" || p.kind == "ExecuteIndirect(dispatch)" {
+            let dispatch = p.kind == "dispatch" || p.kind == "ExecuteIndirect(dispatch)";
+            if dispatch {
                 for line in super::bind::describe_dispatch(o.slot, o.generation, op) {
                     crate::xlog_error!("GPU markers: slot {} op {}: {line}", o.slot, op + 1);
                 }
             } else {
                 let trips = super::bind::trips_of_draws(p.title_pso).map_or("not watched".into(), |t| format!("{t} gave up"));
                 crate::xlog_error!("GPU markers: slot {} op {}: {} with {}; guard tripwire now, in all draws of the pipeline so far: {trips}", o.slot, op + 1, p.kind, pipeline(p.title_pso));
+            }
+            // what the first of them were given, in full: every root argument and what is
+            // behind it now (`hang`)
+            if described.len() < super::hang::OPS {
+                for line in super::hang::describe(o.slot, o.generation, op, dispatch) {
+                    crate::xlog_error!("GPU markers: slot {} op {}: {line}", o.slot, op + 1);
+                }
             }
             described.push((o.slot, op));
         }
@@ -467,6 +547,32 @@ mod tests {
         // all done but the last marker's completion: nothing more to reach
         let last = at(Some(42), Some(41), Some(42));
         assert!(last.contains("op 42 STARTED AND NOT COMPLETED") && !last.contains("not reached"), "{last}");
+    }
+
+    /// The frontier of a watched GPU wait names the ops a begun recording completed since the
+    /// line before, the recordings completed since, and counts those not begun.
+    #[test]
+    fn the_frontier_says_what_the_gpu_completed_since_the_line_before() {
+        let begun = |slot: usize, generation: u32, at: (u32, u32, u32), total: u32| Begun { queue: 1, submission: 20860, slot, generation, at, total, op: format!("op {} dispatch", at.2.max(at.0 + 1)) };
+        // the first line: the recording the GPU is in, and one it has not begun
+        let open = [begun(677, 3, (6, 6, 7), 18), begun(679, 1, (0, 0, 0), 294)];
+        let first = frontier_lines(&open, &HashMap::new());
+        assert_eq!(first.len(), 2, "{first:?}");
+        assert!(first[0].starts_with("q1 submission 20860 slot 677: 6 of 18 ops completed (new); the GPU IS INSIDE op 7") && first[0].ends_with("op 7 dispatch"), "{}", first[0]);
+        assert_eq!(first[1], "1 submitted recordings not begun");
+        let was: HashMap<usize, (u32, u32, u32)> = open.iter().map(|b| (b.slot, (b.generation, b.at.0, b.total))).collect();
+        // nothing moved: the same place, nothing completed
+        let still = frontier_lines(&open, &was);
+        assert!(still[0].starts_with("q1 submission 20860 slot 677: 6 of 18 ops completed; the GPU IS INSIDE op 7"), "{}", still[0]);
+        // ops 7 to 9 done; then the recording done, the next one begun and its slot's old tenant not taken for it
+        let moved = frontier_lines(&[begun(677, 3, (9, 9, 10), 18), begun(679, 1, (0, 0, 0), 294)], &was);
+        assert!(moved[0].contains("9 of 18 ops completed (ops 7-9 completed since)"), "{}", moved[0]);
+        let one = frontier_lines(&[begun(677, 3, (7, 7, 7), 18)], &was);
+        assert!(one[0].contains("7 of 18 ops completed (op 7 completed since)"), "{}", one[0]);
+        let next = frontier_lines(&[begun(679, 1, (0, 0, 1), 294), begun(677, 4, (0, 0, 0), 5)], &was);
+        assert!(next[0].starts_with("q1 submission 20860 slot 679: 0 of 294 ops completed; the GPU IS INSIDE op 1"), "{}", next[0]);
+        assert_eq!(next[1], "recordings completed since: slot 677 (its ops 7-18)");
+        assert_eq!(next[2], "1 submitted recordings not begun");
     }
 
     /// Markers after each op of a recording that ran show all of them started and completed, so

@@ -782,6 +782,7 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         }
         for &t in &targets {
             std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (t + page_off) as *mut u8, chunk);
+            crate::eh::note_guest_write("physical page write", t + page_off, chunk);
         }
         // every address showing the page: the textures there are uploaded again
         for &a in g.places(p) {

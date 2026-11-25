@@ -241,7 +241,10 @@ pub unsafe extern "system" fn XSystemGetDeviceType() -> u32 {
 }
 
 pub unsafe extern "system" fn XSystemGetConsoleId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
-    write_cstr_out(&crate::state::config().console_id, buf, size, used)
+    let id = &crate::state::config().console_id;
+    let hr = write_cstr_out(id, buf, size, used);
+    crate::xlog_info!("XSystemGetConsoleId: a buffer of {size} bytes at {buf:p}, the size used to {used:p}: {} bytes written ({hr:#x})", if hr == S_OK { id.len() + 1 } else { 0 });
+    hr
 }
 
 pub unsafe extern "system" fn XSystemGetXboxLiveSandboxId(size: usize, buf: *mut u8, used: *mut usize) -> HRESULT {
@@ -1088,7 +1091,7 @@ mod tests {
             let mut id = [0u8; 39];
             let mut used = 0usize;
             assert_eq!(XSystemGetConsoleId(39, id.as_mut_ptr(), &mut used), S_OK);
-            assert_eq!(&id[..used - 1], b"00000000.00000000.00000000.00000000.00");
+            assert_eq!(&id[..used - 1], crate::config::CONSOLE_ID.as_bytes());
             assert_eq!(XSystemGetDeviceType(), DEVICE_XBOX_SCARLETT_ANACONDA);
             let info = XSystemGetAnalyticsInfo();
             assert!(info.os_version.major >= 10);

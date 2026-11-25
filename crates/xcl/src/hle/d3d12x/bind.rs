@@ -520,6 +520,12 @@ fn reach(this: *mut c_void) {
 fn mark(this: *mut c_void, kind: &'static str) {
     if super::markers::enabled() {
         unsafe { super::markers::after_op(this, kind, with(this, |s| s.pso)) }
+        // (a dispatch's arguments are kept with what they bound: `note_dispatch_snapshot`)
+        if kind != "dispatch" && kind != "ExecuteIndirect(dispatch)" {
+            if let Some((layout, args)) = with(this, |s| s.layout_gfx.clone().map(|l| (l, s.args_gfx.clone()))) {
+                super::hang::note_graphics_op(this as usize, layout, args);
+            }
+        }
     }
 }
 
@@ -944,6 +950,14 @@ fn mesh_skipped(this: *mut c_void, pso: usize, what: &str, why: &str) {
     }
 }
 
+/// The mesh pipelines made so far and the mesh calls run, native (as host mesh shaders) and
+/// two-pass: a line of its own every 30 s, in the GPU snapshot and at the end.
+pub fn mesh_counts() -> String {
+    let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
+    let (native, two_pass) = super::real::mesh_pipeline_counts();
+    format!("mesh pipelines: {native} native, {two_pass} two-pass; mesh calls: {} native, {} two-pass, {} skipped", c(MESH_NATIVE), c(MESH_TWO_PASS), c(MESH_SKIPPED))
+}
+
 /// The indirect calls so far by type and how mesh calls ran, for the 30 s line.
 pub fn indirect_calls() -> String {
     let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
@@ -1194,6 +1208,13 @@ unsafe fn two_pass_indirect(
     Ok(())
 }
 
+/// (`XCL_GPU_MARKERS`) The root arguments of the dispatch that is op `op` (from 0) of the
+/// recording at marker `slot` / `generation`, as they were bound (`hang::describe`).
+pub(super) fn dispatch_args(slot: usize, generation: u32, op: usize) -> Option<(Arc<Layout>, Vec<u8>)> {
+    let d = DISPATCH_BINDINGS.lock().unwrap();
+    d.iter().rev().find(|b| b.at == Some((slot, generation, op))).map(|b| (b.layout.clone(), b.args.clone()))
+}
+
 /// (`XCL_GPU_MARKERS`) A translated dispatch as it was bound.
 struct BoundDispatch {
     title_pso: usize,
@@ -1215,7 +1236,7 @@ struct BoundImage {
     param: usize,
     slot: u32,
     srv: u32,
-    resource: usize,
+    resource: Option<usize>,
     view: crate::gpu::desc::Image,
 }
 
@@ -1233,6 +1254,33 @@ fn span(size: u64) -> u64 {
     } else {
         size
     }
+}
+
+fn marker_buffer_probes() -> &'static [(usize, u32, u32)] {
+    static PROBES: std::sync::OnceLock<Vec<(usize, u32, u32)>> = std::sync::OnceLock::new();
+    PROBES.get_or_init(|| {
+        let parse = |s: &str| {
+            let s = s.trim();
+            match s.strip_prefix("0x") {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => s.parse().ok(),
+            }
+        };
+        std::env::var("XCL_GPU_MARKER_BUFFER").unwrap_or_default().split(',').filter_map(|entry| {
+            let [param, slot, offset]: [&str; 3] = entry.split(':').collect::<Vec<_>>().try_into().ok()?;
+            Some((parse(param)? as usize, parse(slot)?, parse(offset)?))
+        }).collect()
+    })
+}
+
+fn buffer_dword_address(words: &[u32; 8], offset: u32) -> Option<u64> {
+    if words[3] >> 30 != 0 {
+        return None;
+    }
+    let desc = crate::gpu::desc::buffer(words[..4].try_into().unwrap());
+    let bytes = desc.num_records.saturating_mul(desc.stride.max(1));
+    (desc.address != 0 && offset.checked_add(4).is_some_and(|end| end <= bytes))
+        .then(|| (desc.address + offset as u64) & !3)
 }
 
 fn note_dispatch_binding(this: *mut c_void, title_pso: usize, groups: Option<[u32; 3]>) {
@@ -1294,14 +1342,33 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
             Param::Table { at } => format!("p{k} table at {:#x}", word(at as usize)),
         });
     }
+    for &(param, slot, offset) in marker_buffer_probes() {
+        let Some(Param::Table { at }) = b.layout.params.get(param) else { continue };
+        let label = format!("p{param} slot {slot} buffer dword +{offset:#x}");
+        let Some(words) = slot.checked_mul(32).and_then(|n| word(*at as usize).checked_add(n)).and_then(super::console_heap::words_at) else {
+            out.push(format!("{label}: descriptor unavailable"));
+            continue;
+        };
+        let value = match buffer_dword_address(&words, offset) {
+            Some(va) if crate::gpu::shader::readable(va as usize, 4) => {
+                let value = unsafe { (va as *const u32).read_unaligned() };
+                format!("at {va:#x} now {value:#x} ({value})")
+            }
+            Some(va) => format!("at {va:#x} not readable by the CPU"),
+            None => "not an in-bounds buffer dword".into(),
+        };
+        out.push(format!("{label}: descriptor {}; {value}", hex(&words)));
+    }
     if let Some(t) = TRIPS.lock().unwrap().as_ref().filter(|t| !t.pieces.is_empty()) {
         if let Some(i) = (0..TRIP_RING).find(|&i| t.slots[i].0 != 0 && t.slots[i].1 == b.at) {
             out.push(format!("guard tripwire now: {} gave up", trip_text(&t.words(i).map(|w| w as u64))));
+            out.extend(t.loop_lines(i));
         }
     }
     for BoundImage { table, param, slot, srv, resource, view } in &b.images {
+        let owner = resource.map_or_else(|| "owner untracked".into(), |r| format!("resource {r:#x}"));
         out.push(format!(
-            "p{param} table {table:#x} slot {slot} image {:?} {}x{}x{}, GFX10 format {}, {} view mips, SRV index {srv}, companion UAV index {}, resource {resource:#x}",
+            "p{param} table {table:#x} slot {slot} image {:?} {}x{}x{}, GFX10 format {}, {} view mips, SRV index {srv}, companion UAV index {}, {owner}",
             view.ty, view.width, view.height, view.depth, view.format, view.last_level + 1, srv.saturating_add(1)
         ));
     }
@@ -1326,6 +1393,7 @@ pub(super) fn describe_dispatch(slot: usize, generation: u32, op: usize) -> Vec<
 struct Trips {
     /// the counters' memory: pieces of `TRIP_PIECE` slots (no memory: no tripwire)
     pieces: Vec<usize>,
+    stride: usize,
     /// per slot: the title pipeline it counts for, the place in its recording (dispatches),
     /// and the counts already added to `totals`
     slots: Vec<(usize, Option<(usize, u32, usize)>, [u32; 4])>,
@@ -1356,16 +1424,33 @@ fn trip_text(c: &[u64; 4]) -> String {
 
 impl Trips {
     fn over(pieces: Vec<usize>) -> Trips {
-        Trips { pieces, slots: vec![(0, None, [0; 4]); TRIP_RING + TRIP_GFX], next: 0, gfx: HashMap::new(), totals: HashMap::new(), told: 0, pending: Vec::new() }
+        Trips { pieces, stride: 16, slots: vec![(0, None, [0; 4]); TRIP_RING + TRIP_GFX], next: 0, gfx: HashMap::new(), totals: HashMap::new(), told: 0, pending: Vec::new() }
     }
 
     /// where slot `i`'s four words are
     fn at(&self, i: usize) -> usize {
-        self.pieces[i / TRIP_PIECE] + 16 * (i % TRIP_PIECE)
+        self.pieces[i / TRIP_PIECE] + self.stride * (i % TRIP_PIECE)
     }
 
     fn words(&self, i: usize) -> [u32; 4] {
         std::array::from_fn(|k| unsafe { std::ptr::read_volatile((self.at(i) + 4 * k) as *const u32) })
+    }
+
+    fn loop_lines(&self, i: usize) -> Vec<String> {
+        use crate::gpu::recomp::{LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
+        if self.stride == 16 || i >= TRIP_RING {
+            return Vec::new();
+        }
+        (0..LOOP_PROFILE_SITES).filter_map(|site| {
+            let base = self.at(i) + 16 + site * LOOP_PROFILE_WORDS * 4;
+            let [pc, peak_seen, max, low, high, lanes, early, bound, budget, cap] =
+                std::array::from_fn(|offset| unsafe { ((base + offset * 4) as *const u32).read_volatile() });
+            let pc = pc.checked_sub(1)?;
+            let total = ((high as u64) << 32) | low as u64;
+            let avg = if lanes == 0 { "none finished".to_string() } else { format!("{:.2}", total as f64 / lanes as f64) };
+            let natural_unknown = lanes.saturating_sub(early.saturating_add(bound).saturating_add(budget).saturating_add(cap));
+            Some(format!("loop profile +{pc:#x}: avg {avg}, max completed {max}, live milestone {peak_seen}; completed lane visits {lanes}, below static estimate {early}, reached static estimate {bound}, natural unclassified {natural_unknown}, shared budget {budget}, static cap {cap}"))
+        }).collect()
     }
 
     /// What slot `i` counted since it was last looked at: into the totals, and a line for the
@@ -1413,7 +1498,7 @@ impl Trips {
         let i = self.next % TRIP_RING;
         self.next += 1;
         self.harvest(i);
-        unsafe { std::ptr::write_bytes(self.at(i) as *mut u8, 0, 16) };
+        unsafe { std::ptr::write_bytes(self.at(i) as *mut u8, 0, self.stride) };
         self.slots[i] = (title_pso, at, [0; 4]);
         i
     }
@@ -1433,6 +1518,27 @@ impl Trips {
         for (p, lanes, hits) in v.into_iter().take(most) {
             out.push(format!("guard tripwire: {} in {hits} {} with {}", trip_text(&lanes), if self.gfx.contains_key(&p) { "looks at draws" } else { "dispatches" }, super::markers::pipeline(p)));
         }
+        if self.stride != 16 {
+            let mut profiled = std::collections::HashSet::new();
+            for seq in (self.next.saturating_sub(TRIP_RING)..self.next).rev() {
+                let i = seq % TRIP_RING;
+                let (pso, at, _) = self.slots[i];
+                if pso == 0 || profiled.contains(&pso) {
+                    continue;
+                }
+                let lines = self.loop_lines(i);
+                if lines.is_empty() {
+                    continue;
+                }
+                profiled.insert(pso);
+                let place = at.map_or(String::new(), |(s, _, op)| format!(" (op {} of slot {s})", op + 1));
+                let shader = super::markers::pipeline(pso);
+                out.extend(lines.into_iter().map(|line| format!("{shader}{place}: {line}")));
+                if profiled.len() == most {
+                    break;
+                }
+            }
+        }
         out
     }
 }
@@ -1448,10 +1554,13 @@ pub(super) fn trip_watch(list: *mut c_void, title_pso: usize, gfx: bool) -> (u32
         // from XCL's own pool, as the lists' argument tables are (the coherent window, which
         // the CPU reads; the title holds the rest of it)
         let (mut arena, mut blocks) = (crate::gpu::uma::Arena::default(), Vec::new());
+        let stride = 16 + if crate::gpu::recomp::loop_profile_enabled() {
+            crate::gpu::recomp::LOOP_PROFILE_SITES * crate::gpu::recomp::LOOP_PROFILE_WORDS * 4
+        } else { 0 };
         let pieces: Option<Vec<usize>> = (0..(TRIP_RING + TRIP_GFX) / TRIP_PIECE)
             .map(|_| {
-                let p = arena.take(u, 16 * TRIP_PIECE, 16, &mut blocks).filter(|&p| u.is_committed(p as usize))?;
-                unsafe { std::ptr::write_bytes(p, 0, 16 * TRIP_PIECE) };
+                let p = arena.take(u, stride * TRIP_PIECE, 16, &mut blocks).filter(|&p| u.is_committed(p as usize))?;
+                unsafe { std::ptr::write_bytes(p, 0, stride * TRIP_PIECE) };
                 Some(p as usize)
             })
             .collect();
@@ -1459,7 +1568,9 @@ pub(super) fn trip_watch(list: *mut c_void, title_pso: usize, gfx: bool) -> (u32
             Some(p) => crate::xlog_info!("guard tripwire: counters for {TRIP_RING} dispatches and {TRIP_GFX} graphics pipelines, the first at {:#x}", p[0]),
             None => crate::xlog_warn!("guard tripwire: no room in committed unified memory for its counters – off"),
         }
-        Trips::over(pieces.unwrap_or_default())
+        let mut trips = Trips::over(pieces.unwrap_or_default());
+        trips.stride = stride;
+        trips
     });
     if t.pieces.is_empty() {
         return (0, 0);
@@ -1568,7 +1679,7 @@ fn bound_resources(
                     if w[3] >> 30 != 0 {
                         if let Some(images) = images.as_deref_mut() {
                             if let Some(view) = crate::gpu::desc::image(&w) {
-                                images.push(BoundImage { table: t, param: i, slot: k, srv: w[0], resource: resource(), view });
+                                images.push(BoundImage { table: t, param: i, slot: k, srv: w[0], resource: super::console_heap::image_resource_at(addr, w[0]), view });
                             }
                         }
                         continue;
@@ -1945,6 +2056,18 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[test]
+    fn marker_buffer_probe_checks_descriptor_type_and_bounds() {
+        let mut words = [0; 8];
+        words[..4].copy_from_slice(&crate::gpu::desc::cbv_words(0x7_1234_0000, 0x100));
+        assert_eq!(buffer_dword_address(&words, 0xfc), Some(0x7_1234_00fc));
+        assert_eq!(buffer_dword_address(&words, 0x100), None);
+        assert_eq!(buffer_dword_address(&words, u32::MAX), None);
+        assert_eq!(buffer_dword_address(&[0; 8], 0), None);
+        let image = crate::gpu::desc::xcl_image_for_view(1, 22, crate::gpu::desc::ImageType::D3, 4, 4, 4, 1);
+        assert_eq!(buffer_dword_address(&image, 0), None);
+    }
+
     /// A pipeline with the rect list GS draws its rect lists whole: draw_rects leaves them alone.
     #[test]
     fn rect_lists_with_the_rect_list_gs_are_not_expanded_on_the_cpu() {
@@ -2121,7 +2244,7 @@ mod tests {
                 param: 1,
                 slot: 5,
                 srv: 10,
-                resource: 0x1234,
+                resource: Some(0x1234),
                 view: crate::gpu::desc::image(&crate::gpu::desc::xcl_image_for_view(10, 22, crate::gpu::desc::ImageType::D3, 8, 4, 2, 1)).unwrap(),
             }],
             io: (vec![0x5000, 7, 0, 0, 0xDEAD_BEEF, 0, 0, 0], Some(8), 16),

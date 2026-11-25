@@ -41,7 +41,7 @@ resources.pri
 gpu.csv
 report.json
 report.prev.json
-frame_*.bmp
+*.bmp
 *.dxbc
 *.dxil
 /cache/
@@ -53,9 +53,14 @@ bcpack-tables.bin
 *.gz
 *.zip
 *.orig
+*.rej
 .env
 .env.*
 /depth-uav-probe/agility/
+/depth-uav-probe/retail/
+/depth-uav-probe/warp/
+/depth-uav-warp/
+/debugger-python/
 *.obj
 
 # Python bytecode of the scripts

@@ -386,7 +386,10 @@ unsafe fn open_uma(device: &ID3D12Device) {
         w0_va
     );
     match open_mem_views(device, &bufs) {
-        Ok(first) => *MEM_VIEWS.lock().unwrap() = Some(first),
+        Ok(first) => {
+            crate::xlog_info!("D3D12.X: the memory windows' raw views are descriptors {first}..{} of the shared heap, the null view {}", first + crate::gpu::recomp::MEM_NULL_VIEW, first + crate::gpu::recomp::MEM_NULL_VIEW);
+            *MEM_VIEWS.lock().unwrap() = Some(first);
+        }
         Err(e) => crate::xlog_error!("D3D12.X: translated shaders have no memory: {e}"),
     }
     *UMA_HEAPS.lock().unwrap() = heaps;
@@ -3831,9 +3834,11 @@ const BIG_DRIVER_COMPILE: usize = 256 << 10;
 /// `GIANTS_AT_ONCE` while the memory would still hold one more giant after it, and the
 /// process's private memory (with half the running peaks) within `cap` when given. A compile a
 /// draw or dispatch waits for (`waited_on`, asked again while it waits) starts at once, outside
-/// those limits, unless its peak would leave under `URGENT_FLOOR` available: then it waits for
-/// the compiles running to finish and, still too big with none running, is refused
-/// (`Refused::NoMemory`); its peak counts while it runs or waits, so the background ones hold back.
+/// those limits, while its peak leaves `URGENT_FLOOR` available. One that does not fit yet waits
+/// for memory: for the compiles running to finish, then with none running for `URGENT_PATIENCE`
+/// more (a finished compile's memory comes back late). Only one that does not fit even then is
+/// refused (`Refused::NoMemory`); its peak counts while it runs or waits, so the background ones
+/// hold back.
 struct Governor {
     state: Mutex<GovState>,
     cv: std::sync::Condvar,
@@ -3867,14 +3872,18 @@ fn keep_free() -> u64 {
 }
 /// Memory a compile a bind waits for still leaves available: one too big for it keeps its
 /// stand-in (a 27 MB program took an NVIDIA driver past 31 GB of a 32 GB PC).
-const URGENT_FLOOR: u64 = 2 << 30;
+const URGENT_FLOOR: u64 = 1 << 30;
+/// How long a compile a bind waits for goes on waiting for memory with no other compile
+/// running, before it is refused: nothing XCL runs will give memory back after that.
+const URGENT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Why `Governor::acquire` gave no slot
 #[derive(Clone, Copy, Debug)]
 enum Refused {
     /// a warm-up's compile that did not fit for 10 s with nothing else running: it never will
     TooBig,
-    /// a compile a bind waits for whose peak would leave under `URGENT_FLOOR` available
+    /// a compile a bind waits for whose peak would leave under `URGENT_FLOOR` available with
+    /// no other compile running, after `URGENT_PATIENCE`
     NoMemory,
     /// a warm-up's compile that did not fit for 10 s with nothing else running, but would in this
     /// PC's memory less `KEEP_FREE` and the warm-up's own: tried again at the end of its phase
@@ -3897,7 +3906,7 @@ fn total_physical() -> u64 {
 /// compiles a bind waited for, refused (`Refused::NoMemory`): their pipelines keep the stand-in
 static CANNOT_BUILD: AtomicU64 = AtomicU64::new(0);
 /// DXIL from which a program is a giant: at most `GIANTS_AT_ONCE` of them compile at once
-const GIANT_DXIL: usize = 1 << 20;
+pub(crate) const GIANT_DXIL: usize = 1 << 20;
 const GIANTS_AT_ONCE: usize = 3;
 /// background driver compiles at once at most; under `GIANT_DXIL` the memory left decides below that
 const SMALL_AT_ONCE: usize = 20;
@@ -3988,6 +3997,7 @@ impl Governor {
         let cost = peak(dxil_len);
         let mut s = self.state.lock().unwrap();
         let mut idle_since = None;
+        let mut alone_since: Option<std::time::Instant> = None;
         let mut starving = false;
         let urgent = loop {
             let mut spare = available_physical().saturating_sub(s.reserved / 2);
@@ -3999,10 +4009,16 @@ impl Governor {
             if wanted && spare >= cost + URGENT_FLOOR {
                 break true;
             }
+            // it does not fit yet: it waits for memory, and is refused only when no other
+            // compile has been running for `URGENT_PATIENCE` and it still does not fit
             if wanted && s.running == 0 {
-                s.starving -= starving as usize;
-                CANNOT_BUILD.fetch_add(1, Ordering::Relaxed);
-                return Err(Refused::NoMemory);
+                if alone_since.get_or_insert_with(std::time::Instant::now).elapsed() >= URGENT_PATIENCE {
+                    s.starving -= starving as usize;
+                    CANNOT_BUILD.fetch_add(1, Ordering::Relaxed);
+                    return Err(Refused::NoMemory);
+                }
+            } else {
+                alone_since = None;
             }
             if wanted != starving {
                 if wanted {
@@ -4250,10 +4266,12 @@ fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Re
         Err(Refused::NoMemory) => {
             COMPILE_FAILURES.fetch_add(1, Ordering::Relaxed);
             crate::xlog_error!(
-                "D3D12.X: cannot build within memory: {}: {dxil_len} B of DXIL, ~{} MB expected peak with {} MB available – its stand-in stays bound",
+                "D3D12.X: cannot build within memory: {}: {dxil_len} B of DXIL, ~{} MB expected peak does not fit in {} MB available less the {} MB floor, with no other compile running for {} ms – its stand-in stays bound",
                 what(),
                 peak(dxil_len) >> 20,
-                available_physical() >> 20
+                available_physical() >> 20,
+                URGENT_FLOOR >> 20,
+                URGENT_PATIENCE.as_millis()
             );
         }
         Ok(_) => {}
@@ -6587,7 +6605,7 @@ unsafe fn finish_stream(this: *mut c_void, f: PsoFn, stream: &StreamOut, blob: O
     finish_pso(this, f, desc.as_ptr().cast(), riid, ppv)
 }
 
-fn build_live_mesh_blob(path: Option<&std::path::Path>, len: usize, what: &'static str, mut create: impl FnMut(Option<&[u8]>) -> HRESULT, blob_of: impl FnOnce() -> Option<Vec<u8>>) -> Option<HRESULT> {
+fn build_live_mesh_blob(path: Option<&std::path::Path>, len: usize, what: &str, mut create: impl FnMut(Option<&[u8]>) -> HRESULT, blob_of: impl FnOnce() -> Option<Vec<u8>>) -> Option<HRESULT> {
     if super::pso_async::preparing() {
         return None;
     }
@@ -6695,7 +6713,7 @@ unsafe fn finish_two_pass(this: *mut c_void, stream: &StreamOut, tp: crate::gpu:
     }
     let compute = std::cell::Cell::new(std::ptr::null_mut());
     let hc = if kind == "MS" {
-        build_live_mesh_blob(compute_disk.as_deref(), tp.cs.len(), "MS compute pass", |blob| create_compute(blob, compute.as_ptr()), || pso_blob(compute.get()))
+        build_live_mesh_blob(compute_disk.as_deref(), tp.cs.len(), &format!("MS compute pass (DXIL {:016x})", crate::gpu::shader::fnv64(&tp.cs)), |blob| create_compute(blob, compute.as_ptr()), || pso_blob(compute.get()))
     } else {
         Some(create_compute(None, compute.as_ptr()))
     };
@@ -8095,7 +8113,12 @@ pub fn log_device_removed() {
                 };
                 let va = pf.PageFaultVA;
                 let window = uma_window_vas().iter().position(|&w| va >= w && va < w + 0x1_0000_0000).map(|k| format!(" = window {k} + {:#x}", va - uma_window_vas()[k])).unwrap_or_default();
-                crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+                // (no fault: DRED gives address 0 and names no allocation)
+                if va == 0 && pf.pHeadExistingAllocationNode.is_null() && pf.pHeadRecentFreedAllocationNode.is_null() {
+                    crate::xlog_error!("DRED: no page fault (fault address 0, no allocation named): the GPU did not stop on a bad address – a hang the watchdog ended, as a shader that never finishes is");
+                } else {
+                    crate::xlog_error!("DRED page fault at GPU VA {va:#x}{window}; allocations there: [{}]; recently freed: [{}]", names(pf.pHeadExistingAllocationNode), names(pf.pHeadRecentFreedAllocationNode));
+                }
             }
         }
         let bc = match dred.GetAutoBreadcrumbsOutput() {
@@ -9680,12 +9703,39 @@ mod governor_tests {
     }
 
     #[test]
-    fn a_waited_for_compile_too_big_for_the_memory_is_refused_at_once() {
+    fn a_waited_for_compile_too_big_for_the_memory_is_refused_only_after_waiting_alone() {
         let g = governor();
         let too_big = (available_physical() / 1536) as usize + (1 << 20);
         let t0 = std::time::Instant::now();
         assert!(matches!(g.acquire(too_big, 1, None, false, || true), Err(Refused::NoMemory)));
-        assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+        assert!(t0.elapsed() >= URGENT_PATIENCE && t0.elapsed() < URGENT_PATIENCE + std::time::Duration::from_secs(2));
+        let s = g.state.lock().unwrap();
+        assert_eq!((s.running, s.starving, s.reserved), (0, 0, 0));
+    }
+
+    /// While another compile runs, one that does not fit is queued, however long: it is
+    /// refused only once it has been alone for `URGENT_PATIENCE`.
+    #[test]
+    fn a_waited_for_compile_that_does_not_fit_waits_while_another_runs() {
+        let g = governor();
+        let running = GovGuard { cost: 0, giant: false, urgent: false, _running: crate::progress::DRIVER.begin(), _large: None };
+        g.state.lock().unwrap().running = 1;
+        let too_big = (available_physical() / 1536) as usize + (1 << 20);
+        let refused_at = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let r = g.acquire(too_big, 1, None, false, || true);
+                assert!(matches!(r, Err(Refused::NoMemory)));
+                std::time::Instant::now()
+            });
+            std::thread::sleep(URGENT_PATIENCE + std::time::Duration::from_secs(1));
+            assert!(!waiter.is_finished(), "refused while another compile ran");
+            assert_eq!(g.state.lock().unwrap().starving, 1);
+            let released = std::time::Instant::now();
+            g.release(&running);
+            waiter.join().unwrap().duration_since(released)
+        });
+        std::mem::forget(running);
+        assert!(refused_at >= URGENT_PATIENCE);
         let s = g.state.lock().unwrap();
         assert_eq!((s.running, s.starving, s.reserved), (0, 0, 0));
     }

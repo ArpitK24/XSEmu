@@ -12,6 +12,7 @@
 pub mod bind;
 mod indirect;
 mod markers;
+mod hang;
 pub mod console_heap;
 pub mod console_list;
 pub mod device_x;

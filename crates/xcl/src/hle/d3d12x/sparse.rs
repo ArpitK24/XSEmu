@@ -1102,6 +1102,7 @@ impl State {
                     at += step;
                     src_off += step;
                 }
+                crate::eh::note_guest_write("sparse readback", dst, len);
                 s.sync_sent_range(dst, len);
             }
             pending.clear();
@@ -1319,7 +1320,7 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
         let _ = s.queue.Wait(&s.rb_fence, v);
         super::markers::queue_fence(s.queue.as_raw() as usize, "sparse readback (after a title queue)", &s.rb_fence, v);
     }
-    s.readback_ranges(&merged);
+    crate::eh::with_write_context(|| format!("GPU writes of a submitted list: {} ranges, the first {:#x} + {:#x}", merged.len(), merged[0].0, merged[0].1), || s.readback_ranges(&merged));
 }
 
 /// Synchronize `[va, va + len)` in a sparse window for a CPU read (`ID3D12Resource::Map` with
@@ -1365,7 +1366,7 @@ pub unsafe fn readback_now(va: usize, len: usize) {
     if !dirty_runs.is_empty() {
         s.upload_dirty(&dirty_runs);
     }
-    s.readback_ranges(&[(va, len)]);
+    crate::eh::with_write_context(|| format!("a CPU read of {va:#x} + {len:#x} (Map)"), || s.readback_ranges(&[(va, len)]));
 }
 
 /// The title committed `[a, a + n)` in a sparse window. The pages of tiles mapped for it that

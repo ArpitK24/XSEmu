@@ -144,6 +144,38 @@ fn return_range(free: &mut Vec<(u32, u32)>, next: &mut u32, mut first: u32, coun
     }
 }
 
+/// The first descriptors of the shared heap, which no view of a title's or of XCL's is given:
+/// null image views (`null_views`). A T# of zeros – an empty console slot – has PC index 0 in
+/// its word 0, so an image shader that reads one takes descriptor 0 (SRV) and 1 (UAV) of the
+/// heap. Whatever was reserved first lay there: the memory windows' 4 GiB raw buffer UAVs, read
+/// as a texture, which hangs NVIDIA GPUs. An even count: SRV / UAV pairs.
+pub const NULL_IMAGE_VIEWS: u32 = 4;
+
+/// Null views at descriptors `0..NULL_IMAGE_VIEWS` of the shared heap (an SRV / UAV pair per
+/// console slot: even SRV, odd UAV): a shader that lands there for a T# of zeros reads zeros,
+/// and its writes go nowhere.
+unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
+    for k in 0..NULL_IMAGE_VIEWS as u64 {
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + k * inc as u64) as usize };
+        if k % 2 == 0 {
+            let d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM,
+                ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_SRV { MipLevels: 1, ..Default::default() } },
+            };
+            dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&d), at);
+        } else {
+            let d = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+                Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
+                ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+                Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 { Texture2D: D3D12_TEX2D_UAV::default() },
+            };
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&d), at);
+        }
+    }
+}
+
 /// The shared shader-visible heap, made on first use. False: there is none (it could not be
 /// made) – view heaps then keep their own.
 pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
@@ -169,7 +201,8 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
                 return false;
             }
         };
-        crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
+        crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them; its first {NULL_IMAGE_VIEWS} are null image views (an empty slot's)");
+        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
@@ -177,7 +210,7 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
             heap,
             cap,
-            next: 0,
+            next: NULL_IMAGE_VIEWS,
             free: Vec::new(),
         });
     }
@@ -312,8 +345,7 @@ pub fn unregister(obj: usize) {
     };
     if let Some(h) = gone {
         if let Some(res) = RES.lock().unwrap().as_mut() {
-            let end = h.shadow + h.n as usize * h.slot_bytes() as usize;
-            res.retain(|&at, _| at < h.shadow || at >= end);
+            res.forget(h.shadow..h.shadow + h.n as usize * h.slot_bytes() as usize);
         }
         for (p, &f) in h.pages.iter().enumerate().filter(|&(_, &f)| f != UNMAPPED) {
             release_global(f, page_descriptors(h.n, p as u32));
@@ -403,26 +435,63 @@ pub unsafe fn publish_range(first: &Slot, n: u32) {
     }
 }
 
-/// view slot address → the resource its view names (frame tracing and GPU markers)
-static RES: Mutex<Option<std::collections::HashMap<usize, usize>>> = Mutex::new(None);
+#[derive(Default)]
+struct ViewOwners {
+    by_slot: std::collections::HashMap<usize, usize>,
+    by_shared_index: std::collections::HashMap<u32, (usize, usize)>,
+}
+
+impl ViewOwners {
+    fn note(&mut self, s: &Slot, res: usize) {
+        if res == 0 {
+            self.by_slot.remove(&s.at);
+            if s.shared_srv != 0 {
+                self.by_shared_index.remove(&s.index);
+            }
+        } else {
+            self.by_slot.insert(s.at, res);
+            if s.shared_srv != 0 {
+                self.by_shared_index.insert(s.index, (s.at, res));
+            }
+        }
+    }
+
+    fn forget(&mut self, slots: std::ops::Range<usize>) {
+        self.by_slot.retain(|at, _| !slots.contains(at));
+        self.by_shared_index.retain(|_, (at, _)| !slots.contains(at));
+    }
+
+    fn shared_owner(&self, index: u32) -> Option<usize> {
+        self.by_shared_index.get(&index).map(|&(_, res)| res)
+    }
+}
+
+static RES: Mutex<Option<ViewOwners>> = Mutex::new(None);
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
     if s.sampler || !(super::present::trace_frame() || super::markers::enabled()) {
         return;
     }
-    let mut g = RES.lock().unwrap();
-    let m = g.get_or_insert_with(Default::default);
-    if res == 0 {
-        m.remove(&s.at);
-    } else {
-        m.insert(s.at, res);
-    }
+    RES.lock().unwrap().get_or_insert_with(Default::default).note(s, res);
 }
 
 /// The resource of the view slot at UMA address `at`.
 pub fn resource_at(at: usize) -> Option<usize> {
-    RES.lock().unwrap().as_ref()?.get(&at).copied()
+    RES.lock().unwrap().as_ref()?.by_slot.get(&at).copied()
+}
+
+pub(super) fn image_resource_at(addr32: u32, index: u32) -> Option<usize> {
+    let shared = GLOBAL.lock().unwrap().is_some();
+    if shared {
+        return RES.lock().unwrap().as_ref()?.shared_owner(index);
+    }
+    let u = crate::gpu::uma::get()?;
+    let s = slot((u.base() + addr32 as usize) as u64)?;
+    if s.sampler || s.index != index {
+        return None;
+    }
+    resource_at(s.at)
 }
 
 pub fn write(s: &Slot, words: &[u32]) {
@@ -523,6 +592,21 @@ pub fn words_at(addr32: u32) -> Option<[u32; 8]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_owner_follows_descriptor_index_across_raw_copies() {
+        let source = Slot { at: 0x1000, index: 17, pc_srv: 0, pc_uav: 0, pc_gpu_uav: 0, sampler: false, shared_srv: 1, k: 0 };
+        let copy = Slot { at: 0x2000, index: 19, ..source };
+        let mut owners = ViewOwners::default();
+        owners.note(&source, 101);
+        owners.note(&copy, 102);
+        let words = crate::gpu::desc::xcl_image_for_view(source.index, 22, crate::gpu::desc::ImageType::D3, 4, 4, 4, 1);
+        assert_eq!(owners.shared_owner(words[0]), Some(101));
+        assert_eq!(owners.by_slot.get(&copy.at), Some(&102));
+        owners.forget(source.at..source.at + SLOT as usize);
+        assert_eq!(owners.shared_owner(words[0]), None);
+        assert_eq!(owners.shared_owner(copy.index), Some(102));
+    }
 
     #[test]
     fn texture3d_uav_companion_reads_written_mip() {
@@ -684,6 +768,55 @@ mod tests {
         assert_eq!(take_range(&mut free, &mut next, 160, 96), Some(0));
         return_range(&mut free, &mut next, 96, 32);
         assert_eq!(take_range(&mut free, &mut next, 160, 64), Some(96));
+    }
+
+    /// A T# of zeros (an empty slot) names descriptors 0 (SRV) and 1 (UAV) of the shared heap:
+    /// those are null views, written before anything is reserved, and nothing is ever reserved
+    /// there – not the memory windows' raw buffer UAVs (a texture read of one hangs the GPU).
+    #[test]
+    fn a_tsharp_of_zeros_finds_null_views_and_never_a_memory_window() {
+        use std::ffi::c_void;
+        use windows::core::Interface;
+        static SEEN: Mutex<Vec<(bool, usize, usize)>> = Mutex::new(Vec::new());
+        #[repr(C)]
+        struct Object {
+            vt: *const usize,
+        }
+        unsafe extern "system" fn srv(_this: *mut c_void, r: *mut c_void, _d: *const D3D12_SHADER_RESOURCE_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((false, r as usize, at.ptr));
+        }
+        unsafe extern "system" fn uav(_this: *mut c_void, r: *mut c_void, _c: *mut c_void, _d: *const D3D12_UNORDERED_ACCESS_VIEW_DESC, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+            SEEN.lock().unwrap().push((true, r as usize, at.ptr));
+        }
+        assert!(NULL_IMAGE_VIEWS >= 2, "the SRV / UAV pair of a T# of zeros is not kept");
+        assert_eq!(NULL_IMAGE_VIEWS % 2, 0, "the kept descriptors split a console slot's SRV / UAV pair");
+        // (ID3D12Device: CreateShaderResourceView and CreateUnorderedAccessView)
+        let mut vt = [0usize; 20];
+        vt[18] = srv as usize;
+        vt[19] = uav as usize;
+        let mut device = Object { vt: vt.as_ptr() };
+        unsafe {
+            let dev = std::mem::ManuallyDrop::new(ID3D12Device::from_raw(&mut device as *mut _ as *mut c_void));
+            null_views(&dev, 0x1000, 32);
+        }
+        let seen = SEEN.lock().unwrap().clone();
+        assert_eq!(seen.len(), NULL_IMAGE_VIEWS as usize);
+        for (k, &(is_uav, r, at)) in seen.iter().enumerate() {
+            assert_eq!((is_uav, r, at), (k % 2 == 1, 0, 0x1000 + 32 * k), "descriptor {k}");
+        }
+        // a heap as it is made: the first range given starts after the null views, and one
+        // given back and taken again does not move below them
+        let (mut free, mut next) = (Vec::new(), NULL_IMAGE_VIEWS);
+        let first = take_range(&mut free, &mut next, 1 << 20, crate::gpu::recomp::MEM_NULL_VIEW + 1).unwrap();
+        assert_eq!(first, NULL_IMAGE_VIEWS, "the memory windows' views, reserved first, start after the null views");
+        return_range(&mut free, &mut next, first, crate::gpu::recomp::MEM_NULL_VIEW + 1);
+        assert!(take_range(&mut free, &mut next, 1 << 20, 2).unwrap() >= NULL_IMAGE_VIEWS);
+        // with a device: the views XCL reserved for the memory windows
+        if super::super::real::init().is_ok() {
+            if let Some(views) = super::super::real::mem_views() {
+                assert!(views >= NULL_IMAGE_VIEWS, "the memory windows' views start at descriptor {views}");
+            }
+        }
     }
 
     #[test]

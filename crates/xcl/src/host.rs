@@ -80,6 +80,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         crate::hle::d3d12x::bind::indirect_calls()
                     );
                     crate::xlog_info!("commit: {}", commit_breakdown());
+                    crate::xlog_info!("{}", crate::hle::d3d12x::bind::mesh_counts());
                 }
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();

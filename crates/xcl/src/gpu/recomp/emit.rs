@@ -80,7 +80,10 @@ pub(super) struct Em {
     mesh_sync_edges: Vec<(u64, u64)>,
     mesh_sync_end: Option<u64>,
     mesh_sync_indirect: bool,
-    mesh_meets: BTreeSet<u64>,
+    packed_mask: Option<(usize, usize, String, String)>,
+    packed_cross_lane_write: Option<usize>,
+    mesh_memory_barrier: bool,
+    mesh_divergent_lds: bool,
     force_spin: bool,
     /// console instructions emitted since the last `xcl_tick` (`waits`)
     since_tick: u32,
@@ -93,6 +96,10 @@ const NOOPS: &[&str] = &[
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
+
+fn is_lds(name: &str) -> bool {
+    name.starts_with("ds_") && !matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop")
+}
 
 fn sname(code: u64) -> Option<String> {
     Some(match code {
@@ -643,7 +650,10 @@ impl Em {
             mesh_sync_edges: Vec::new(),
             mesh_sync_end: None,
             mesh_sync_indirect: false,
-            mesh_meets: BTreeSet::new(),
+            packed_mask: None,
+            packed_cross_lane_write: None,
+            mesh_memory_barrier: false,
+            mesh_divergent_lds: false,
             force_spin,
             since_tick: 0,
         }
@@ -672,6 +682,7 @@ impl Em {
         let mut endpgm = None;
         let mut indirect = false;
         let mut memory_writes = false;
+        let mut lds_sites = Vec::new();
         for d in insts {
             let name = d.inst.name.to_ascii_lowercase();
             if stop_at_endpgm && matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
@@ -684,7 +695,11 @@ impl Em {
                 }
             }
             if mesh {
-                memory_writes |= name.starts_with("ds_") || name.contains("_store") || name.contains("_atomic") || name.starts_with("s_dcache_");
+                if is_lds(name.as_str()) {
+                    lds_sites.push(d.pc);
+                } else {
+                    memory_writes |= name.contains("_store") || name.contains("_atomic") || name.starts_with("s_dcache_");
+                }
                 if matches!(name.as_str(), "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done") {
                     endpgm.get_or_insert(d.pc);
                 }
@@ -733,6 +748,9 @@ impl Em {
         self.mesh_sync_end = endpgm;
         self.mesh_sync_indirect = indirect;
         self.mesh_export_barriers = mesh && self.opt.mesh_native.is_some() && !memory_writes;
+        self.mesh_memory_barrier = self.opt.mesh_native.is_some() && has_s_barrier && memory_writes;
+        self.mesh_divergent_lds = self.opt.mesh_native.is_some() && !lds_sites.is_empty()
+            && lds_sites.iter().chain(&barriers).any(|&p| !self.mesh_sync_converges(p));
         let converged_mesh = mesh && barriers.iter().all(|&p| self.mesh_sync_converges(p));
         self.safe_barrier = has_s_barrier && self.compute_or_mesh_hw_waves().is_some_and(|w| w > 1)
             && !self.mesh_export_barriers && !converged_mesh
@@ -749,14 +767,15 @@ impl Em {
     }
 
     fn line(&mut self, s: &str) {
-        if self.opt.mesh_native.is_some() && self.x64_threads() > 64
-            && (s.contains("xcl_x_ballot(") || s.contains("xcl_x_rla_uniform(")
-                || s.contains("xcl_x_rla_any(") || s.contains("xcl_x_meet("))
-        {
-            self.mesh_meets.insert(self.cur_pc);
-        }
         self.out.push_str(pad(self.indent));
-        let s = track_exec(s, self.exec_test());
+        let packed_test;
+        let test = if self.packed_wave() && s.contains("exec_") {
+            packed_test = format!("{}; hi_xcl_on = {}", super::wave_pack::EXEC_LO, super::wave_pack::EXEC_HI);
+            &packed_test
+        } else {
+            self.exec_test()
+        };
+        let s = track_exec(s, test);
         if self.lane_window {
             self.out.push_str(&lane_helpers(&s));
         } else {
@@ -774,7 +793,19 @@ impl Em {
     /// hardware wave32 halves that exchange masks and lane values (`PRELUDE_X64`,
     /// docs/wave64-on-wave32.md).
     fn x64(&self) -> bool {
-        self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+        self.opt.mesh_native.is_none() && !self.packed_compute() && self.opt.wave64 && self.opt.split_wave64 && matches!(self.opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_) | Mode::Geometry(_))
+    }
+
+    fn mesh_packed(&self) -> bool {
+        self.opt.mesh_native.is_some() && self.opt.wave64 && self.x64_threads() > 32
+    }
+
+    pub(super) fn packed_compute(&self) -> bool {
+        self.opt.wave64 && self.opt.split_wave64 && !self.opt.legacy_compute_wave64 && matches!(self.opt.mode, Mode::Compute(_))
+    }
+
+    fn packed_wave(&self) -> bool {
+        self.packed_compute() || self.mesh_packed()
     }
 
     /// The program waits for other hardware waves by polling: the split form's counted meets
@@ -811,7 +842,9 @@ impl Em {
     /// Lane read whose source lane the ISA keeps in the reader's 32-lane half (DPP16, DPP8,
     /// ds_swizzle, v_permlane(x)16).
     fn rla_half_fn(&self) -> &'static str {
-        if self.x64() {
+        if self.packed_wave() {
+            "xcl_pack_half"
+        } else if self.x64() {
             "xcl_x_rla_half"
         } else {
             "rla"
@@ -1050,6 +1083,12 @@ impl Em {
     fn write_mask(&mut self, dst: &Dst, cond: &str) {
         let a = self.act();
         let m = self.t();
+        if self.packed_wave() {
+            let start = self.out.len();
+            self.write64(dst, &format!("{m}.x"), &format!("{m}.y"));
+            self.packed_mask = Some((start, self.out.len(), format!("and({a}, ({cond}))"), m));
+            return;
+        }
         let mut ballot = self.ballot_fn();
         // no exchange for a mask that is only ever read lane by lane (the half's own word is
         // enough), that goes nowhere, or that is 0 in every lane anyway
@@ -1080,18 +1119,80 @@ impl Em {
     // ---------------------------------------------------------------- one instruction
 
     pub fn inst(&mut self, d: &Decoded, next: u64) -> Flow {
-        let name = d.inst.name.to_ascii_lowercase();
-        self.lane_window = false;
-        if self.comments {
-            self.line(&format!("// {:04x}: {}", d.pc, rdna2::format(d)));
-        }
-        self.cur_pc = d.pc;
         if self.waits() {
             self.since_tick += 1;
             if self.since_tick >= TICK_EVERY {
                 self.since_tick = 0;
                 self.line("xcl_tick();");
             }
+        }
+        let lds = d.enc.name == "ENC_DS" && is_lds(&d.inst.name.to_ascii_lowercase());
+        let fence = if lds && self.opt.mesh_native.is_some() {
+            Some("GroupMemoryBarrierWithGroupSync();")
+        } else if lds && self.packed_compute() {
+            Some("GroupMemoryBarrier();")
+        } else {
+            None
+        };
+        let vector = self.packed_wave() && (d.enc.name.starts_with("ENC_VOP") || d.enc.name.starts_with("VOP") ||
+            matches!(d.enc.name, "ENC_MUBUF" | "ENC_MTBUF" | "ENC_EXP" | "ENC_DS" | "ENC_MIMG" | "ENC_FLAT" | "ENC_FLAT_GLBL" | "ENC_FLAT_SCRATCH"))
+            && !matches!(d.inst.name, "V_READLANE_B32" | "V_READFIRSTLANE_B32");
+        let start = self.out.len();
+        let flow = self.inst_once(d, next);
+        if !vector || self.out.len() == start {
+            if let Some(fence) = fence {
+                self.line(fence);
+            }
+            return flow;
+        }
+        use super::wave_pack::lane_code;
+        let code = self.out.split_off(start);
+        self.line("{");
+        self.indent += 1;
+        if let Some((a, b, predicate, mask)) = self.packed_mask.take() {
+            let (a, b) = (a - start, b - start);
+            self.out.push_str(&lane_code(&code[..a], false));
+            self.line(&format!("uint {mask}_lo = WaveActiveBallot({predicate}).x;"));
+            self.line("lane_id = hi_xcl_slot;");
+            self.out.push_str(&lane_code(&code[..a], true));
+            self.line(&format!("uint2 {mask} = uint2({mask}_lo, WaveActiveBallot({}).x);", lane_code(&predicate, true)));
+            self.out.push_str(&code[a..b]);
+            self.line("lane_id = xcl_slot;");
+            self.out.push_str(&lane_code(&code[b..], false));
+            self.line("lane_id = hi_xcl_slot;");
+            self.out.push_str(&lane_code(&code[b..], true));
+        } else if let Some(write) = self.packed_cross_lane_write.take() {
+            let (read, write) = code.split_at(write - start);
+            self.out.push_str(&lane_code(read, false));
+            self.line("lane_id = hi_xcl_slot;");
+            self.out.push_str(&lane_code(read, true));
+            self.out.push_str(&lane_code(write, true));
+            self.line("lane_id = xcl_slot;");
+            self.out.push_str(&lane_code(write, false));
+        } else {
+            self.out.push_str(&lane_code(&code, false));
+            self.line("lane_id = hi_xcl_slot;");
+            self.out.push_str(&lane_code(&code, true));
+        }
+        self.line("lane_id = xcl_slot;");
+        self.indent -= 1;
+        self.line("}");
+        if let Some(fence) = fence {
+            self.line(fence);
+        }
+        flow
+    }
+
+    fn inst_once(&mut self, d: &Decoded, next: u64) -> Flow {
+        let name = d.inst.name.to_ascii_lowercase();
+        self.lane_window = false;
+        if self.comments {
+            self.line(&format!("// {:04x}: {}", d.pc, rdna2::format(d)));
+        }
+        self.cur_pc = d.pc;
+        if self.opt.mesh_native.is_some() && name.contains("_atomic") {
+            self.unsupported(d, "native mesh atomic");
+            return Flow::Next;
         }
         // a far jump (`rdna2::resolve_far_jumps`) is an unconditional branch
         if let Some(t) = d.far_target {
@@ -1146,7 +1247,7 @@ impl Em {
         match name {
             "s_endpgm" | "s_endpgm_saved" | "s_endpgm_ordered_ps_done" => Flow::End,
             "s_barrier" => {
-                if self.mesh_export_barriers {
+                if self.opt.mesh_native.is_some() {
                     return Flow::Next;
                 } else if self.x64() && matches!(self.opt.mode, Mode::Geometry(_)) {
                     // split ES+GS: the GS phase runs in the lower hardware wave alone (one console
@@ -1155,7 +1256,7 @@ impl Em {
                 } else if matches!(self.opt.mode, Mode::Compute(_) | Mode::Mesh(_)) {
                     if self.safe_barrier {
                         self.line("xcl_s_barrier();");
-                    } else if self.compute_or_mesh_hw_waves() == Some(1) {
+                    } else if !self.packed_compute() && self.compute_or_mesh_hw_waves() == Some(1) {
                         self.line("GroupMemoryBarrier();");
                     } else {
                         self.line("GroupMemoryBarrierWithGroupSync();");
@@ -1850,7 +1951,11 @@ impl Em {
         }
         for (i, v) in vals.iter().enumerate() {
             let s = self.sreg(sdata + i as u64);
-            self.line(&format!("{s} = {v};"));
+            if self.packed_compute() {
+                self.line(&format!("{s} = WaveReadLaneFirst({v});"));
+            } else {
+                self.line(&format!("{s} = {v};"));
+            }
         }
         Ok(())
     }
@@ -3998,18 +4103,29 @@ impl Em {
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
-                let first = if self.x64() && self.x64_spin() {
+                let first = if self.packed_compute() {
+                    format!("first_lane({el} & xcl_valid_lo, {eh} & xcl_valid_hi)")
+                } else if self.x64() && self.x64_spin() {
                     format!("first_lane({el} & xcl_x_klo, {eh} & xcl_x_khi)")
                 } else {
                     format!("first_lane({el}, {eh})")
                 };
-                self.line(&format!("uint {t} = {rla}({a}, {first});"));
+                if self.packed_wave() {
+                    self.line(&format!("uint {t} = xcl_pack_read({a}, {}, {first});", super::wave_pack::lane_code(&a, true)));
+                } else {
+                    self.line(&format!("uint {t} = {rla}({a}, {first});"));
+                }
                 self.write32(&dst, &t);
                 return Ok(());
             }
             "v_readlane_b32" => {
                 let t = self.t();
                 let rla = self.rla_uniform_fn();
+                if self.packed_wave() {
+                    self.line(&format!("uint {t} = xcl_pack_read({a}, {}, {b} & {wmask}u);", super::wave_pack::lane_code(&a, true)));
+                    self.write32(&dst, &t);
+                    return Ok(());
+                }
                 let read = format!("{rla}({a}, {b} & {wmask}u)");
                 // wave64 VS / PS (`upper_lanes`): in a 32-lane wave, lanes 32..63 without a lane
                 // read; a spill slot < 32 from its shadow whatever the wave size (its lane may
@@ -4437,7 +4553,7 @@ impl Em {
         Ok(())
     }
 
-    /// LDS (`groupshared`, compute only) and the DS cross-lane permutes.
+    /// LDS (`groupshared`) and the DS cross-lane permutes.
     fn ds(&mut self, d: &Decoded, name: &str) -> Result<(), &'static str> {
         let f = |n: &str| rdna2::field_value(d.enc, &d.words, n).unwrap_or(0);
         let act = self.act();
@@ -4473,13 +4589,20 @@ impl Em {
                 } else {
                     "rla"
                 };
-                self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
+                if self.packed_wave() {
+                    self.line(&format!("uint {t} = xcl_pack_read(xcl_lower_{v}, hi_{v}, {t}_l);"));
+                } else {
+                    self.line(&format!("uint {t} = {rla}({v}, {t}_l);"));
+                }
                 // a 32-lane wave of a wave64 VS / PS: lanes 32..63 hold a constant (`upper_lanes`)
                 if let Some(Read::Const(c)) = self.upper.as_ref().and_then(|u| u.reads.get(&d.pc)).copied() {
                     self.line(&format!("{t} = select(and(xcl_hw32, {t}_l >= 32u), {c:#010x}u, {t});"));
                 }
                 self.line(&format!("{t} = select(lanebit_at({el}, {eh}, {t}_l), {t}, 0u);"));
                 let dst = Dst::V(f("VDST"));
+                if self.packed_wave() {
+                    self.packed_cross_lane_write = Some(self.out.len());
+                }
                 self.write32(&dst, &t);
                 return Ok(());
             }
@@ -4490,6 +4613,12 @@ impl Em {
                 let (a, v) = (self.vreg(f("ADDR")), self.vreg(f("DATA0")));
                 let (el, eh) = (self.sreg(126), self.sreg(127));
                 let eh = if self.opt.wave64 { eh } else { "0u".into() };
+                if self.packed_wave() {
+                    self.line(&format!("uint {t} = xcl_pack_scatter(xcl_lower_{a}, hi_{a}, xcl_lower_{v}, hi_{v}, {el}, {eh}, {off16}u, lane_id);"));
+                    self.packed_cross_lane_write = Some(self.out.len());
+                    self.write32(&Dst::V(f("VDST")), &t);
+                    return Ok(());
+                }
                 let (n, m) = if self.opt.wave64 { (64, 63) } else { (32, 31) };
                 self.line(&format!("uint {t}_a = {a} + {off16}u;"));
                 self.line(&format!("uint {t} = 0u;"));
@@ -4528,6 +4657,10 @@ impl Em {
         if !matches!(self.opt.mode, Mode::Kernel | Mode::Mesh(_) | Mode::Geometry(_) | Mode::Compute(_)) {
             return Err("LDS outside compute");
         }
+        let native = self.opt.mesh_native.is_some();
+        if native && f("GDS") != 0 {
+            return Err("native mesh GDS");
+        }
         // geometry mode: where each GS lane puts its output vertices (lowest LDS address written)
         let gs_phase = match &self.opt.mode {
             Mode::Geometry(g) => g.gs_start.is_some_and(|s| d.pc >= s),
@@ -4541,6 +4674,16 @@ impl Em {
             self.uses_lds = true;
             let m0 = self.sreg(124);
             let at = format!("(({m0} & 0xFFFFu) + {off16}u + 4u * lane_id)");
+            if native {
+                if name == "ds_write_addtid_b32" {
+                    let src = self.vreg(f("DATA0"));
+                    self.line(&format!("if ({act}) xcl_mesh_lds_store({at}, {src});"));
+                } else {
+                    let dst = self.vreg(f("VDST"));
+                    self.line(&format!("if ({act}) {dst} = xcl_mesh_lds_load({at});"));
+                }
+                return Ok(());
+            }
             let slot = if self.x64() {
                 format!("xcl_lds[min((({at}) >> 2) & 8191u, XCL_X_LDS_TOP)]")
             } else if self.safe_barrier {
@@ -4602,6 +4745,9 @@ impl Em {
         };
         // d16 8 / 16-bit LDS accesses (half of the VGPR)
         if let Some((bits, signed, write, half)) = ds_d16(name) {
+            if native {
+                return Err("native mesh sub-dword LDS");
+            }
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4627,6 +4773,9 @@ impl Em {
             _ => None,
         };
         if let Some((bits, signed, write)) = small {
+            if native {
+                return Err("native mesh sub-dword LDS");
+            }
             let at = format!("{a} + {off16}u");
             let slot = lds(at.clone());
             let sh = format!("((({at}) & 3u) * 8u)");
@@ -4656,13 +4805,21 @@ impl Em {
             let (vd, d0, d1) = (f("VDST"), f("DATA0"), f("DATA1"));
             for (e, at) in addrs.iter().enumerate() {
                 for k in 0..n {
-                    let slot = lds(format!("{at} + {}u", 4 * k));
+                    let word = format!("{at} + {}u", 4 * k);
                     if write {
                         let src = self.vreg(if e == 0 { d0 } else { d1 } + k);
-                        st.push(format!("{slot} = {src};"));
+                        if native {
+                            st.push(format!("xcl_mesh_lds_store({word}, {src});"));
+                        } else {
+                            st.push(format!("{} = {src};", lds(word)));
+                        }
                     } else {
                         let v = self.vreg(vd + e as u64 * n + k);
-                        st.push(format!("{v} = {slot};"));
+                        if native {
+                            st.push(format!("{v} = xcl_mesh_lds_load({word});"));
+                        } else {
+                            st.push(format!("{v} = {};", lds(word)));
+                        }
                     }
                 }
             }
@@ -4672,6 +4829,9 @@ impl Em {
                 self.line(&format!("if ({act}) xcl_gs_base = min(xcl_gs_base, {lowest});"));
             }
             return Ok(());
+        }
+        if native {
+            return Err("native mesh LDS atomic");
         }
         let (op, rtn) = match name.strip_prefix("ds_") {
             Some(r) if r.contains("_rtn_") => (r.replacen("_rtn", "", 1), true),
@@ -4748,19 +4908,20 @@ impl Em {
     /// known once its code is emitted; None: it can (or the form was not asked for).
     pub(super) fn mesh_native_blocker(&self) -> Option<&'static str> {
         let (Mode::Mesh(ms), Some(native)) = (&self.opt.mode, &self.opt.mesh_native) else { return None };
-        if ms.threads > 128 || ms.max_vertices > ms.threads || ms.max_primitives > ms.threads {
-            return Some("its vertices and primitives need more lanes than a host mesh group has threads (128)");
+        if ms.max_vertices > ms.threads || ms.max_primitives > ms.threads {
+            return Some("its vertices and primitives need more lanes than the guest mesh group has");
         }
-        if self.uses_lds {
-            return Some("it uses LDS (xcl_lds is 32 KB, the mesh stage allows 28 KB of groupshared memory)");
+        if self.uses_lds && (native.lds_bytes == 0 || native.lds_bytes > 28 * 1024) {
+            return Some("its LDS allocation is missing or exceeds the native mesh limit (28 KB)");
         }
-        if self.safe_barrier {
-            return Some("it needs a workgroup barrier that is not reached by all waves");
+        if self.mesh_divergent_lds {
+            return Some("its LDS accesses or barriers are in divergent control flow");
         }
-        if self.x64() && ms.threads > 64
-            && (ms.threads % 64 != 0 || self.mesh_meets.iter().any(|&p| !self.mesh_sync_converges(p)))
-        {
-            return Some("a split-wave64 exchange is not reached by all waves");
+        if self.mesh_memory_barrier {
+            return Some("it needs a guest barrier for memory accesses");
+        }
+        if self.mesh_packed() && self.uses_scratch {
+            return Some("its private scratch layout is not supported by the packed mesh entry");
         }
         if passthrough_batches(ms, passthrough_elements(ms, native.ps_inputs.as_deref())).is_some() {
             return Some("its vertices are over D3D12's 32 KB mesh output limit");
@@ -4843,7 +5004,11 @@ impl Em {
     pub fn finish(&self, body: &str) -> String {
         let mut h = String::new();
         let decoded: String = self.fmt_regs.iter().flat_map(|&q| fmt_decode(q, true)).map(|l| format!("    {l}\n")).collect();
-        let body = &format!("    bool xcl_on = {};\n{decoded}{body}", self.exec_test());
+        let body = &if self.packed_wave() {
+            format!("    bool xcl_on = {};\n    bool hi_xcl_on = {};\n{decoded}{body}", super::wave_pack::EXEC_LO, super::wave_pack::EXEC_HI)
+        } else {
+            format!("    bool xcl_on = {};\n{decoded}{body}", self.exec_test())
+        };
         h.push_str("// generated by XCL (RDNA2 -> HLSL), do not edit\n");
         if matches!(self.opt.mode, Mode::Pixel(_)) {
             // lane reads within a quad see helper lanes (`rla`)
@@ -4873,9 +5038,25 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         let _ = writeln!(h, "#define XCL_LOOP_GUARD {}u", super::loop_guard());
-        h.push_str(PRELUDE);
+        if self.packed_compute() {
+            h.push_str(&PRELUDE.replace("static uint xcl_tripped = 0u;", "static uint xcl_tripped = 0u;\nstatic uint xcl_valid_lanes;")
+                .replace("if (((xcl_tripped >> k) & 1u) != 0u) return;", "uint bit = k + select(and(k == 3u, lane_id >= 32u), 16u, 0u);\n    if (((xcl_tripped >> bit) & 1u) != 0u) return;")
+                .replace("xcl_tripped | (1u << k)", "xcl_tripped | (1u << bit)")
+                .replace("at + 4u * k, 1u, o", "at + 4u * k, select(k == 3u, 1u, (uint)(WaveGetLaneIndex() < xcl_valid_lanes) + (uint)(WaveGetLaneIndex() + 32u < xcl_valid_lanes)), o"));
+        } else {
+            h.push_str(PRELUDE);
+        }
         if self.x64() {
             self.x64_prelude(&mut h);
+        }
+        if self.opt.loop_profile && matches!(self.opt.mode, Mode::Compute(_)) && body.contains("xcl_lp_done(") {
+            super::loop_profile::prelude(&mut h, self.packed_compute());
+        }
+        if self.packed_wave() {
+            if !self.packed_compute() {
+                h.push_str("static uint xcl_valid_lanes;\n");
+            }
+            h.push_str(super::wave_pack::PRELUDE);
         }
         if let Some(u) = &self.upper {
             // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
@@ -4898,6 +5079,9 @@ impl Em {
         }
         if self.uses_scratch {
             h.push_str(PRELUDE_SCRATCH);
+            if self.packed_compute() {
+                h.push_str(&super::wave_pack::lane_code(PRELUDE_SCRATCH, true));
+            }
         }
         if self.dynamic_f16_rm {
             h.push_str("static uint xcl_fp16_rm = 0u;\n");
@@ -5011,17 +5195,19 @@ impl Em {
             }
             Mode::Compute(cs) => {
                 let lanes = if self.opt.wave64 { 64 } else { 32 };
+                let packed = self.packed_compute();
                 if self.uses_lds && !self.x64_lds() {
                     h.push_str("groupshared uint xcl_lds[8192]; // D3D12 limit: 32 KB (the console allows 64 KB)\n");
                 }
                 let [x, y, z] = cs.threads;
                 // split wave64: the same group in hardware wave32s (a console wave = two of them)
-                let hw_lanes = if self.x64() { 32 } else { lanes };
+                let hw_lanes = if self.x64() || packed { 32 } else { lanes };
+                let host = if packed { [(x * y * z).div_ceil(64) * 32, 1, 1] } else { cs.threads };
                 // 2-D / 3-D groups: the PC driver need not form its waves from consecutive
                 // thread indices (AMD RDNA4 lays them out in 2 x 2 quads: lanes 0, 1, 4, 5, 8 …
                 // of an 8 x 8 group; NVIDIA differs too), the console does – a hardware wave
                 // takes the next `lanes` console threads as it arrives, lane l the l-th of them
-                let reorder = !self.x64() && y * z > 1;
+                let reorder = !packed && !self.x64() && y * z > 1;
                 if reorder {
                     // console threads handed to waves so far: the program's top LDS word while
                     // the waves take their threads (the console's LDS starts undefined; D3D12's
@@ -5033,14 +5219,27 @@ impl Em {
                     }
                 }
                 self.safe_barrier_prelude(&mut h);
+                let [hx, hy, hz] = host;
                 let _ = writeln!(
                     h,
-                    "[WaveSize({hw_lanes})]\n[numthreads({x}, {y}, {z})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
+                    "[WaveSize({hw_lanes})]\n[numthreads({hx}, {hy}, {hz})]\nvoid main(uint3 gid : SV_GroupID, uint3 gtid : SV_GroupThreadID, uint gi : SV_GroupIndex)\n{{"
                 );
                 if self.safe_barrier {
                     h.push_str("    xcl_s_barrier_init(gi);\n");
                 }
-                if self.x64() {
+                if packed {
+                    let total = x * y * z;
+                    let wave = if total <= 64 { "0u" } else { "WaveReadLaneFirst(gi) / 32u" };
+                    let _ = writeln!(h, "    uint xcl_wave = {wave};\n    uint xcl_slot = WaveGetLaneIndex();\n    uint hi_xcl_slot = xcl_slot + 32u;\n    lane_id = xcl_slot;");
+                    if total % 64 == 0 {
+                        h.push_str("    xcl_valid_lanes = 64u;\n    uint xcl_valid_lo = 0xFFFFFFFFu;\n    uint xcl_valid_hi = 0xFFFFFFFFu;\n");
+                    } else {
+                        let _ = writeln!(h, "    xcl_valid_lanes = min(64u, {total}u - 64u * xcl_wave);");
+                        h.push_str("    uint xcl_valid_lo = WaveActiveBallot(xcl_slot < xcl_valid_lanes).x;\n    uint xcl_valid_hi = WaveActiveBallot(hi_xcl_slot < xcl_valid_lanes).x;\n");
+                    }
+                    h.push_str("    uint xcl_tid = 64u * xcl_wave + xcl_slot;\n    uint hi_xcl_tid = xcl_tid + 32u;\n");
+                    let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    uint3 hi_gtid = uint3(hi_xcl_tid % {x}u, (hi_xcl_tid / {x}u) % {y}u, hi_xcl_tid / {}u);", x * y, x * y);
+                } else if self.x64() {
                     // the console thread's ids (`xcl_x_thread`), not this hardware thread's
                     self.x64_entry(&mut h);
                     let _ = writeln!(h, "    gtid = uint3(xcl_tid % {x}u, (xcl_tid / {x}u) % {y}u, xcl_tid / {}u);\n    gi = xcl_tid;", x * y);
@@ -5068,10 +5267,14 @@ impl Em {
                 }
                 if cs.tg_size && sg.contains(&next) {
                     // waves in the group: a last, partial wave counts (96 threads: 2 of 64)
-                    let wave = if self.x64() { "xcl_cw".into() } else { format!("(gi / {lanes}u)") };
+                    let wave = if packed { "xcl_wave".into() } else if self.x64() { "xcl_cw".into() } else { format!("(gi / {lanes}u)") };
                     let _ = writeln!(h, "    {} = {}u | ({wave} << 6);", sname(next).unwrap(), (x * y * z).div_ceil(lanes));
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                if packed {
+                    h.push_str("    uint scc = 0u;\n    exec_lo = xcl_valid_lo;\n    exec_hi = xcl_valid_hi;\n");
+                } else {
+                    let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                }
                 for &v in &self.vgprs {
                     let init = match v {
                         0 => "gtid.x",
@@ -5080,6 +5283,10 @@ impl Em {
                         _ => "0u",
                     };
                     let _ = writeln!(h, "    uint v{v} = {init};");
+                    if packed {
+                        let sep = if init.starts_with("gtid.") { "hi_" } else { "" };
+                        let _ = writeln!(h, "    uint hi_v{v} = {sep}{init};");
+                    }
                 }
                 h.push_str(body);
                 if self.safe_barrier {
@@ -5088,61 +5295,59 @@ impl Em {
                 h.push_str("}\n");
             }
             Mode::Mesh(ms) if self.opt.mesh_native.is_some() => {
-                // A host mesh shader (`MeshNative`): the entry of the compute form below without
-                // a record – the exports are in `xcl_ov*` / `xcl_op`, the counts in groupshared –
-                // and at the end the thread's own vertex and primitive. No `WaveSize` (HLSL has
-                // none for mesh shaders): the host's waves are 32 lanes (`pso::mesh_native_split`).
-                let ps_inputs = self.opt.mesh_native.as_ref().and_then(|n| n.ps_inputs.as_deref());
-                let lanes = if self.opt.wave64 { 64 } else { 32 };
-                self.safe_barrier_prelude(&mut h);
-                let (decl, fill) = native_mesh_vertex(ms, ps_inputs);
+                let native = self.opt.mesh_native.as_ref().unwrap();
+                let packed = self.mesh_packed();
+                let (decl, fill) = native_mesh_vertex(ms, native.ps_inputs.as_deref());
                 h.push_str(&decl);
-                h.push_str("// GS_ALLOC_REQ of the group: vertices, primitives\ngroupshared uint xcl_ms_nv;\ngroupshared uint xcl_ms_np;\n");
+                if self.uses_lds {
+                    let words = native.lds_bytes.div_ceil(4);
+                    let _ = writeln!(h, "#define XCL_LDS_WORDS {words}u\ngroupshared uint xcl_lds[{words}];");
+                    h.push_str(super::wave_pack::LDS);
+                }
                 let (t, mv, mp) = (ms.threads, ms.max_vertices, ms.max_primitives);
+                let threads = t.min(32);
                 let _ = writeln!(
                     h,
-                    "[outputtopology(\"triangle\")]\n[numthreads({t}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
+                    "[outputtopology(\"triangle\")]\n[numthreads({threads}, 1, 1)]\nvoid main(uint gi : SV_GroupIndex, uint3 gid : SV_GroupID, out vertices XclVert verts[{mv}], out indices uint3 tris[{mp}])\n{{"
                 );
-                h.push_str("    if (gi == 0u) { xcl_ms_nv = 0u; xcl_ms_np = 0u; }\n    GroupMemoryBarrierWithGroupSync();\n");
-                if self.safe_barrier {
-                    h.push_str("    xcl_s_barrier_init(gi);\n");
+                h.push_str("    lane_id = WaveGetLaneIndex();\n    uint xcl_slot = lane_id;\n    uint xcl_ms_nv = 0u;\n    uint xcl_ms_np = 0u;\n");
+                if packed {
+                    let _ = writeln!(h, "    xcl_valid_lanes = {t}u;\n    uint hi_xcl_slot = xcl_slot + 32u;");
                 }
-                if self.x64() {
-                    self.x64_entry(&mut h);
-                    h.push_str("    gi = xcl_tid;\n");
-                } else {
-                    h.push_str("    lane_id = WaveGetLaneIndex();\n");
+                for prefix in if packed { &["", "hi_"][..] } else { &[""][..] } {
+                    for k in 0..ms.vert_dwords() / 4 {
+                        let _ = writeln!(h, "    uint4 {prefix}xcl_ov{k} = uint4(0u, 0u, 0u, 0u);");
+                    }
+                    let _ = writeln!(h, "    uint {prefix}xcl_op = 0x80000000u;");
                 }
-                let wave = if self.x64() { "xcl_cw".into() } else { format!("gi / {lanes}u") };
-                let _ = writeln!(h, "    uint xcl_wave = {wave};\n    uint xcl_slot = xcl_wave * {lanes}u + lane_id;");
-                for k in 0..ms.vert_dwords() / 4 {
-                    let _ = writeln!(h, "    uint4 xcl_ov{k} = uint4(0u, 0u, 0u, 0u);");
-                }
-                h.push_str("    uint xcl_op = 0x80000000u; // no primitive exported: null\n");
                 load_sgprs(&mut h);
                 if sg.contains(&3) {
-                    h.push_str("    s3 = (s3 & 0xF0FFFFFFu) | (xcl_wave << 24);\n");
+                    h.push_str("    s3 &= 0xF0FFFFFFu;\n");
                 }
-                let _ = writeln!(h, "    uint scc = 0u;\n    {{ uint2 e0 = {}(true); exec_lo = e0.x; exec_hi = e0.y; }}", self.ballot_fn());
+                h.push_str("    uint scc = 0u;\n    exec_lo = WaveActiveBallot(true).x;\n");
+                if packed {
+                    let _ = writeln!(h, "    exec_hi = WaveActiveBallot(hi_xcl_slot < {t}u).x;");
+                } else {
+                    h.push_str("    exec_hi = 0u;\n");
+                }
                 for &v in &self.vgprs {
                     let init = if v == 5 { format!("gid.x * {t}u + xcl_slot") } else { "0u".into() };
                     let _ = writeln!(h, "    uint v{v} = {init};");
+                    if packed {
+                        let _ = writeln!(h, "    uint hi_v{v} = {};", super::wave_pack::lane_code(&init, true));
+                    }
                 }
                 h.push_str(body);
-                if self.safe_barrier {
-                    h.push_str("    xcl_s_barrier_exit();\n");
+                let _ = writeln!(h, "    uint xcl_nv = min(WaveReadLaneFirst(xcl_ms_nv), {mv}u);\n    uint xcl_np = min(WaveReadLaneFirst(xcl_ms_np), {mp}u);");
+                h.push_str("    SetMeshOutputCounts(xcl_nv, xcl_np);\n");
+                let outputs = format!(
+                    "    if (xcl_slot < xcl_nv) {{\n{fill}        verts[xcl_slot] = o;\n    }}\n    if (xcl_slot < xcl_np) {{\n        uint3 x = uint3(xcl_op & 0x3FFu, (xcl_op >> 10) & 0x3FFu, (xcl_op >> 20) & 0x3FFu);\n        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n        tris[xcl_slot] = select(bad, uint3(0u, 0u, 0u), x);\n    }}\n"
+                );
+                h.push_str(&outputs);
+                if packed {
+                    h.push_str(&super::wave_pack::lane_code(&outputs, true));
                 }
-                // every thread is here (the body has no return): the group's counts, then this
-                // thread's vertex and primitive. A null primitive (bit 31) or one with an index
-                // past the vertices is the degenerate triangle (0, 0, 0), as in the pass-through.
-                h.push_str("    GroupMemoryBarrierWithGroupSync();\n");
-                let _ = writeln!(h, "    uint xcl_nv = min(xcl_ms_nv, {mv}u);\n    uint xcl_np = min(xcl_ms_np, {mp}u);");
-                h.push_str("    SetMeshOutputCounts(xcl_nv, xcl_np);\n    if (xcl_slot < xcl_nv) {\n");
-                h.push_str(&fill);
-                h.push_str("        verts[xcl_slot] = o;\n    }\n    if (xcl_slot < xcl_np) {\n");
-                h.push_str("        uint3 x = uint3(xcl_op & 0x3FFu, (xcl_op >> 10) & 0x3FFu, (xcl_op >> 20) & 0x3FFu);\n");
-                h.push_str("        bool bad = or((xcl_op >> 31) != 0u, any(x >= xcl_nv));\n");
-                h.push_str("        tris[xcl_slot] = select(bad, uint3(0u, 0u, 0u), x);\n    }\n}\n");
+                h.push_str("}\n");
             }
             Mode::Mesh(ms) => {
                 // split wave64: each console wave in two hardware wave32s (`PRELUDE_X64`)

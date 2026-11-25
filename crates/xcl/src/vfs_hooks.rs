@@ -572,6 +572,7 @@ unsafe extern "system" fn hk_read_file(h: *mut c_void, buf: *mut c_void, n: u32,
     // (a read into a view of a physical page: not write-watched; an overlapped read is not done yet)
     if ok != 0 && !buf.is_null() && ov.is_null() && !read.is_null() {
         crate::hle::kernelx::note_written(buf as usize, *read as usize);
+        crate::eh::note_guest_write("ReadFile", buf as usize, *read as usize);
     }
     ok
 }

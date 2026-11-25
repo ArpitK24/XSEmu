@@ -771,6 +771,7 @@ unsafe fn write_virtual(destination: usize, payload: &[u8]) -> bool {
         GetCurrentProcess(), destination as *mut c_void, payload.as_ptr().cast(), payload.len(), &mut written,
     );
     crate::hle::kernelx::note_written(destination, written);
+    crate::eh::note_guest_write("DirectStorage", destination, written);
     status >= 0 && written == payload.len()
 }
 
@@ -878,15 +879,26 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         src
     };
 
-    if r.dest_physical_pages() {
-        let pages = destination_pages(r.destination as usize, dest_pages.ok_or(E_ACCESS_VIOLATION)?)?;
-        if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
+    let request = || {
+        format!(
+            "request with options {:#x}: {} bytes at {:#x} of {}",
+            r.options,
+            r.source_size,
+            r.offset,
+            if r.memory_source() { format!("memory at {:#x}", r.source) } else { file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default() }
+        )
+    };
+    crate::eh::with_write_context(request, || {
+        if r.dest_physical_pages() {
+            let pages = destination_pages(r.destination as usize, dest_pages.ok_or(E_ACCESS_VIOLATION)?)?;
+            if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
+                return Err(E_ACCESS_VIOLATION);
+            }
+        } else if !write_virtual(r.destination as usize, &payload[..n]) {
             return Err(E_ACCESS_VIOLATION);
         }
-    } else if !write_virtual(r.destination as usize, &payload[..n]) {
-        return Err(E_ACCESS_VIOLATION);
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// `XCL_DS_VALIDATE=1`: after each request, whether it could have broken memory it does not own –
@@ -1284,6 +1296,40 @@ impl QueueInner {
             self.submit(false);
         }
     }
+    /// Close(), and the last Release() (DirectStorage closes a queue when its last reference
+    /// goes): what is not submitted yet ends as E_QUEUE_CLOSED, and no request writes into the
+    /// caller's memory once this has returned.
+    fn close(&self) {
+        // Lock `worker` then `pending` (same order as `submit`) so no racing enqueue or submit
+        // can push new pending entries or spawn a new worker after `closed` is set.
+        let drained = {
+            let mut w = self.worker.lock().unwrap();
+            let mut pend = self.pending.lock().unwrap();
+            if self.closed.swap(true, Ordering::AcqRel) {
+                Vec::new()
+            } else {
+                w.take();
+                self.space.notify_all();
+                pend.late_destinations = 0;
+                std::mem::take(&mut pend.entries)
+            }
+        };
+        for e in drained {
+            if let Entry::Status(s, i) = e {
+                if let Some(slot) = s.slots.get(i as usize) {
+                    slot.store(E_QUEUE_CLOSED, Ordering::Release);
+                }
+            }
+            // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
+        }
+        // Wait outside queue locks so no in-flight worker request can still touch caller buffers
+        // after `Close()` or the final `Release()` returns (including for concurrent callers).
+        let (lock, cvar) = &self.worker_active;
+        let mut active = lock.lock().unwrap();
+        while *active {
+            active = cvar.wait(active).unwrap();
+        }
+    }
 }
 
 impl Drop for QueueInner {
@@ -1397,9 +1443,10 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
     let n = (*obj).refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if n == 0 {
         let obj = Box::from_raw(obj);
-        // Drop the channel sender so the worker thread exits and drops its
-        // Arc<QueueInner> (breaking the worker <-> queue cycle).
-        obj.inner.worker.lock().unwrap().take();
+        // DirectStorage closes the queue when its last reference is released; that also drops
+        // the channel sender, so the worker thread exits and drops its Arc<QueueInner>
+        // (breaking the worker <-> queue cycle).
+        obj.inner.close();
         drop(obj);
     }
     n
@@ -1532,36 +1579,7 @@ unsafe extern "system" fn queue_cancel(p: *mut c_void, mask: u64, value: u64) {
 }
 
 unsafe extern "system" fn queue_close(p: *mut c_void) {
-    let q = queue(p);
-    // Lock `worker` then `pending` (same order as `submit`) so no racing enqueue or submit
-    // can push new pending entries or spawn a new worker after `closed` is set.
-    let drained = {
-        let mut w = q.worker.lock().unwrap();
-        let mut pend = q.pending.lock().unwrap();
-        if q.closed.swap(true, Ordering::AcqRel) {
-            Vec::new()
-        } else {
-            w.take();
-            q.space.notify_all();
-            pend.late_destinations = 0;
-            std::mem::take(&mut pend.entries)
-        }
-    };
-    for e in drained {
-        if let Entry::Status(s, i) = e {
-            if let Some(slot) = s.slots.get(i as usize) {
-                slot.store(E_QUEUE_CLOSED, Ordering::Release);
-            }
-        }
-        // `Entry::Signal` drops `FenceRef` (calling Release); `Entry::Request` drops `FileInner`.
-    }
-    // Wait outside queue locks so no in-flight worker request can still touch caller buffers
-    // after `Close()` returns (including for concurrent `Close()` callers).
-    let (lock, cvar) = &q.worker_active;
-    let mut active = lock.lock().unwrap();
-    while *active {
-        active = cvar.wait(active).unwrap();
-    }
+    queue(p).close();
 }
 
 /// Returns a duplicated event handle owned by the caller (who closes it with `CloseHandle`).
@@ -2697,6 +2715,69 @@ mod tests {
             assert!(BCPACK.filled_bytes[7].load(Ordering::Relaxed) >= before + n as u64);
             queue_close(q);
             queue_release(q);
+            status_release(s);
+        }
+    }
+
+    /// DirectStorage closes a queue automatically when its last reference is released: in-flight
+    /// worker activity finishes before `Release` returns, remaining submitted requests do not write
+    /// caller buffers afterwards, and both submitted and unsubmitted status entries complete with
+    /// `E_QUEUE_CLOSED` rather than staying `E_PENDING` or succeeding with `S_OK`.
+    #[test]
+    fn last_queue_release_closes_pending_and_submitted_work_before_returning() {
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let weak = Arc::downgrade(queue(q));
+
+            let entered = Arc::new(std::sync::Barrier::new(2));
+            let hold = Arc::new(std::sync::Barrier::new(2));
+            let src = [0x5Au8; 64];
+            let mut dst_submitted = [0xCDu8; 64];
+            queue(q).enqueue(Entry::Gate(Arc::clone(&entered)));
+            queue(q).enqueue(Entry::Gate(Arc::clone(&hold)));
+            let req = request(SOURCE_MEMORY_BIT, dst_submitted.as_mut_ptr() as u64, dst_submitted.len() as u32, src.as_ptr() as u64, 0, src.len() as u32);
+            queue_enqueue_request(q, req.as_ptr());
+            queue_enqueue_status(q, s, 0);
+            queue_submit(q);
+            entered.wait();
+
+            // Unsubmitted status entry sitting in `pending.entries` (`E_PENDING`).
+            queue_enqueue_status(q, s, 1);
+            assert!(!status_is_complete(s, 1));
+
+            let unblocked = Arc::new(AtomicBool::new(false));
+            let u2 = Arc::clone(&unblocked);
+            let h2 = Arc::clone(&hold);
+            let t = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                u2.store(true, Ordering::Release);
+                h2.wait();
+            });
+
+            assert_eq!(queue_release(q), 0);
+            let waited_for_worker = unblocked.load(Ordering::Acquire);
+            t.join().unwrap();
+            let t0 = std::time::Instant::now();
+            while weak.upgrade().is_some() && t0.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            assert!(waited_for_worker, "Release returned before active worker item finished");
+            assert!(weak.upgrade().is_none());
+            assert!(dst_submitted.iter().all(|&b| b == 0xCD), "submitted request wrote to buffer after final Release");
+            assert!(status_is_complete(s, 0) && status_get_hresult(s, 0) == E_QUEUE_CLOSED, "submitted status must get E_QUEUE_CLOSED");
+            assert!(status_is_complete(s, 1) && status_get_hresult(s, 1) == E_QUEUE_CLOSED, "pending status must get E_QUEUE_CLOSED");
             status_release(s);
         }
     }

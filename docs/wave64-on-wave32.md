@@ -1,14 +1,13 @@
 # Wave64 console programs on 32-lane GPUs
 
-Status: implemented for compute / kernel mode, the mesh (NGG) first pass and ES+GS
-(`gpu/recomp/emit.rs`, `PRELUDE_X64`); wave64 VS / PS, which cannot be paired, get the values
+Wave64 compute uses packed registers on 32-lane GPUs. Kernel mode, the mesh
+(NGG) first pass and ES+GS use the split form (`gpu/recomp/emit.rs`, `PRELUDE_X64`).
+Wave64 VS / PS, which cannot be paired, get the values
 of the lanes ≥ 32 they read instead (`upper_lanes.rs`, "Vertex and pixel shaders" below).
-The native path is untouched: the form below is only
+The native wave64 path is untouched: the forms below are only
 generated when the adapter cannot run 64-lane waves (`D3D12_FEATURE_DATA_D3D12_OPTIONS1`
 `WaveLaneCountMax < 64`, e.g. NVIDIA, whose D3D12 range is 32..32). On such an adapter a
-`[WaveSize(64)]` compute shader is rejected at PSO creation, so until now wave64 compute
-programs were refused there, and mesh / ES+GS programs ran as two independent halves only
-when they had no cross-half operation (`geometry_wave32_hazards`) and were refused otherwise.
+`[WaveSize(64)]` compute shader is rejected at PSO creation.
 
 ## Execution model it relies on
 
@@ -21,7 +20,66 @@ from a handful of vector → scalar instructions: masks (`v_cmp*`, carries – a
 vector reads (DPP16, DPP8, `ds_swizzle`, `v_permlane(x)16`, `ds_bpermute`) also go through
 `rla()`.
 
-## The form
+## Packed compute
+
+A guest wave64 runs in one host wave32. Host lane `i` holds the VGPRs of guest
+lanes `i` and `i+32`, and both use one set of scalar registers. The entry
+flattens the physical group to 32 threads per guest wave. It reconstructs each
+slot's original x/y/z thread coordinates and masks unused slots in the final
+wave. The group ID and guest group dimensions are unchanged.
+
+Ballots combine the two masks before changing EXEC or VCC. Lane reads, swizzles,
+DPP and permutations use wave intrinsics. The two halves of a register
+permutation read their inputs before either writes its destination. Scalar
+loads broadcast one lane's value so a change in memory cannot split control
+flow within the packed wave. None of these exchanges uses shared memory.
+
+Every guest loop spends from the same budget. If any active lane runs out,
+the host wave gives up together, including where a loop contains wave
+intrinsics. A packed wave reports give-ups for its valid guest lanes. Real LDS
+operations fence the stores and reads of both slots; guest `s_barrier` still
+orders workgroup-wide LDS accesses. Multi-wave barriers keep their bounded
+progress check. Compute programs above 32,768 decoded guest instructions keep
+the split form to avoid expanding large shaders. For smaller programs, the
+build compares the actual packed and legacy DXIL before calling the driver.
+It keeps the legacy result if packing grows DXIL by more than 10×, or moves
+it from below 1 MiB to the driver's giant class. The comparison uses the
+normal DXIL cache for both forms, so cold programs may compile both.
+The translated cache stores the selected DXIL and samplers, so a repeat
+hit does not emit either form. It also keeps exact legacy results for
+reuse across size-policy changes. On a miss both layouts share guest
+instruction decoding and analysis; a non-blocking lookup defers the
+comparison to the pipeline worker.
+`XCL_COMPUTE_WAVE64_PACK_MAX_DXIL_RATIO` and
+`XCL_COMPUTE_WAVE64_PACK_GIANT_DXIL_BYTES` override these limits; zero disables
+that check. `XCL_COMPUTE_WAVE64_PACK_MAX_INSTS` changes the instruction cutoff.
+`XCL_COMPUTE_WAVE64_LEGACY=1` forces the split form. The shader log records
+the choice and the DXIL sizes when compared.
+
+`XCL_LOOP_PROFILE=1` profiles compute guest loops. Set it to a comma-separated
+list of compute shader hashes to instrument only those shaders. Enable
+`XCL_GPU_MARKERS` to allocate the counters and print them in a dispatch
+snapshot. Profiled shaders keep their normal layout selection, but their
+new DXIL needs a driver compile. Each recorded site shows guest byte PC,
+average and maximum iterations for completed lane visits, and a power-of-two
+milestone for still-running visits. Counts refer to logical slots carried
+through control flow, including EXEC-masked slots, not to individual VALU
+work. An exit is counted as early or at the static bound only when the
+translator recognizes such a bound, and separately when the shared budget
+or the optional static cap stopped it. At most 32 loop sites per shader
+are profiled. Snapshots of live GPU writes are best effort.
+
+`XCL_STATIC_LOOP_CAP=N` adds a per-visit cap to guest loops with a recognized
+static bound greater than N. It defaults to zero (off) and does not replace
+the shared budget. Like that budget, a cap may leave shader work unfinished.
+
+For a stalled dispatch, `XCL_GPU_MARKER_BUFFER=parameter:slot:byte_offset`
+adds the named buffer descriptor and the current dword to the marker report.
+The offset can be decimal or hexadecimal. This is a CPU snapshot, not a GPU
+readback. Image markers look up the descriptor's owner by its shader-visible
+heap index; an untracked owner does not mean the shader reads a null image.
+
+## Split form
 
 One console wave64 = two hardware wave32s of the same thread group ("halves"): the console
 group keeps its `numthreads` and the shader gets `[WaveSize(32)]`. Which hardware threads
@@ -79,10 +137,12 @@ SGPRs of both halves and the tests fail if they ever differ.
   co-resident waves of one group making progress, which holds on GPUs (all waves of a group
   are resident on one SM / CU) but not necessarily on WARP. `XCL_WAVE64_SPIN=1` forces this
   variant outside the native mesh stage.
-* **Native mesh** uses group barriers for exchanges. The RTX 3080 can serialize mesh
-  waves, so a wave polling another may time out even when both run identical code.
-  Multi-wave native mesh is accepted only when every wave reaches each exchange
-  together. Other mesh programs use the compute form for their exchanges.
+* **Native mesh** accepts one console wave per group. On a 32-lane host warp, each
+  thread holds the registers of guest lane `i` and `i + 32`. Ballots combine two wave
+  ballots, and lane reads and DPP use wave intrinsics. Neither exchange nor output
+  publication uses shared memory or a barrier. Wider mesh groups use the compute
+  form: on the RTX 3080, the first wave in a native mesh pair can finish polling
+  before its partner starts, even in straight-line code.
 
 A console wave whose upper half does not exist (group of 32 or 96 threads) exchanges with
 nobody: the missing lanes count as inactive (ballot bits 0), exactly as on the console. The
@@ -108,12 +168,11 @@ it. A program that really uses the whole 32 KB of LDS therefore loses its top dw
    `s_barrier` stays a group barrier (all console waves reach it, as on the console). The GS
    phase (lower half only) has no exchanges and its `s_barrier` is dropped (one wave).
    A wave that has ended is waited for at a D3D12 group barrier for ever, which the console
-   does not do. In native mesh code without LDS or memory writes, guest barriers only
-   order exports. The translator stages them and uses the uniform group barrier before
-   publishing the outputs. Barriers that synchronize memory stay real group barriers
-   only when every wave is proven to reach the same site. Elsewhere `xcl_s_barrier`
-   counts live waves and arrivals. It gives up after 1024 polls without progress, then
-   disables polling for the whole group so each pair of halves uses the same verdict.
+   does not do. A native mesh entry only uses group sync to order actual LDS accesses.
+   It emits the sync after both logical halves perform the access, outside the lane
+   predicates, and requires that no branch can skip the site. Otherwise that shader
+   uses the compute form. Its counted `xcl_s_barrier` gives up after 1024 polls without
+   progress and disables polling for the group so both halves use the same verdict.
 3. **Lane numbering** – handled by `xcl_x_thread` (see above); NVIDIA really does form waves
    of non-consecutive thread indices for 3-D groups (`gpu_split_wave64_waves_diverge` fails
    without the remap).

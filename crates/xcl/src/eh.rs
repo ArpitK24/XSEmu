@@ -110,8 +110,14 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        if !ctx.is_null() {
+            log_register_memory(&*ctx);
+        }
+        watch_report();
+        crash_dump();
         crate::report::write_final(Some(msg));
         crate::log::flush();
+        full_dump(info);
     }
     match TITLE_FILTER.load(Ordering::Acquire) {
         0 => 0, // EXCEPTION_CONTINUE_SEARCH
@@ -127,13 +133,21 @@ static ENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::ne
 /// status is not 0, every other thread – and the log written out. abort() leaves no other
 /// trace: the buffered log lines went with the process.
 unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 {
+    if h == 0 || h == -1 {
+        // (a full dump being written at a crash is finished first)
+        drop(FULL_DUMP.lock());
+        watch_report();
+    }
     if (h == 0 || h == -1) && !ENDING.swap(true, Ordering::AcqRel) {
         let probe = 0usize;
         let (tid, stack) = (windows_sys::Win32::System::Threading::GetCurrentThreadId(), stack_callers_n(&probe as *const usize as usize, 16));
         crate::hle::d3d12x::bind::log_trips();
+        crate::xlog_info!("at the end: {}", crate::hle::d3d12x::bind::mesh_counts());
         if status != 0 {
             crate::xlog_error!("process ends with status {status:#x} (thread {tid}); on the stack: {stack}");
             dump_threads();
+            // (an end that is no unhandled exception – a removed device – leaves the same record)
+            crash_dump();
         } else {
             crate::xlog_info!("process ends (thread {tid}); on the stack: {stack}");
         }
@@ -721,10 +735,23 @@ pub fn dump_threads() {
 // ---------------------------------------------------------------------------------------
 
 static WATCHED: AtomicUsize = AtomicUsize::new(0);
+/// counts the changes of `WATCHED`: a thread armed for an earlier address is armed again
+static WATCH_GEN: AtomicUsize = AtomicUsize::new(0);
 static WATCH_HITS: AtomicUsize = AtomicUsize::new(0);
+static WATCH_INSTALLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// the latest trapped writes: (uptime, thread, the address after the writing instruction, the
+/// value then)
+static WATCH_LAST: Mutex<std::collections::VecDeque<(f64, u32, usize, u64)>> = Mutex::new(std::collections::VecDeque::new());
 
 /// the exception `watch_writes` raises: the handler arms the raising thread at once
 const WATCH_ARM: u32 = 0xE0C1_A7E1;
+
+/// DR0 and its bits of DR7: a write watchpoint on the 8 bytes at `addr`, none for 0.
+fn set_watch(dr0: &mut u64, dr7: &mut u64, addr: usize) {
+    *dr0 = addr as u64;
+    // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
+    *dr7 = (*dr7 & !0xF_0003) | if addr == 0 { 0 } else { 1 | (0b01 << 16) | (0b10 << 18) };
+}
 
 unsafe extern "system" fn watch_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     const SINGLE_STEP: u32 = 0x8000_0004;
@@ -732,61 +759,84 @@ unsafe extern "system" fn watch_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
     let ctx = &mut *(*info).ContextRecord;
     let addr = WATCHED.load(Ordering::Acquire);
     if rec.ExceptionCode as u32 == WATCH_ARM {
-        ctx.Dr0 = addr as u64;
-        // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
-        ctx.Dr7 = (ctx.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
+        set_watch(&mut ctx.Dr0, &mut ctx.Dr7, addr);
         ctx.ContextFlags |= windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
         return -1;
     }
-    if rec.ExceptionCode as u32 != SINGLE_STEP || addr == 0 || ctx.Dr6 & 1 == 0 {
+    if rec.ExceptionCode as u32 != SINGLE_STEP || ctx.Dr6 & 1 == 0 {
         return 0; // EXCEPTION_CONTINUE_SEARCH
     }
     ctx.Dr6 = 0;
-    if WATCH_HITS.fetch_add(1, Ordering::Relaxed) < 32 {
+    if ctx.Dr0 as usize != addr || addr == 0 {
+        // armed for an address watched earlier: for the one watched now (or none), not a hit
+        set_watch(&mut ctx.Dr0, &mut ctx.Dr7, addr);
+        ctx.ContextFlags |= windows_sys::Win32::System::Diagnostics::Debug::CONTEXT_DEBUG_REGISTERS_AMD64;
+        return -1;
+    }
+    let n = WATCH_HITS.fetch_add(1, Ordering::AcqRel) + 1;
+    let value = (addr as *const u64).read_volatile();
+    let tid = windows_sys::Win32::System::Threading::GetCurrentThreadId();
+    {
+        let mut last = WATCH_LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if last.len() == 64 {
+            last.pop_front();
+        }
+        last.push_back((crate::log::uptime(), tid, ctx.Rip as usize, value));
+    }
+    if n <= 64 || n.is_power_of_two() {
         let callers = stack_callers(ctx.Rsp as usize);
         crate::xlog_warn!(
-            "watch: {:#x} now {:#x}, written by the instruction before {} (thread {}); on the stack: {}",
+            "watch: {:#x} now {:#x}, written by the instruction before {} (thread {}, write #{n}); on the stack: {}",
             addr,
-            (addr as *const u64).read_volatile(),
+            value,
             modules::describe_address(ctx.Rip as usize),
-            windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+            tid,
             callers
         );
     }
     -1 // EXCEPTION_CONTINUE_EXECUTION
 }
 
-/// Arm a hardware write watchpoint on the 8 bytes at `addr` in every thread of the process
-/// (threads created later are armed as they appear, for a minute); each write is logged
-/// with the writing code's address. `XCL_WATCH_DEVICE=1`: on the title's D3D12 device.
-pub fn watch_writes(addr: usize) {
+/// The watchpoint's handler, and a thread that keeps every thread of the process armed for the
+/// address watched now, for as long as the process runs (every 10 ms for a minute after the
+/// address changed, then every 50 ms: a thread made later is armed when the look finds it).
+fn watch_install() {
     use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, GetThreadContext, SetThreadContext, CONTEXT, CONTEXT_DEBUG_REGISTERS_AMD64};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Thread32First, Thread32Next, TH32CS_SNAPTHREAD, THREADENTRY32};
     use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
-    if WATCHED.swap(addr, Ordering::AcqRel) != 0 {
+    if WATCH_INSTALLED.swap(true, Ordering::AcqRel) {
         return;
     }
     unsafe {
         AddVectoredExceptionHandler(1, Some(watch_handler));
-        // the calling thread now (the others below, as the arming loop reaches them)
-        windows_sys::Win32::System::Diagnostics::Debug::RaiseException(WATCH_ARM, 0, 0, std::ptr::null());
     }
-    crate::xlog_warn!("watch: write watchpoint on {addr:#x}");
-    std::thread::spawn(move || {
+    let _ = std::thread::Builder::new().name("xcl-watch-arm".into()).spawn(move || {
         let me = unsafe { GetCurrentThreadId() };
         let mut armed = std::collections::HashSet::new();
-        let start = std::time::Instant::now();
-        while start.elapsed().as_secs() < 60 {
+        let mut gen = usize::MAX;
+        let mut changed = std::time::Instant::now();
+        loop {
+            let now = WATCH_GEN.load(Ordering::Acquire);
+            if now != gen {
+                gen = now;
+                armed.clear();
+                changed = std::time::Instant::now();
+            }
+            let addr = WATCHED.load(Ordering::Acquire);
             unsafe {
                 let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
                 if snap == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
                 }
+                let mut seen = std::collections::HashSet::new();
                 let mut e: THREADENTRY32 = std::mem::zeroed();
                 e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
                 let mut ok = Thread32First(snap, &mut e) != 0;
                 while ok {
+                    if e.th32OwnerProcessID == GetCurrentProcessId() && e.th32ThreadID != me {
+                        seen.insert(e.th32ThreadID);
+                    }
                     if e.th32OwnerProcessID == GetCurrentProcessId() && e.th32ThreadID != me && armed.insert(e.th32ThreadID) {
                         let h = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME, 0, e.th32ThreadID);
                         if !h.is_null() {
@@ -797,9 +847,7 @@ pub fn watch_writes(addr: usize) {
                             c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
                             if SuspendThread(h) != u32::MAX {
                                 if GetThreadContext(h, &mut c.0) != 0 {
-                                    c.0.Dr0 = addr as u64;
-                                    // L0, RW0 = 01 (writes), LEN0 = 10 (8 bytes)
-                                    c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | 1 | (0b01 << 16) | (0b10 << 18);
+                                    set_watch(&mut c.0.Dr0, &mut c.0.Dr7, addr);
                                     SetThreadContext(h, &c.0);
                                 }
                                 ResumeThread(h);
@@ -807,15 +855,343 @@ pub fn watch_writes(addr: usize) {
                                 armed.remove(&e.th32ThreadID);
                             }
                             windows_sys::Win32::Foundation::CloseHandle(h);
+                        } else {
+                            armed.remove(&e.th32ThreadID);
                         }
                     }
                     ok = Thread32Next(snap, &mut e) != 0;
                 }
                 windows_sys::Win32::Foundation::CloseHandle(snap);
+                // (a thread id is used again once its thread has ended)
+                armed.retain(|t| seen.contains(t));
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            std::thread::sleep(std::time::Duration::from_millis(if changed.elapsed().as_secs() < 60 { 10 } else { 50 }));
         }
     });
+}
+
+/// Arm a hardware write watchpoint on the 8 bytes at `addr` in every thread of the process
+/// (threads created later are armed as they appear); each write is logged with the writing
+/// code's address. `XCL_WATCH_DEVICE=1`: on the title's D3D12 device.
+pub fn watch_writes(addr: usize) {
+    if WATCHED.compare_exchange(0, addr, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return;
+    }
+    WATCH_GEN.fetch_add(1, Ordering::AcqRel);
+    watch_install();
+    unsafe {
+        // the calling thread now (the others as the arming thread reaches them)
+        windows_sys::Win32::System::Diagnostics::Debug::RaiseException(WATCH_ARM, 0, 0, std::ptr::null());
+    }
+    crate::xlog_warn!("watch: write watchpoint on {addr:#x}");
+}
+
+/// whether XCL's own writes into the title's memory are kept (`XCL_WATCH`, `XCL_CRASH_DUMP`)
+static LEDGER_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+const LEDGER_MAX: usize = 1 << 21;
+/// XCL's own writes into the title's memory, the latest `LEDGER_MAX`: (uptime, what, address,
+/// bytes, what it was done for)
+#[allow(clippy::type_complexity)]
+static LEDGER: Mutex<std::collections::VecDeque<(f32, &'static str, usize, usize, Option<std::sync::Arc<str>>)>> = Mutex::new(std::collections::VecDeque::new());
+
+thread_local! {
+    /// what the calling thread's writes into the title's memory are done for (`with_write_context`)
+    static WRITE_CONTEXT: std::cell::RefCell<Option<std::sync::Arc<str>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// `f`, with the writes into the title's memory it makes (`note_guest_write`) kept as done for
+/// `detail` – a DirectStorage request's file and offset, the call a GPU readback follows.
+pub fn with_write_context<R>(detail: impl FnOnce() -> String, f: impl FnOnce() -> R) -> R {
+    if !LEDGER_ON.load(Ordering::Relaxed) {
+        return f();
+    }
+    let was = WRITE_CONTEXT.with(|c| c.replace(Some(detail().into())));
+    let r = f();
+    WRITE_CONTEXT.with(|c| *c.borrow_mut() = was);
+    r
+}
+
+/// XCL (or a kernel call it made for the title) wrote `len` bytes of the title's memory at `at`.
+/// A hardware watchpoint does not see a kernel write (ReadFile, NtWriteVirtualMemory) and names
+/// only XCL's copy loop for the others, so under `XCL_WATCH` / `XCL_CRASH_DUMP` these writes are
+/// kept: one over the watched address is logged at once, and the ones over an address are named
+/// when the watch reaches it and at a crash.
+pub fn note_guest_write(what: &'static str, at: usize, len: usize) {
+    if !LEDGER_ON.load(Ordering::Relaxed) || len == 0 {
+        return;
+    }
+    let detail = WRITE_CONTEXT.with(|c| c.borrow().clone());
+    let watched = WATCHED.load(Ordering::Relaxed);
+    if watched != 0 && at <= watched && watched - at < len {
+        static LINES: AtomicUsize = AtomicUsize::new(0);
+        if LINES.fetch_add(1, Ordering::Relaxed) < 256 {
+            let value = unsafe { probe_bytes(watched as u64, 8) }.map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+            crate::xlog_warn!(
+                "watch: XCL wrote {len:#x} bytes at {at:#x} over the watched {watched:#x} ({what}{}; thread {}); it holds {value:x?} now",
+                detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default(),
+                unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
+            );
+        }
+    }
+    let mut l = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+    if l.len() == LEDGER_MAX {
+        l.pop_front();
+    }
+    l.push_back((crate::log::uptime() as f32, what, at, len, detail));
+}
+
+/// XCL's own writes over `addr`, the latest first (up to 6).
+fn ledger_covering(addr: usize) -> String {
+    let l = LEDGER.lock().unwrap_or_else(|e| e.into_inner());
+    let hits: Vec<String> = l
+        .iter()
+        .rev()
+        .filter(|e| e.2 <= addr && addr - e.2 < e.3)
+        .take(6)
+        .map(|e| format!("{} of {:#x} bytes at {:#x}, {:.3} s{}", e.1, e.3, e.2, e.0, e.4.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()))
+        .collect();
+    if hits.is_empty() { format!("none among the {} kept", l.len()) } else { hits.join("; ") }
+}
+
+/// A chain: an address in the title's exe (hex RVA), then for each `@off` the pointer held there
+/// plus the offset – `100@28` is 0x28 bytes into what the pointer at exe+0x100 points to.
+fn parse_chain(s: &str) -> Option<(usize, Vec<usize>)> {
+    let mut parts = s.split('@').map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
+    let rva = parts.next()??;
+    Some((rva, parts.collect::<Option<Vec<usize>>>()?))
+}
+
+/// Where a chain points now; None while a pointer on the way is null or its memory not readable.
+unsafe fn resolve_chain(base: usize, chain: &(usize, Vec<usize>)) -> Option<usize> {
+    let mut p = base.checked_add(chain.0)?;
+    for &off in &chain.1 {
+        let v = u64::from_le_bytes(probe_bytes(p as u64, 8)?.try_into().unwrap()) as usize;
+        if v == 0 {
+            return None;
+        }
+        p = v.wrapping_add(off);
+    }
+    (p > 0x10000 && crate::gpu::shader::readable(p, 8)).then_some(p)
+}
+
+/// `XCL_WATCH=<chain>`: the 8 bytes the chain points to are watched for the whole run. The chain
+/// is followed again every millisecond: when it points somewhere else (a table's first entry
+/// made, moved, gone) the watchpoint moves there, and the value found and XCL's own earlier
+/// writes over the place are logged. Every CPU write is trapped and logged with its thread and
+/// code (`watch_handler`); a change no trap saw – a kernel write, a thread not armed yet – is
+/// logged from the look, with XCL's own writes over the place.
+fn watch_chain(spec: String, chain: (usize, Vec<usize>)) {
+    LEDGER_ON.store(true, Ordering::Release);
+    let _ = std::thread::Builder::new().name("xcl-watch".into()).spawn(move || {
+        let base = loop {
+            if let Some(m) = modules::main_module() {
+                break m.base;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let read = |at: usize| unsafe { probe_bytes(at as u64, 8) }.map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+        let (mut target, mut value, mut hits, mut lines) = (0usize, None, 0usize, 0usize);
+        loop {
+            let now = unsafe { resolve_chain(base, &chain) }.unwrap_or(0);
+            if now != target {
+                target = now;
+                WATCHED.store(now, Ordering::Release);
+                WATCH_GEN.fetch_add(1, Ordering::AcqRel);
+                value = read(now);
+                hits = WATCH_HITS.load(Ordering::Acquire);
+                if now != 0 {
+                    watch_install();
+                }
+                lines += 1;
+                if lines <= 256 && now != 0 {
+                    crate::xlog_warn!("watch: {spec} is {now:#x} now, holding {value:x?} ({}); XCL's own writes over it so far: {}", crate::hle::kernelx::lazy::describe(now), ledger_covering(now));
+                } else if lines <= 256 {
+                    crate::xlog_warn!("watch: {spec} points nowhere now");
+                }
+                // (every thread is armed again for a new place: not more often than this)
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                continue;
+            }
+            if target != 0 {
+                let v = read(target);
+                if v != value {
+                    // a trapped write is logged by its own thread: a moment for that
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    if WATCH_HITS.load(Ordering::Acquire) == hits {
+                        lines += 1;
+                        if lines <= 256 {
+                            crate::xlog_warn!(
+                                "watch: {target:#x} changed from {value:x?} to {v:x?} with no CPU write trapped (a kernel write, or a thread not armed yet); XCL's own writes over it: {}",
+                                ledger_covering(target)
+                            );
+                        }
+                    }
+                    value = read(target);
+                }
+                hits = WATCH_HITS.load(Ordering::Acquire);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    });
+}
+
+/// At a crash or the process's end, once: what the watched place holds, the latest trapped
+/// writes and XCL's own writes over it.
+fn watch_report() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let addr = WATCHED.load(Ordering::Acquire);
+    if addr == 0 || DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let value = unsafe { probe_bytes(addr as u64, 8) }.map(|b| u64::from_le_bytes(b.try_into().unwrap()));
+    let last: Vec<String> = WATCH_LAST
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .rev()
+        .take(16)
+        .map(|&(t, tid, rip, v)| format!("{t:.3} s thread {tid} before {}: {v:#x}", modules::describe_address(rip)))
+        .collect();
+    crate::xlog_warn!(
+        "watch: at the end {addr:#x} holds {value:x?}; {} CPU writes trapped, the latest first: [{}]; XCL's own writes over it: {}",
+        WATCH_HITS.load(Ordering::Acquire),
+        last.join("; "),
+        ledger_covering(addr)
+    );
+}
+
+/// `n` bytes at `at` in hex, in groups of 8 (diagnostics); None where the memory is not readable.
+unsafe fn hex_at(at: usize, n: usize) -> Option<String> {
+    let b = probe_bytes(at as u64, n)?;
+    Some(b.chunks(8).map(|c| c.iter().map(|x| format!("{x:02x}")).collect::<String>()).collect::<Vec<_>>().join(" "))
+}
+
+/// XCL's own writes over `addr` for a line of a dump: nothing where there are none.
+fn xcl_wrote(addr: usize) -> String {
+    let w = ledger_covering(addr);
+    if w.starts_with("none among") { String::new() } else { format!(" – XCL's own writes over it: {w}") }
+}
+
+/// At an unhandled exception: the 80 bytes each register points to, where that is memory – the
+/// record a loop was on, the object a call was made on – which a title's small dump leaves out;
+/// and 64 bytes at each of the first four pointers there (the records that object holds: what a
+/// load through it read), each once. Every place with XCL's own writes over it.
+unsafe fn log_register_memory(c: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) {
+    let regs = [
+        ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+        ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15), ("rsp", c.Rsp),
+    ];
+    let (mut lines, mut seen) = (Vec::new(), Vec::new());
+    for &(n, v) in &regs {
+        let Some(h) = hex_at(v as usize, 80) else { continue };
+        lines.push(format!("  {n} {v:#x}: {h}{}", xcl_wrote(v as usize)));
+        let Some(first) = probe_bytes(v, 32) else { continue };
+        for (i, q) in first.chunks_exact(8).enumerate() {
+            let p = u64::from_le_bytes(q.try_into().unwrap());
+            // (not code or a vtable: an image's pages are not the title's records)
+            if p & 7 != 0 || seen.contains(&p) || regs.iter().any(|r| r.1 == p) || crate::hle::kernelx::lazy::describe(p as usize).contains("type 0x1000000") {
+                continue;
+            }
+            let Some(h) = hex_at(p as usize, 64) else { continue };
+            seen.push(p);
+            lines.push(format!("    [{n}+{:#x}] {p:#x}: {h}{}", i * 8, xcl_wrote(p as usize)));
+        }
+    }
+    if !lines.is_empty() {
+        crate::xlog_error!("memory at the registers (thread {}):\n{}", windows_sys::Win32::System::Threading::GetCurrentThreadId(), lines.join("\n"));
+    }
+}
+
+/// `XCL_CRASH_DUMP=<chain>:<bytes>[p],…` (hex): at the first unhandled exception those bytes at each
+/// chain go to the log in hex; with `p` also 256 bytes at every pointer among them, each with XCL's
+/// own writes over the place – a table of the title's and the records its entries point to.
+unsafe fn crash_dump() {
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Ok(spec) = std::env::var("XCL_CRASH_DUMP") else { return };
+    let Some(base) = modules::main_module().map(|m| m.base) else { return };
+    if DONE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let mut seen = std::collections::HashSet::new();
+    for item in spec.split(',') {
+        let Some((chain_s, len_s)) = item.trim().split_once(':') else { continue };
+        let follow = len_s.ends_with('p');
+        let (Some(chain), Ok(len)) = (parse_chain(chain_s), usize::from_str_radix(len_s.trim_end_matches('p'), 16)) else { continue };
+        let len = len.min(0x1_0000);
+        let Some(at) = resolve_chain(base, &chain) else {
+            crate::xlog_error!("crash dump {chain_s}: points nowhere");
+            continue;
+        };
+        let mut out = format!("crash dump {chain_s} ({at:#x}, {len:#x} bytes):");
+        let mut pointers = Vec::new();
+        for off in (0..len).step_by(32) {
+            let n = 32.min(len - off);
+            match probe_bytes((at + off) as u64, n) {
+                Some(b) => {
+                    out += &format!("\n  +{off:04x}: {}", b.chunks(8).map(|c| c.iter().map(|x| format!("{x:02x}")).collect::<String>()).collect::<Vec<_>>().join(" "));
+                    pointers.extend(b.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap()) as usize));
+                }
+                None => out += &format!("\n  +{off:04x}: not readable"),
+            }
+        }
+        crate::xlog_error!("{out}");
+        if !follow {
+            continue;
+        }
+        for p in pointers {
+            if p < 0x10000 || p >> 47 != 0 || seen.len() >= 1024 || !seen.insert(p) {
+                continue;
+            }
+            let Some(b) = probe_bytes(p as u64, 256) else { continue };
+            let hex: Vec<String> = b.chunks(32).enumerate().map(|(i, r)| format!("  +{:04x}: {}", i * 32, r.chunks(8).map(|c| c.iter().map(|x| format!("{x:02x}")).collect::<String>()).collect::<Vec<_>>().join(" "))).collect();
+            crate::xlog_error!("crash dump {chain_s} -> {p:#x} ({}); XCL's own writes over it: {}\n{}", crate::hle::kernelx::lazy::describe(p), ledger_covering(p), hex.join("\n"));
+        }
+    }
+    crate::log::flush();
+}
+
+/// (whether the full dump was written or tried: the lock is held while it is written)
+static FULL_DUMP: Mutex<bool> = Mutex::new(false);
+
+/// a process that commits more than this gets a small dump instead of all of its memory: the
+/// full dump of a 19 GB process took the PC's last memory, and 8.5 GB of disk before it was stopped
+const FULL_DUMP_MOST: u64 = 4 << 30;
+
+/// `XCL_FULL_DUMP=<directory>`: at the first unhandled exception a dump of the process is written
+/// there by the helper process (`dump_by_helper`) before the title's own handler runs. All of
+/// its memory while it commits no more than `FULL_DUMP_MOST` (a title's own dump is a small one
+/// without its heaps and data); over that its threads, their stacks and the memory those point
+/// to, and the log has the rest (`crash_dump`, `log_register_memory`). The directory is the PC's:
+/// the file is made outside the title's view of the file system, where `D:\` is its package.
+/// Other threads that crash, and the process's end, wait until it is written.
+unsafe fn full_dump(info: *const EXCEPTION_POINTERS) {
+    use std::os::windows::io::AsRawHandle;
+    let Some(dir) = std::env::var_os("XCL_FULL_DUMP").filter(|d| !d.is_empty()) else { return };
+    let mut done = FULL_DUMP.lock().unwrap_or_else(|e| e.into_inner());
+    if std::mem::replace(&mut *done, true) {
+        return;
+    }
+    let commit = crate::util::process_commit_bytes() as u64;
+    let full = commit <= FULL_DUMP_MOST;
+    // MiniDumpWithFullMemory | MiniDumpWithFullMemoryInfo | MiniDumpWithThreadInfo, or
+    // MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo
+    let ty = if full { 0x2 | 0x800 | 0x1000 } else { 0x40 | 0x1000 };
+    let path = std::path::Path::new(&dir).join(format!("xcl-{}-{}.dmp", if full { "full" } else { "small" }, windows_sys::Win32::System::Threading::GetCurrentProcessId()));
+    let t = std::time::Instant::now();
+    let r = match crate::vfs_hooks::with_host_io(|| std::fs::File::create(&path)) {
+        Ok(f) => dump_by_helper(f.as_raw_handle() as HANDLE, ty, windows_sys::Win32::System::Threading::GetCurrentThreadId(), info as usize, 1_800_000),
+        Err(e) => Err(format!("cannot create the file ({e})")),
+    };
+    crate::xlog_error!(
+        "{} dump to {} ({} MB committed; all of the memory is written up to {} MB): {} after {:.1} s",
+        if full { "full" } else { "small" },
+        path.display(),
+        commit >> 20,
+        FULL_DUMP_MOST >> 20,
+        r.err().unwrap_or_else(|| "done".into()),
+        t.elapsed().as_secs_f64()
+    );
+    crate::log::flush();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -915,16 +1291,17 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
 /// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
 /// title's code runs, with what, without changing it.
 pub fn start_probes() {
-    // `XCL_WATCH=rva` (hex, in the title's exe): every write to those 8 bytes is logged with
-    // the writing code (`watch_writes`) – who fills a field the title later trips over
-    if let Some(rva) = std::env::var("XCL_WATCH").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
-        let _ = std::thread::Builder::new().name("xcl-watch".into()).spawn(move || loop {
-            if let Some(m) = modules::main_module() {
-                watch_writes(m.base + rva);
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        });
+    // `XCL_WATCH=<chain>` (hex, in the title's exe: `rva`, or `rva@off…` through pointers): every
+    // write to the 8 bytes there is logged with the writing code (`watch_chain`) – who fills a
+    // field the title later trips over
+    if let Ok(spec) = std::env::var("XCL_WATCH") {
+        match parse_chain(&spec) {
+            Some(chain) => watch_chain(spec.trim().to_string(), chain),
+            None => crate::xlog_warn!("XCL_WATCH={spec}: not a chain (a hex rva, then @offset for each pointer followed)"),
+        }
+    }
+    if std::env::var_os("XCL_CRASH_DUMP").is_some() {
+        LEDGER_ON.store(true, Ordering::Release);
     }
     let rvas: Vec<usize> = std::env::var("XCL_PROBE").unwrap_or_default().split(',').filter_map(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()).take(3).collect();
     if rvas.is_empty() {
@@ -1010,41 +1387,52 @@ pub fn host_override(dll: &str, name: &str) -> Option<usize> {
 /// hangs the process (play-45). A helper xcl process (`xcl minidump`) writes it instead, as
 /// dbghelp advises. Other processes' dumps go to dbghelp as they are.
 unsafe extern "system" fn minidump_write_dump(process: HANDLE, pid: u32, file: HANDLE, ty: u32, exc: *const MINIDUMP_EXCEPTION_INFORMATION, user: *const c_void, callback: *const c_void) -> i32 {
-    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
-    use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
-    if pid != GetCurrentProcessId() {
+    if pid != windows_sys::Win32::System::Threading::GetCurrentProcessId() {
         return real_minidump_write_dump().map_or(0, |f| f(process, pid, file, ty, exc, user, callback));
     }
     let (tid, pointers) = exc.as_ref().map_or((0, 0), |e| (e.ThreadId, e.ExceptionPointers as usize));
+    let r = dump_by_helper(file, ty, tid, pointers, 120_000);
+    crate::xlog_info!(
+        "the title's minidump (type {ty:#x}, thread {tid}) written by a helper process: {}{}",
+        r.as_ref().err().cloned().unwrap_or_else(|| "done".into()),
+        if user.is_null() && callback.is_null() { "" } else { "; its user streams and callback left out" }
+    );
+    crate::log::flush();
+    r.is_ok() as i32
+}
+
+/// A dump of this process of type `ty` written into `file` by a helper xcl process
+/// (`xcl minidump`), waited for up to `wait_ms`; `pointers`: the crashing thread's exception
+/// pointers, or 0. The error says what did not work.
+unsafe fn dump_by_helper(file: HANDLE, ty: u32, tid: u32, pointers: usize, wait_ms: u32) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateProcessW, GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, WaitForSingleObject, CREATE_NO_WINDOW, PROCESS_INFORMATION, STARTUPINFOW};
+    let pid = GetCurrentProcessId();
     let me = GetCurrentProcess();
     let mut inherited: HANDLE = std::ptr::null_mut();
     if DuplicateHandle(me, file, me, &mut inherited, 0, 1, DUPLICATE_SAME_ACCESS) == 0 {
-        crate::xlog_error!("the title's minidump: cannot pass its file to a helper process");
-        return 0;
+        return Err("cannot pass its file to a helper process".into());
     }
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
     let mut cmd = crate::util::wide(&format!("\"{exe}\" minidump {pid} {} {ty} {tid} {pointers}", inherited as usize));
     let si = STARTUPINFOW { cb: std::mem::size_of::<STARTUPINFOW>() as u32, ..std::mem::zeroed() };
     let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
     let started = CreateProcessW(std::ptr::null(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 1, CREATE_NO_WINDOW, std::ptr::null(), std::ptr::null(), &si, &mut pi) != 0;
+    let error = std::io::Error::last_os_error();
     CloseHandle(inherited);
     if !started {
-        crate::xlog_error!("the title's minidump: cannot start the helper process ({})", std::io::Error::last_os_error());
-        return 0;
+        return Err(format!("cannot start the helper process ({error})"));
     }
     CloseHandle(pi.hThread);
-    let waited = WaitForSingleObject(pi.hProcess, 120_000);
+    let waited = WaitForSingleObject(pi.hProcess, wait_ms);
     let mut code = 1u32;
     GetExitCodeProcess(pi.hProcess, &mut code);
     CloseHandle(pi.hProcess);
-    let written = waited == WAIT_OBJECT_0 && code == 0;
-    crate::xlog_info!(
-        "the title's minidump (type {ty:#x}, thread {tid}) written by a helper process: {}{}",
-        if written { "done".to_string() } else if waited == WAIT_OBJECT_0 { format!("failed (exit code {code:#x})") } else { "no end after 120 s".to_string() },
-        if user.is_null() && callback.is_null() { "" } else { "; its user streams and callback left out" }
-    );
-    crate::log::flush();
-    written as i32
+    match (waited == WAIT_OBJECT_0, code) {
+        (true, 0) => Ok(()),
+        (true, _) => Err(format!("failed (exit code {code:#x})")),
+        (false, _) => Err(format!("no end after {} s", wait_ms / 1000)),
+    }
 }
 
 /// `xcl minidump <pid> <file handle> <type> <thread> <exception pointers>`: the helper that
@@ -1333,6 +1721,51 @@ mod tests {
             modules::unregister_mapped(code);
             VirtualFree(code as *mut _, 0, MEM_RELEASE);
             VirtualFree(buf as *mut _, 0, MEM_RELEASE);
+        }
+    }
+
+    /// The write watch end to end on the calling thread: a chain through a pointer is followed,
+    /// a CPU write is trapped with its value, a write to the place watched before is not counted,
+    /// and XCL's own writes over a place are named with what they were done for.
+    #[test]
+    fn a_chain_watch_traps_cpu_writes_and_names_xcls_own() {
+        let records = Box::leak(Box::new([0u64; 16]));
+        let table = Box::leak(Box::new([0u64; 2]));
+        let chain = parse_chain("0@28").unwrap();
+        assert_eq!(chain, (0, vec![0x28]));
+        assert_eq!(parse_chain("12g"), None);
+        let base = table.as_ptr() as usize;
+        unsafe {
+            assert_eq!(resolve_chain(base, &chain), None, "a null pointer on the way");
+            table[0] = records.as_ptr() as u64;
+            let field = records.as_ptr() as usize + 0x28;
+            assert_eq!(resolve_chain(base, &chain), Some(field));
+            watch_writes(field);
+            assert_eq!(WATCHED.load(Ordering::Acquire), field, "no other watch in the tests");
+            let before = WATCH_HITS.load(Ordering::Acquire);
+            std::ptr::write_volatile(field as *mut u64, 0x1122_3344_5566_7788);
+            assert_eq!(WATCH_HITS.load(Ordering::Acquire), before + 1);
+            let last = *WATCH_LAST.lock().unwrap().back().unwrap();
+            assert_eq!((last.1, last.3), (windows_sys::Win32::System::Threading::GetCurrentThreadId(), 0x1122_3344_5566_7788));
+            // the watch moves: this thread may still be armed for the old place
+            let other = records.as_ptr() as usize + 0x68;
+            WATCHED.store(other, Ordering::Release);
+            WATCH_GEN.fetch_add(1, Ordering::AcqRel);
+            std::ptr::write_volatile(field as *mut u64, 1);
+            assert_eq!(WATCH_HITS.load(Ordering::Acquire), before + 1, "a write to the place watched before is not one");
+            std::ptr::write_volatile(other as *mut u64, 2);
+            assert_eq!(WATCH_HITS.load(Ordering::Acquire), before + 2);
+            // XCL's own writes
+            LEDGER_ON.store(true, Ordering::Release);
+            with_write_context(|| "a test request".into(), || note_guest_write("DirectStorage", records.as_ptr() as usize, 0x80));
+            note_guest_write("ReadFile", records.as_ptr() as usize, 0x20);
+            let named = ledger_covering(other);
+            assert!(named.starts_with("DirectStorage of 0x80 bytes") && named.contains("(a test request)") && !named.contains("ReadFile"), "{named}");
+            assert_eq!(hex_at(other, 16).as_deref(), Some("0200000000000000 0000000000000000"));
+            WATCHED.store(0, Ordering::Release);
+            WATCH_GEN.fetch_add(1, Ordering::AcqRel);
+            std::ptr::write_volatile(other as *mut u64, 3);
+            assert_eq!(WATCH_HITS.load(Ordering::Acquire), before + 2, "no watch any more");
         }
     }
 }

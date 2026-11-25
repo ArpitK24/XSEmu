@@ -1115,7 +1115,12 @@ pub fn mesh_native_split() -> Result<Option<bool>, String> {
 /// mesh shader, `ps` = pixel shader; initial SGPRs `sgprs` (u0), flat memory `mem`. Returns the
 /// RGBA32F pixels of a `size`² target.
 pub fn mesh_draw_native(ms: &[u8], ps: &[u8], groups: MeshGroups, sgprs: &[u32], mem: &[u32], size: u32, clear: [f32; 4]) -> Result<Vec<[f32; 4]>, String> {
-    mesh_draw_with(None, ms, ps, groups, 1, 64, sgprs, mem, size, clear).map(|r| r.0)
+    mesh_draw_with(None, ms, ps, groups, 1, 64, sgprs, mem, size, clear, false).map(|r| r.0)
+}
+
+#[cfg(test)]
+pub(super) fn mesh_draw_native_flat(ms: &[u8], ps: &[u8], groups: u32, sgprs: &[u32], mem: &[u32], size: u32, clear: [f32; 4]) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
+    mesh_draw_with(None, ms, ps, MeshGroups::Direct(groups), 1, 64, sgprs, mem, size, clear, true)
 }
 
 /// `mesh_draw` with `split` mesh groups per record (`emit::passthrough_split`).
@@ -1132,7 +1137,7 @@ pub fn mesh_draw_split(
     size: u32,
     clear: [f32; 4],
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
-    mesh_draw_with(Some(cs), ms, ps, MeshGroups::Direct(groups), split, record_dwords, sgprs, mem, size, clear)
+    mesh_draw_with(Some(cs), ms, ps, MeshGroups::Direct(groups), split, record_dwords, sgprs, mem, size, clear, false)
 }
 
 /// `mesh_draw_split`, or without `cs` the mesh pipeline alone (`mesh_draw_native`; u1 is then
@@ -1149,6 +1154,7 @@ fn mesh_draw_with(
     mem: &[u32],
     size: u32,
     clear: [f32; 4],
+    read_flat: bool,
 ) -> Result<(Vec<[f32; 4]>, Vec<u32>), String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
@@ -1244,10 +1250,11 @@ fn mesh_draw_with(
         let io_buf = buffer(dev, io_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let mem_buf = buffer(dev, mem_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
         let res_buf = buffer(dev, res_bytes, D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_STATE_COMMON, true)?;
+        let (result_buf, result_bytes) = if read_flat { (&mem_buf, mem_bytes) } else { (&res_buf, res_bytes) };
         let mut fp = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
         let mut total = 0u64;
         dev.GetCopyableFootprints(&tex, 0, 1, 0, Some(&mut fp), None, None, Some(&mut total));
-        let readback = buffer(dev, total + res_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
+        let readback = buffer(dev, total + result_bytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, false)?;
 
         let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(e)?;
         let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, cpso.as_ref()).map_err(e)?;
@@ -1305,12 +1312,12 @@ fn mesh_draw_with(
         }
         list.ResourceBarrier(&[
             transition(&rt, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE),
-            transition(&res_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            transition(result_buf, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE),
         ]);
         let dst = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&readback), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         let src = D3D12_TEXTURE_COPY_LOCATION { pResource: transmute_copy(&rt), Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
-        list.CopyBufferRegion(&readback, total, &res_buf, 0, res_bytes);
+        list.CopyBufferRegion(&readback, total, result_buf, 0, result_bytes);
         list.Close().map_err(e)?;
         gpu.queue.ExecuteCommandLists(&[Some(list.cast().map_err(e)?)]);
         gpu.value += 1;
@@ -1325,7 +1332,7 @@ fn mesh_draw_with(
                 px.push([*c, *c.add(1), *c.add(2), *c.add(3)]);
             }
         }
-        let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, res_len).to_vec();
+        let recs = std::slice::from_raw_parts((q as *const u8).add(total as usize) as *const u32, (result_bytes / 4) as usize).to_vec();
         readback.Unmap(0, None);
         Ok((px, recs))
     }

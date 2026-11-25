@@ -1427,6 +1427,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicU32;
 
+    /// XSystemGetConsoleId, XSystemGetXboxLiveSandboxId and XSystemGetAppSpecificDeviceId
+    /// (size, buffer, size used): the string and its terminator in a buffer of exactly the size
+    /// needed or more, no byte in a smaller one, no byte outside the buffer either way, and the
+    /// size needed (terminator included) as a size_t where the third argument points.
+    #[test]
+    fn xsystem_strings_stay_inside_the_buffer_they_are_given() {
+        type Getter = unsafe extern "system" fn(usize, *mut u8, *mut usize) -> HRESULT;
+        let getters: [(&str, Getter); 3] = [("XSystemGetConsoleId", XSystemGetConsoleId), ("XSystemGetXboxLiveSandboxId", XSystemGetXboxLiveSandboxId), ("XSystemGetAppSpecificDeviceId", XSystemGetAppSpecificDeviceId)];
+        for (name, get) in getters {
+            unsafe {
+                let mut needed = 0usize;
+                assert_eq!(get(0, std::ptr::null_mut(), &mut needed), crate::util::E_NOT_SUFFICIENT_BUFFER, "{name}: no buffer");
+                assert!(needed >= 2 && needed <= 45, "{name}: needs {needed} bytes");
+                let mut want = vec![0u8; needed];
+                assert_eq!(get(needed, want.as_mut_ptr(), std::ptr::null_mut()), S_OK, "{name}: no place for the size used");
+                assert_eq!(want.iter().position(|&b| b == 0), Some(needed - 1), "{name}: one terminator, the last byte");
+                for size in [0, 1, needed - 1, needed, needed + 1, 64] {
+                    let mut mem = [0xA5u8; 96];
+                    let mut used = [usize::MAX; 3];
+                    let hr = get(size, mem.as_mut_ptr().add(16), &mut used[1]);
+                    assert_eq!(used, [usize::MAX, needed, usize::MAX], "{name}: the size used is one size_t");
+                    if size < needed {
+                        assert_eq!(hr, crate::util::E_NOT_SUFFICIENT_BUFFER, "{name}: a buffer of {size} bytes");
+                        assert!(mem.iter().all(|&b| b == 0xA5), "{name}: wrote into a buffer of {size} bytes, too small for it");
+                    } else {
+                        assert_eq!(hr, S_OK, "{name}: a buffer of {size} bytes");
+                        assert_eq!(&mem[16..16 + needed], &want[..], "{name}: a buffer of {size} bytes");
+                        assert!(mem[..16].iter().chain(&mem[16 + needed..]).all(|&b| b == 0xA5), "{name}: wrote outside the string in a buffer of {size} bytes");
+                    }
+                }
+            }
+        }
+        // XSystemConsoleIdBytes
+        let mut needed = 0usize;
+        unsafe { XSystemGetConsoleId(0, std::ptr::null_mut(), &mut needed) };
+        assert_eq!(needed, 39);
+    }
+
     unsafe fn query(c: Guid, i: Guid) -> (HRESULT, *mut c_void) {
         let mut o = std::ptr::null_mut();
         (QueryApiImpl(&c, &i, &mut o), o)

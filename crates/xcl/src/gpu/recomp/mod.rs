@@ -54,6 +54,7 @@
 pub mod dxc;
 pub(crate) mod emit;
 pub mod mesh_dispatch;
+mod wave_pack;
 pub mod mesh_wave;
 pub mod x64_masks;
 pub mod pso;
@@ -62,6 +63,8 @@ pub mod runner;
 #[cfg(test)]
 mod tests;
 pub mod upper_lanes;
+mod loop_profile;
+pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -508,6 +511,8 @@ pub struct Options {
     /// RDNA): the program gets the values of lanes 32..63 it reads where a 32-lane wave lacks
     /// them (`upper_lanes`). No effect on wave32 programs.
     pub split_wave64: bool,
+    pub legacy_compute_wave64: bool,
+    pub loop_profile: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -528,8 +533,18 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), loop_profile: false, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
     }
+}
+
+pub(super) fn legacy_compute_wave64() -> bool {
+    static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LEGACY.get_or_init(|| std::env::var("XCL_COMPUTE_WAVE64_LEGACY").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub(super) fn compute_wave64_pack_max_insts() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| std::env::var("XCL_COMPUTE_WAVE64_PACK_MAX_INSTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(32_768))
 }
 
 /// A console mesh (NGG) program as a host mesh shader: the program's exports go to the
@@ -538,18 +553,20 @@ impl Default for Options {
 /// title's groups draws it – no record, no second pass.
 ///
 /// HLSL has no `WaveSize` for mesh shaders, so the caller must know the host's wave size: 32
-/// lanes (a wave32 program, or a wave64 one in the split form, `Options::split_wave64`).
+/// lanes (one guest lane per thread for wave32, up to two for wave64).
 /// `pso::mesh_native_split` says whether the adapter qualifies.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MeshNative {
     /// the pixel shader's input signature: the vertices carry exactly these (as
     /// `emit::mesh_passthrough_for`); None: every output of the program
     pub ps_inputs: Option<Vec<SigElement>>,
+    pub lds_bytes: u32,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct Translation {
     pub hlsl: String,
+    packed_compute: bool,
     /// instructions we cannot translate yet (mnemonic → count); the HLSL still compiles,
     /// these become comments
     pub unsupported: BTreeMap<String, usize>,
@@ -580,6 +597,7 @@ struct Ctx<'a> {
     /// how the block of each leader ends (`term` of [leader, next leader))
     terms: &'a [Term],
     loops: &'a [(u64, u64)],
+    loop_profile: loop_profile::Sites,
     /// every branch: (address of the branch, target)
     edges: &'a [(u64, u64)],
     /// `structurable_to` results: (lo, hi, exit) → targets leaving the range
@@ -638,9 +656,9 @@ type MemoKey = (u64, u64, Option<u64>, usize, Option<u64>, Vec<u64>);
 /// At the top of every emitted loop: a lane's loop iterations are capped (`xcl_budget`, in
 /// the prelude: `loop_guard`) – console code that loops on what XCL passed it wrong (an address, a
 /// count) must not keep the PC GPU busy for minutes (a process with such work in flight cannot
-/// even be terminated). Once the budget is spent every loop
-/// leaves at its next iteration and the program runs to its end.
-const LOOP_GUARD: &str = "if (xcl_budget == 0u) { xcl_trip(0u); break; } xcl_budget--;";
+/// even be terminated). If any active lane has spent its budget, the whole
+/// hardware wave leaves before the next iteration.
+const LOOP_GUARD: &str = "if (WaveActiveAnyTrue(xcl_budget == 0u)) { xcl_trip(0u); break; } xcl_budget -= min(xcl_budget, 1u);";
 
 /// `LOOP_GUARD` as a program has it: one that waits for other hardware waves by polling
 /// (`emit::Em::waits`) also reports the iteration as progress (`xcl_tick`).
@@ -661,12 +679,20 @@ pub fn loop_guard() -> u32 {
 /// by a constant once in it) with a constant no more than `guard` steps away. A loop the
 /// guard cuts short leaves its results unfinished.
 pub(super) fn long_loops(insts: &[Decoded], guard: u32) -> Vec<String> {
+    loop_bounds(insts).filter_map(|(a, b, cmp, bound)| match bound {
+        Some(n) if n <= guard as u64 => None,
+        Some(n) => Some(format!("{a:#x}..{b:#x}: {n} iterations")),
+        None => Some(format!("{a:#x}..{b:#x}: no static bound{}", cmp.map_or(String::new(), |c| format!(" (`{}`)", rdna2::format(c))))),
+    }).collect()
+}
+
+fn loop_bounds(insts: &[Decoded]) -> impl Iterator<Item = (u64, u64, Option<&Decoded>, Option<u64>)> {
     let at = |pc: u64| insts.partition_point(|d| d.pc < pc);
     let number = |s: &str| match s.strip_prefix("0x") {
         Some(hex) => u32::from_str_radix(hex, 16).ok().map(|v| v as i32 as i64),
         None => s.parse::<i64>().ok(),
     };
-    let trips = |first: usize, body: &[Decoded], cmp: &Decoded| -> Option<u64> {
+    let trips = move |first: usize, body: &[Decoded], cmp: &Decoded| -> Option<u64> {
         let text = rdna2::format(cmp);
         let (x, y) = text.split_once(' ')?.1.split_once(", ")?;
         let (reg, limit) = match (number(x), number(y)) {
@@ -696,20 +722,15 @@ pub(super) fn long_loops(insts: &[Decoded], guard: u32) -> Vec<String> {
     };
     loop_ranges(insts)
         .into_iter()
-        .filter_map(|(a, b)| {
+        .filter_map(move |(a, b)| {
             let (first, end) = (at(a), at(b));
             let body = &insts[first..end];
             let latch = body.last()?;
             // the compare the latch's condition comes from: the last one of its block
             let cmp = body.iter().rev().skip(1).take_while(|d| rdna2::branch_target(d).is_none()).find(|d| d.inst.name.starts_with("S_CMP"));
             let cmp = cmp.filter(|_| latch.inst.name.starts_with("S_CBRANCH_SCC"));
-            match cmp.and_then(|c| trips(first, body, c)) {
-                Some(n) if n <= guard as u64 => None,
-                Some(n) => Some(format!("{a:#x}..{b:#x}: {n} iterations")),
-                None => Some(format!("{a:#x}..{b:#x}: no static bound{}", cmp.map_or(String::new(), |c| format!(" (`{}`)", rdna2::format(c))))),
-            }
+            Some((a, b, cmp, cmp.and_then(|c| trips(first, body, c))))
         })
-        .collect()
 }
 
 /// The loops the translator emits: ranges spanned by backward jumps (far jumps included),
@@ -1067,7 +1088,10 @@ fn emit_structured(
         }
         let raised: BTreeSet<u64> = match it {
             Item::Loop { a, b, latch, entry } => {
-                body.push_str(&format!("{ipad}[loop] for (;;) {{\n{ipad}    {}\n", loop_guard_line(em)));
+                let probe = c.loop_profile.probe(a, b);
+                probe.before(body, &ipad);
+                body.push_str(&format!("{ipad}[loop] for (;;) {{\n"));
+                probe.guard(body, &ipad, em);
                 let (lcont, lin) = if entry.is_none() { (Some(a), &inner) } else { (None, &none) };
                 let mut r = emit_structured(c, em, body, entry.unwrap_or(a), latch, None, nest + 1, lcont, lin, d + 1, blocks, flags);
                 for &t in &r {
@@ -1091,6 +1115,7 @@ fn emit_structured(
                     }
                 }
                 body.push_str(&format!("{ipad}}}\n"));
+                probe.after(body, &ipad);
                 r
             }
             Item::If { start, end, t, u } => {
@@ -1176,9 +1201,13 @@ fn emit_range(c: &Ctx, em: &mut emit::Em, body: &mut String, lo: u64, hi: u64, d
         let start = c.leaders[i];
         let inner = c.loops.iter().filter(|&&(a, b)| a == start && b <= hi && (a, b) != (lo, hi)).max_by_key(|x| x.1).copied();
         if let Some((a, b)) = inner {
-            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n{pad}    {}\n", loop_guard_line(em)));
+            let probe = c.loop_profile.probe(a, b);
+            probe.before(body, &pad);
+            body.push_str(&format!("{pad}[loop] while (pc >= {a}u && pc < {b}u) {{\n"));
+            probe.guard(body, &pad, em);
             emit_range(c, em, body, a, b, depth + 1, blocks, flags);
             body.push_str(&format!("{pad}}}\n"));
+            probe.after(body, &pad);
             i = c.leaders.partition_point(|&l| l < b);
             continue;
         }
@@ -1431,7 +1460,28 @@ fn constant_samplers(insts: &[Decoded], leaders: &BTreeSet<u64>) -> BTreeMap<u64
     out
 }
 
-pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+struct DecodedProgram<'a> {
+    code: &'a [u8],
+    insts: Vec<Decoded>,
+    starts: BTreeSet<u64>,
+    leaders: BTreeSet<u64>,
+    branches: usize,
+    gs_jump: Option<Option<u64>>,
+    static_samplers: BTreeMap<u64, [u32; 4]>,
+    fmt_regs: BTreeSet<u64>,
+    max_vgpr: u64,
+    long_loops: Vec<String>,
+}
+
+fn decode_program<'a>(code: &'a [u8], opt: &Options) -> Result<DecodedProgram<'a>, String> {
+    if let (Mode::Mesh(ms), Some(_)) = (&opt.mode, &opt.mesh_native) {
+        if ms.threads > if opt.wave64 { 64 } else { 32 } {
+            return Err("not a host mesh shader: the group has more than one console wave".into());
+        }
+        if opt.wave64 && !opt.split_wave64 {
+            return Err("not a host mesh shader: the packed entry requires a 32-lane host wave".into());
+        }
+    }
     let mut insts: Vec<Decoded> = Vec::new();
     let mut off = 0usize;
     while off + 4 <= code.len() {
@@ -1469,34 +1519,58 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
             leaders.insert(next);
         }
     }
-    let mut em = emit::Em::new(opt.clone());
-    em.configure_round_modes(&insts, branches == 0);
-    em.static_ss = constant_samplers(&insts, &leaders);
+    let static_samplers = constant_samplers(&insts, &leaders);
+    let fmt_regs = emit::format_descriptor_regs(&insts);
+    let max_vgpr = insts.iter().flat_map(|d| {
+        let (r, w) = rdna2::vgpr_uses(d);
+        r.into_iter().chain(w)
+    }).max().unwrap_or(0);
+    let long_loops = long_loops(&insts, loop_guard());
+    Ok(DecodedProgram { code, insts, starts, leaders, branches, gs_jump, static_samplers, fmt_regs, max_vgpr, long_loops })
+}
+
+pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
+    emit_program(&decode_program(code, opt)?, opt)
+}
+
+fn emit_program(program: &DecodedProgram<'_>, opt: &Options) -> Result<Translation, String> {
+    let DecodedProgram { code, insts, starts, leaders, branches, gs_jump, .. } = program;
+    let (branches, gs_jump) = (*branches, *gs_jump);
+    let mut em_options = opt.clone();
+    if matches!(opt.mode, Mode::Compute(_)) {
+        let path = match (opt.wave64, opt.split_wave64) {
+            (false, _) => "native-wave32",
+            (true, false) => "native-wave64",
+            (true, true) if opt.legacy_compute_wave64 => "legacy-wave64 override",
+            (true, true) if insts.len() > compute_wave64_pack_max_insts() => {
+                em_options.legacy_compute_wave64 = true;
+                "legacy-wave64 size cutoff"
+            }
+            (true, true) => "packed-wave64 candidate",
+        };
+        crate::xlog_info!("[SHADER] compute code {:016x}: {path}, {} guest instructions (pack limit {})", super::shader::fnv64(code), insts.len(), compute_wave64_pack_max_insts());
+    }
+    let mut em = emit::Em::new(em_options);
+    em.configure_round_modes(insts, branches == 0);
+    em.static_ss = program.static_samplers.clone();
     // split wave64: masks only read lane by lane skip the halves' exchange (geometry mode
     // continues from the ES into the GS through s_setpc: left as it is)
-    if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
-        em.x64_whole_live = x64_masks::by_pc(&insts, matches!(opt.mode, Mode::Kernel));
+    if opt.wave64 && opt.split_wave64 && !em.packed_compute() && matches!(opt.mode, Mode::Kernel | Mode::Compute(_) | Mode::Mesh(_)) && std::env::var_os("XCL_X64_ALL_MASKS").is_none() {
+        em.x64_whole_live = x64_masks::by_pc(insts, matches!(opt.mode, Mode::Kernel));
     }
-    em.fmt_regs = emit::format_descriptor_regs(&insts);
+    em.fmt_regs = program.fmt_regs.clone();
     // a wave64 VS / PS on a GPU that can run 32-lane waves: what lanes 32..63 hold where the
     // program reads them (the driver may still pick 64 lanes: decided at run time); only a
     // program with a read to change gets the form
     if opt.wave64 && opt.split_wave64 && matches!(opt.mode, Mode::Vertex(_) | Mode::Pixel(_)) {
-        let a = upper_lanes::analyze(&insts);
+        let a = upper_lanes::analyze(insts);
         if a.reads.values().any(|r| matches!(r, upper_lanes::Read::Const(_) | upper_lanes::Read::Shadow)) {
             em.upper = Some(a);
         }
     }
-    em.max_vgpr = insts
-        .iter()
-        .flat_map(|d| {
-            let (r, w) = rdna2::vgpr_uses(d);
-            r.into_iter().chain(w)
-        })
-        .max()
-        .unwrap_or(0);
+    em.max_vgpr = program.max_vgpr;
     if let Mode::Pixel(ps) = &opt.mode {
-        em.ps_modes = emit::ps_attr_modes(&insts, ps.input_ena);
+        em.ps_modes = emit::ps_attr_modes(insts, ps.input_ena);
     }
     let mut body = String::new();
     let mut blocks = 0usize;
@@ -1517,8 +1591,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
         // (`while (pc in range)`); ranges are merged until they nest. Same semantics as a
         // dispatcher loop over all blocks, but DXC sees an acyclic graph almost everywhere
         // (optimising one big dispatcher loop took minutes on large retail programs).
-        let leaders: Vec<u64> = leaders.into_iter().filter(|l| starts.contains(l)).collect();
-        let loops = loop_ranges(&insts);
+        let leaders: Vec<u64> = leaders.iter().copied().filter(|l| starts.contains(l)).collect();
+        let loops = loop_ranges(insts);
         let edges: Vec<(u64, u64)> = insts.iter().filter_map(|d| rdna2::branch_target(d).map(|t| (d.pc, t))).collect();
         let terms: Vec<Term> = leaders
             .iter()
@@ -1528,7 +1602,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
                 term_of(insts[..insts.partition_point(|d| d.pc < e)].last().filter(|d| d.pc >= s))
             })
             .collect();
-        let ctx = Ctx { insts: &insts, starts: &starts, leaders: &leaders, terms: &terms, loops: &loops, edges: &edges, memo: Default::default() };
+        let loop_profile = loop_profile::Sites::new(insts, opt.loop_profile && matches!(opt.mode, Mode::Compute(_)));
+        let ctx = Ctx { insts, starts, leaders: &leaders, terms: &terms, loops: &loops, loop_profile, edges: &edges, memo: Default::default() };
         let mut flags = BTreeSet::new();
         let mut code = String::new();
         if gs_jump.is_none() && opt.structured && std::env::var_os("XCL_RECOMP_NO_STRUCTURED").is_none() && structurable(&ctx, 0, u64::MAX).is_some() {
@@ -1553,7 +1628,7 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, long_loops: long_loops(&insts, loop_guard()) })
+    Ok(Translation { hlsl, packed_compute: em.packed_compute(), unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, long_loops: program.long_loops.clone() })
 }
 
 #[cfg(test)]
