@@ -74,6 +74,13 @@ pub struct Layout {
     pub size: u32,
     pub inline: u32,
     pub inline_gfx: u32,
+    pub(super) uavs: Vec<UavBinding>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum UavBinding {
+    Root { param: usize, at: u32 },
+    Table { param: usize, at: u32, first: u32, count: u32 },
 }
 
 /// User SGPRs the console's compiler gives root arguments: compute s4…s15 (s0…s3 are the
@@ -95,6 +102,11 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
     };
     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
     let (n, poff) = (r(4)? as usize, r(8)? as usize);
+    let range_words = match r(0) {
+        Some(1) => Some(5usize),
+        Some(2 | 3) => Some(6usize),
+        _ => None,
+    };
     let mut l = Layout::default();
     // the parameters go into user SGPRs in order while each fits whole; from the first one
     // that does not, the rest go to the table (packed from its start) – as the console's
@@ -107,6 +119,20 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
             2..=4 => Param::Descriptor { at: l.size },
             _ => Param::Table { at: l.size },
         };
+        if ty == 4 {
+            l.uavs.push(UavBinding::Root { param: k, at: l.size });
+        } else if let (0, Some(words), Some(count), Some(off)) = (ty, range_words, r(pay), r(pay + 4)) {
+            let mut append = 0u32;
+            for i in 0..count as usize {
+                let at = off as usize + i * words * 4;
+                let (Some(kind), Some(count), Some(first)) = (r(at), r(at + 4), r(at + (words - 1) * 4)) else { break };
+                let first = if first == u32::MAX { append } else { first };
+                append = first.saturating_add(count);
+                if kind == 1 && count != 0 {
+                    l.uavs.push(UavBinding::Table { param: k, at: l.size, first, count });
+                }
+            }
+        }
         let bytes = match p {
             Param::Constants { count, .. } => 4 * count,
             Param::Table { .. } => 4,
@@ -839,7 +865,14 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         // a pipeline still being built in the background is waited for; if
                         // the background translation failed, skip instead of binding XCL's
                         // ABI root signature onto the stand-in
-                        let real = super::pso_async::resolve_wait((*p).pc);
+                        let real = match super::pso_async::resolve_for_compute_use((*p).pc) {
+                            Ok(real) => real,
+                            Err(skip) => {
+                                super::bind::note_pending_compute_skip_with_args((*p).pc, "console-list Dispatch", skip, layout.as_deref(), &table);
+                                out.skipped_dispatches += 1;
+                                continue;
+                            }
+                        };
                         if !super::real::is_translated_compute(real) {
                             out.skipped_dispatches += 1;
                             continue;

@@ -1492,6 +1492,48 @@ impl State {
     }
 }
 
+/// (diagnostics, `alias::report`) The video memory behind an address in a sparse window: the pool
+/// tile its 64 KiB tile is mapped onto (or parked on), whether its 4 KiB page is committed, the
+/// placed buffers that use the pool tile, and any other window address on the same pool tile
+/// (there should be none). None: not in a sparse window, or the state is locked by another
+/// thread – at a crash it is not waited for.
+pub(crate) fn alias_facts(va: usize) -> Option<String> {
+    let g = crate::alias::try_lock(&STATE)?;
+    let s = g.as_ref()?;
+    s.window_index(va)?;
+    let t = va & !(TILE - 1);
+    let (pool, mut what) = match (s.mapped.get(&t), s.parked.get(&t)) {
+        (Some(e), _) => (
+            Some(e.pool),
+            format!(
+                "mapped onto video-memory pool tile {:?}, this 4 KiB page {}",
+                e.pool,
+                if e.holes & (1u16 << ((va - t) / PAGE)) == 0 { "committed" } else { "a hole (not committed: nothing is uploaded or read back there)" }
+            ),
+        ),
+        (None, Some(&tile)) => (Some(tile), format!("decommitted, still parked on video-memory pool tile {tile:?}")),
+        (None, None) => (None, "not committed: no video memory".to_string()),
+    };
+    if let Some(pool) = pool {
+        if let Some(n) = s.pinned.get(&pool) {
+            let buffers: Vec<String> = crate::alias::try_lock(&BUFFER_PINS).map_or(Vec::new(), |b| b.iter().filter(|(_, p)| p.tiles.contains(&pool)).take(4).map(|(r, _)| format!("{r:#x}")).collect());
+            what += &format!("; the pool tile is used by {n} placed buffer(s) ({})", buffers.join(", "));
+        }
+        let others: Vec<String> = s
+            .mapped
+            .iter()
+            .filter(|(&a, e)| a != t && e.pool == pool)
+            .map(|(&a, _)| format!("{a:#x} (mapped)"))
+            .chain(s.parked.iter().filter(|(&a, &p)| a != t && p == pool).map(|(&a, _)| format!("{a:#x} (parked)")))
+            .take(4)
+            .collect();
+        if !others.is_empty() {
+            what += &format!("; THE SAME POOL TILE IS ALSO AT {}", others.join(", "));
+        }
+    }
+    Some(format!("sparse window tile {t:#x}: {what}"))
+}
+
 /// The sparse windows' tiles with video memory as sorted (start, end) runs: where a CPU write
 /// has to reach the GPU.
 pub fn mapped_ranges() -> Vec<(usize, usize)> {

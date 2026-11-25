@@ -110,6 +110,12 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
+            let b = behind(rec.ExceptionInformation[1]);
+            if !b.is_empty() {
+                crate::xlog_error!("the address of the access violation, {:#x}:{b}", rec.ExceptionInformation[1]);
+            }
+        }
         if !ctx.is_null() {
             log_register_memory(&*ctx);
         }
@@ -920,7 +926,8 @@ pub fn note_guest_write(what: &'static str, at: usize, len: usize) {
     if !LEDGER_ON.load(Ordering::Relaxed) || len == 0 {
         return;
     }
-    let detail = WRITE_CONTEXT.with(|c| c.borrow().clone());
+    // (not there in a thread that is ending: a page filled on first use is noted from a fault)
+    let detail = WRITE_CONTEXT.try_with(|c| c.borrow().clone()).ok().flatten();
     let watched = WATCHED.load(Ordering::Relaxed);
     if watched != 0 && at <= watched && watched - at < len {
         static LINES: AtomicUsize = AtomicUsize::new(0);
@@ -951,6 +958,35 @@ fn ledger_covering(addr: usize) -> String {
         .map(|e| format!("{} of {:#x} bytes at {:#x}, {:.3} s{}", e.1, e.3, e.2, e.0, e.4.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()))
         .collect();
     if hits.is_empty() { format!("none among the {} kept", l.len()) } else { hits.join("; ") }
+}
+
+/// XCL's own writes over `addr` (`ledger_covering`); None when there are none or the writes are
+/// not kept.
+pub(crate) fn writes_over(addr: usize) -> Option<String> {
+    if !LEDGER_ON.load(Ordering::Relaxed) {
+        return None;
+    }
+    let w = ledger_covering(addr);
+    (!w.starts_with("none among")).then_some(w)
+}
+
+/// The title's and XCL's code on the calling thread's stack (up to `max` callers), for a
+/// diagnostic line.
+pub(crate) fn callers_here(max: usize) -> String {
+    let probe = 0usize;
+    unsafe { stack_callers_n(&probe as *const usize as usize, max) }
+}
+
+/// For a line of a crash record: XCL's account of the memory behind `p` and of every other
+/// address showing it (`alias::report`), on lines of its own; nothing where it has none.
+unsafe fn behind(p: usize) -> String {
+    let Some(r) = crate::alias::report(p) else { return String::new() };
+    static LEDGER_NOTE: std::sync::Once = std::sync::Once::new();
+    let mut note = "";
+    if !LEDGER_ON.load(Ordering::Relaxed) {
+        LEDGER_NOTE.call_once(|| note = "\n        (XCL's own writes are not kept in this run: XCL_CRASH_DUMP or XCL_WATCH keeps them)");
+    }
+    format!("\n{r}{note}")
 }
 
 /// A chain: an address in the title's exe (hex RVA), then for each `@off` the pointer held there
@@ -1084,7 +1120,7 @@ unsafe fn log_register_memory(c: &windows_sys::Win32::System::Diagnostics::Debug
     let (mut lines, mut seen) = (Vec::new(), Vec::new());
     for &(n, v) in &regs {
         let Some(h) = hex_at(v as usize, 80) else { continue };
-        lines.push(format!("  {n} {v:#x}: {h}{}", xcl_wrote(v as usize)));
+        lines.push(format!("  {n} {v:#x}: {h}{}{}", xcl_wrote(v as usize), behind(v as usize)));
         let Some(first) = probe_bytes(v, 32) else { continue };
         for (i, q) in first.chunks_exact(8).enumerate() {
             let p = u64::from_le_bytes(q.try_into().unwrap());
@@ -1094,7 +1130,7 @@ unsafe fn log_register_memory(c: &windows_sys::Win32::System::Diagnostics::Debug
             }
             let Some(h) = hex_at(p as usize, 64) else { continue };
             seen.push(p);
-            lines.push(format!("    [{n}+{:#x}] {p:#x}: {h}{}", i * 8, xcl_wrote(p as usize)));
+            lines.push(format!("    [{n}+{:#x}] {p:#x}: {h}{}{}", i * 8, xcl_wrote(p as usize), behind(p as usize)));
         }
     }
     if !lines.is_empty() {
@@ -1144,7 +1180,7 @@ unsafe fn crash_dump() {
             }
             let Some(b) = probe_bytes(p as u64, 256) else { continue };
             let hex: Vec<String> = b.chunks(32).enumerate().map(|(i, r)| format!("  +{:04x}: {}", i * 32, r.chunks(8).map(|c| c.iter().map(|x| format!("{x:02x}")).collect::<String>()).collect::<Vec<_>>().join(" "))).collect();
-            crate::xlog_error!("crash dump {chain_s} -> {p:#x} ({}); XCL's own writes over it: {}\n{}", crate::hle::kernelx::lazy::describe(p), ledger_covering(p), hex.join("\n"));
+            crate::xlog_error!("crash dump {chain_s} -> {p:#x} ({}); XCL's own writes over it: {}\n{}{}", crate::hle::kernelx::lazy::describe(p), ledger_covering(p), hex.join("\n"), behind(p));
         }
     }
     crate::log::flush();

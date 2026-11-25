@@ -193,12 +193,13 @@ mod translated {
         }
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
         let guard = super::super::loop_guard();
+        let trip_counters = crate::config::gpu_markers_enabled();
         let static_cap = super::super::loop_profile::static_cap();
         if legacy {
-            return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
+            return identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0legacy-compute-wave64"));
         }
         let (ratio, giant) = super::packed_dxil_limits();
-        identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0loop-profile={profile}\0static-loop-cap={static_cap}\0compute-wave64-pack-max-insts={}\0packed-dxil-ratio={ratio}\0packed-dxil-giant={giant}", super::super::compute_wave64_pack_max_insts()))
+        identity_for(&format!("{base:016x}"), &format!("{nan}\0loop-guard={guard}\0trip-counters={trip_counters}\0loop-profile={profile}\0static-loop-cap={static_cap}\0compute-wave64-pack-max-insts={}\0packed-dxil-ratio={ratio}\0packed-dxil-giant={giant}", super::super::compute_wave64_pack_max_insts()))
     }
 
     /// a second hash of the bytes, independent of `fnv64`'s
@@ -623,7 +624,8 @@ fn console_translation(blob: &[u8], stage: Stage, sampler_base: u32, windows: u3
 }
 
 fn with_console_code<R>(blob: &[u8], stage: Stage, sampler_base: u32, windows: u32, split_wave64: bool, run: impl FnOnce(&[u8], Options, &'static str) -> Result<R, String>) -> Result<R, String> {
-    let options = Options { split_wave64, static_sampler_base: sampler_base, mem_windows: windows, nan_guards: nan_guards(), ..Default::default() };
+    let guard_trip_counters = stage != Stage::Compute || crate::config::gpu_markers_enabled();
+    let options = Options { split_wave64, static_sampler_base: sampler_base, mem_windows: windows, nan_guards: nan_guards(), guard_trip_counters, ..Default::default() };
     if let Some(f) = fspx(blob) {
         if stage != Stage::Compute {
             return Err("an FSPX (driver) container in a graphics slot".into());

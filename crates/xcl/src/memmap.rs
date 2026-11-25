@@ -6,6 +6,13 @@
 //! walking its pages: with hundreds of thousands of views and placeholders mapped, and views of
 //! gigabytes, one call took milliseconds. Addresses outside everything recorded (host DLLs, heaps,
 //! stacks) are still asked of Windows (`access` returns None).
+//!
+//! The record must never say more than Windows has: an address answered "committed" that is not
+//! is written by XCL (a page mapped as a copy, a DirectStorage destination) and faults. So a
+//! commit is kept only inside address space XCL saw reserved – whose release it sees too
+//! (`released`) – or in unified memory, which is never released; and a new reservation starts
+//! with nothing recorded in it, whatever was there before (address space Windows hands out is
+//! free: a reservation recorded there went back without XCL seeing it).
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -93,11 +100,22 @@ fn read() -> std::sync::RwLockReadGuard<'static, Map> {
     MAP.read().unwrap_or_else(|e| e.into_inner())
 }
 
-/// `[start, start + len)` is address space XCL reserved (or handed out) for the title.
+/// `[start, start + len)` is address space XCL reserved (or handed out) for the title: new
+/// address space, to the end of its last page – what was recorded there is gone.
 pub fn reserved(start: usize, len: usize) {
-    if len > 0 {
-        write().known.insert(start, start + len);
+    if len == 0 {
+        return;
     }
+    let end = (start + len + 0xFFF) & !0xFFF;
+    let mut g = write();
+    // (a reservation recorded here went back to Windows unseen: all of it is gone)
+    let stale: Vec<(usize, usize)> = g.known.range(..end).rev().take_while(|(_, &e)| e > start).map(|(&s, &e)| (s, e)).collect();
+    for (s, e) in stale {
+        g.known.remove(&s);
+        g.cut(s, e);
+    }
+    g.cut(start & !0xFFF, end);
+    g.known.insert(start, end);
 }
 
 /// The reservation at `start` is gone, with everything committed in it.
@@ -113,10 +131,17 @@ pub fn reservation(at: usize) -> Option<(usize, usize)> {
     read().known.range(..=at).next_back().filter(|(_, &e)| at < e).map(|(&s, &e)| (s, e))
 }
 
-/// `[start, start + len)` is committed with `protect`.
+/// `[start, start + len)` is committed with `protect`. Kept only where XCL sees the address
+/// space go again: in a reservation it recorded, or in unified memory. (Elsewhere Windows is
+/// asked: a span kept for memory released behind XCL would answer for whatever comes there next.)
 pub fn committed(start: usize, len: usize, protect: u32) {
-    if len > 0 {
-        write().put(start & !0xFFF, (start + len + 0xFFF) & !0xFFF, Access::of(protect));
+    if len == 0 {
+        return;
+    }
+    let unified = crate::gpu::uma::get().is_some_and(|u| u.contains(start));
+    let mut g = write();
+    if unified || g.known.range(..=start).next_back().is_some_and(|(_, &e)| start < e) {
+        g.put(start & !0xFFF, (start + len + 0xFFF) & !0xFFF, Access::of(protect));
     }
 }
 
@@ -224,5 +249,45 @@ mod tests {
         assert_eq!(access(base + 0x20_0000, 4), None, "outside the record");
         released(base);
         assert_eq!(access(base + 0x1000, 4), None);
+    }
+
+    /// A commit outside every reservation XCL recorded is not kept: XCL would not see that
+    /// memory released.
+    #[test]
+    fn a_commit_outside_every_reservation_is_asked_of_windows() {
+        let base = 0x7100_0000_0000usize;
+        committed(base, 0x2000, PAGE_READWRITE);
+        assert_eq!(access(base, 4), None);
+        reserved(base, 0x10_0000);
+        committed(base + 0x10_0000, 0x1000, PAGE_READWRITE);
+        assert_eq!(access(base + 0x10_0000, 4), None, "past the reservation's end");
+        released(base);
+    }
+
+    /// Address space reserved again starts with nothing committed, and the reservation recorded
+    /// there before (released without XCL seeing it) is gone.
+    #[test]
+    fn a_new_reservation_starts_with_nothing_committed() {
+        let base = 0x7200_0000_0000usize;
+        reserved(base, 0x10_0000);
+        committed(base, 0x10_0000, PAGE_READWRITE);
+        // (released behind XCL, then handed out again in two pieces)
+        reserved(base + 0x4_0000, 0x2_0000);
+        assert_eq!(access(base + 0x4_0000, 4), Some(Access::None));
+        assert_eq!(reservation(base + 0x4_0000), Some((base + 0x4_0000, base + 0x6_0000)));
+        assert_eq!(reservation(base), None, "the old reservation is not there any more");
+        assert_eq!(access(base + 0x8_0000, 4), None, "nor what was committed in the rest of it");
+        released(base + 0x4_0000);
+    }
+
+    /// A reservation ends with its last page, as its commits do: releasing it leaves nothing.
+    #[test]
+    fn a_reservation_of_part_of_a_page_is_released_whole() {
+        let base = 0x7300_0000_0000usize;
+        reserved(base, 0x1800);
+        committed(base, 0x1800, PAGE_READWRITE);
+        assert_eq!(access(base + 0x1900, 4), Some(Access::Write));
+        released(base);
+        assert_eq!(access(base + 0x1900, 4), None);
     }
 }

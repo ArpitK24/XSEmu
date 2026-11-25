@@ -80,6 +80,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                         crate::hle::d3d12x::bind::indirect_calls()
                     );
                     crate::xlog_info!("commit: {}", commit_breakdown());
+                    note_resident_memory();
                     crate::xlog_info!("{}", crate::hle::d3d12x::bind::mesh_counts());
                 }
                 let now = snap();
@@ -192,6 +193,31 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::report::write_final(None);
     crate::log::flush();
     code as i32
+}
+
+fn note_resident_memory() {
+    use windows_sys::Win32::System::ProcessStatus::{K32GetPerformanceInfo, K32GetProcessMemoryInfo, PERFORMANCE_INFORMATION, PROCESS_MEMORY_COUNTERS_EX2};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    let mut process = PROCESS_MEMORY_COUNTERS_EX2 { cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32, ..Default::default() };
+    let have_process = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), std::ptr::from_mut(&mut process).cast(), process.cb) } != 0;
+    let mut system = PERFORMANCE_INFORMATION::default();
+    let have_system = unsafe { K32GetPerformanceInfo(&mut system, std::mem::size_of::<PERFORMANCE_INFORMATION>() as u32) } != 0;
+    let process_status = if have_process {
+        format!("XCL working set {} MB ({} MB private, {} MB shareable)", process.WorkingSetSize >> 20, process.PrivateWorkingSetSize >> 20,
+            process.WorkingSetSize.saturating_sub(process.PrivateWorkingSetSize) >> 20)
+    } else {
+        "XCL private working set unavailable".into()
+    };
+    let system_status = if have_system {
+        let mb = |pages: usize| pages.saturating_mul(system.PageSize) >> 20;
+        format!("physical {} of {} MB available, system cache {} MB, kernel {} MB, system commit {} of {} MB",
+            mb(system.PhysicalAvailable), mb(system.PhysicalTotal), mb(system.SystemCache), mb(system.KernelTotal), mb(system.CommitTotal), mb(system.CommitLimit))
+    } else {
+        "system memory counters unavailable".into()
+    };
+    crate::xlog_info!("RAM: {process_status}; {system_status}; in-process compute blobs {} MB",
+        crate::hle::d3d12x::real::resident_compute_blob_bytes() >> 20);
 }
 
 /// The process's committed memory by owner, from a walk of its address space: private commit in

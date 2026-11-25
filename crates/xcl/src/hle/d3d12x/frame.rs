@@ -198,7 +198,7 @@ fn with<R>(f: impl FnOnce(&mut Clock) -> R) -> R {
 
 /// device #78 SetFrameIntervalX(output, length µs, periodicity, flags)
 pub unsafe extern "system" fn set_frame_interval_x(_this: *mut std::ffi::c_void, _output: *mut std::ffi::c_void, len_us: u32, periodicity: u32, flags: u32) -> HRESULT {
-    if len_us != 0 && !interval_valid(len_us, high_refresh()) {
+    if len_us != 0 && !interval_valid(len_us, crate::state::config().reported_display_mode().map_or_else(high_refresh, |mode| mode.hz == 120)) {
         crate::xlog_warn!("D3D12.X: SetFrameIntervalX({len_us} µs) – not an interval of this display");
         return E_INVALIDARG;
     }

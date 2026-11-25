@@ -615,6 +615,14 @@ impl Uma {
         Some(p)
     }
 
+    /// The bytes of the block handed out at `p` in a committed window (None: none starts there).
+    pub fn block_size(&self, p: usize) -> Option<usize> {
+        if !self.is_committed(p) {
+            return None;
+        }
+        self.inner.lock().unwrap().used.get(&(p - self.base)).copied()
+    }
+
     /// Release a block from `alloc` (false: not one of ours).
     pub fn free(&self, p: usize) -> bool {
         if !self.is_committed(p) {

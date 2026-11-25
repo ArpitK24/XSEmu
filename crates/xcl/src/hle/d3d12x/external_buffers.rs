@@ -125,6 +125,19 @@ pub(super) unsafe fn register(res: usize, title: usize, mirror: usize, bytes: us
     true
 }
 
+/// (diagnostics, `alias::report`) The buffers the title placed over `[va, va + len)` outside unified
+/// memory, the first 4: a Map with a read range copies each one's mirror over its memory.
+pub(super) fn placed_over(va: usize, len: usize) -> Vec<String> {
+    let Some(g) = crate::alias::try_lock(&BUFFERS) else { return Vec::new() };
+    let Some(buffers) = g.as_ref() else { return Vec::new() };
+    buffers
+        .iter()
+        .filter(|(_, b)| b.title < va.saturating_add(len) && va < b.title + b.bytes)
+        .take(4)
+        .map(|(res, b)| format!("a buffer is placed over this memory: PC buffer {res:#x} at {:#x} + {:#x}, mirrored at {:#x} (a Map for reading copies the mirror over it)", b.title, b.bytes, b.mirror))
+        .collect()
+}
+
 pub(super) fn forget(res: usize) {
     let Some(b) = BUFFERS.lock().unwrap().as_mut().and_then(|b| b.remove(&res)) else { return };
     if b.seen != 0 {
@@ -215,6 +228,9 @@ impl Backing {
             self.sync_page(p, PAGE);
         }
         super::sparse::readback_now(self.mirror + begin, end - begin);
+        // (XCL's write into the title's memory)
+        crate::alias::mapping_changed("a placed buffer's mirror is copied over its memory", "ID3D12Resource::Map", self.title + begin, end - begin);
+        crate::eh::note_guest_write("placed buffer read back (Map)", self.title + begin, end - begin);
         std::ptr::copy_nonoverlapping(
             (self.mirror + begin) as *const u8,
             (self.title + begin) as *mut u8,

@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn gpu_markers_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_GPU_MARKERS").is_ok_and(|v| v.trim() == "1"))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -50,6 +55,7 @@ pub struct Config {
     pub d3d12_debug: bool,
     /// "auto" (show the title's frames in an XCL window) or "off".
     pub present: String,
+    pub display_mode: String,
     /// Raytracing tier reported by `CheckFeatureSupport(D3D12_OPTIONS5)`:
     /// "auto" (host GPU tier), "tier1_1" (11), "tier1_0" (10), or "off" (0).
     /// `XCL_RAYTRACING` overrides.
@@ -182,6 +188,7 @@ impl Default for Config {
             d3d12_adapter: "auto".into(),
             d3d12_debug: false,
             present: "auto".into(),
+            display_mode: "auto".into(),
             raytracing: "auto".into(),
             window_width: 1280,
             window_height: 720,
@@ -195,6 +202,7 @@ impl Default for Config {
 
 const HEADER: &str = "# XCL – title configuration. Created automatically; you can edit it.\n\
 # device_type: \"anaconda\" (Series X) or \"lockhart\" (Series S)\n\
+# display_mode: \"auto\" (Lockhart 1280x720@60 SDR, other devices host), \"host\", or \"WxH[@60|@120]\" (SDR); XCL_DISPLAY_MODE overrides\n\
 # mounts: console path prefix -> folder ({game} = game folder, read-only; {data} = XCL data)\n\
 # aliases: DLL pattern -> \"kernelx.dll\" / \"xgameruntime.dll\" / \"d3d12_xs.dll\" / \"@system\" / \"@stub\"\n\
 # stub_returns: \"dll!Function\" -> value the stub returns (e.g. \"E_NOTIMPL\", \"0\", \"0x1\")\n\n";
@@ -241,6 +249,18 @@ impl Config {
         self.device_type.eq_ignore_ascii_case("lockhart") || self.device_type.eq_ignore_ascii_case("series s")
     }
 
+    pub(crate) fn reported_display_mode(&self) -> Option<DisplayMode> {
+        self.display_mode_with_env(std::env::var("XCL_DISPLAY_MODE").ok().as_deref())
+    }
+
+    fn display_mode_with_env(&self, env: Option<&str>) -> Option<DisplayMode> {
+        match env.and_then(DisplaySetting::parse).or_else(|| DisplaySetting::parse(&self.display_mode)).unwrap_or(DisplaySetting::Auto) {
+            DisplaySetting::Fixed(mode) => Some(mode),
+            DisplaySetting::Auto if self.is_series_s() => Some(DisplayMode { width: 1280, height: 720, hz: 60 }),
+            DisplaySetting::Auto | DisplaySetting::Host => None,
+        }
+    }
+
     /// Configured `D3D12_RAYTRACING_TIER` override for `CheckFeatureSupport(D3D12_OPTIONS5)`:
     /// `None` keeps the host GPU tier ("auto"), `Some(0 / 10 / 11)` forces NOT_SUPPORTED /
     /// TIER_1_0 / TIER_1_1. `XCL_RAYTRACING` overrides `xcl.toml`.
@@ -248,6 +268,37 @@ impl Config {
         let env = std::env::var("XCL_RAYTRACING").ok();
         let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
         parse_raytracing_tier(mode)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DisplayMode {
+    pub width: u32,
+    pub height: u32,
+    pub hz: u32,
+}
+
+enum DisplaySetting {
+    Auto,
+    Host,
+    Fixed(DisplayMode),
+}
+
+impl DisplaySetting {
+    fn parse(setting: &str) -> Option<Self> {
+        let setting = setting.trim().to_ascii_lowercase();
+        match setting.as_str() {
+            "auto" => return Some(Self::Auto),
+            "host" => return Some(Self::Host),
+            _ => {}
+        }
+        let (size, hz) = setting.split_once('@').unwrap_or((&setting, "60"));
+        let (width, height) = size.split_once('x')?;
+        let (width, height, hz) = (width.parse().ok()?, height.parse().ok()?, hz.parse().ok()?);
+        if !(1..=16384).contains(&width) || !(1..=16384).contains(&height) || !matches!(hz, 60 | 120) {
+            return None;
+        }
+        Some(Self::Fixed(DisplayMode { width, height, hz }))
     }
 }
 
@@ -308,6 +359,22 @@ mod tests {
         assert!(c.is_series_s());
         assert_eq!(c.gamertag, "Player1");
         assert_eq!(c.raytracing, "auto");
+    }
+
+    #[test]
+    fn reported_display_defaults_to_720p_only_for_lockhart_and_accepts_overrides() {
+        let mut c: Config = toml::from_str("device_type = \"lockhart\"").unwrap();
+        let lockhart = Some(DisplayMode { width: 1280, height: 720, hz: 60 });
+        assert_eq!(c.display_mode_with_env(None), lockhart);
+        assert_eq!(c.display_mode_with_env(Some("0x720")), lockhart);
+        assert_eq!(Config::default().display_mode_with_env(None), None);
+        c = toml::from_str("device_type = \"lockhart\"\ndisplay_mode = \"1920x1080\"").unwrap();
+        let toml = Some(DisplayMode { width: 1920, height: 1080, hz: 60 });
+        assert_eq!(c.display_mode_with_env(None), toml);
+        assert_eq!(c.display_mode_with_env(Some("1920x1080@30")), toml);
+        assert_eq!(c.display_mode_with_env(Some("2560X1440@120")), Some(DisplayMode { width: 2560, height: 1440, hz: 120 }));
+        assert_eq!(c.display_mode_with_env(Some("auto")), lockhart);
+        assert_eq!(c.display_mode_with_env(Some("host")), None);
     }
 
     #[test]

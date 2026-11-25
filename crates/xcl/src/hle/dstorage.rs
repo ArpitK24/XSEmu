@@ -267,10 +267,11 @@ fn bcpack_fill_block(mode: u8) -> Option<Vec<u8>> {
 }
 
 /// Where a refused BCPack request's fill goes: its virtual destination, or the physical pages
-/// it named (snapshot at enqueue, as for a request that runs).
+/// it names (its page list as at enqueue, read again at its turn as for a request that runs:
+/// `page_list_at_turn`).
 enum FillTarget {
     Virtual,
-    Pages(Vec<usize>),
+    Pages(Vec<usize>, ListPlace),
 }
 
 /// Fill the title's destination of `r` (exactly `destination_size` bytes) with solid blocks.
@@ -279,7 +280,10 @@ unsafe fn bcpack_fill(r: &Request, target: &FillTarget) -> bool {
     let n = r.destination_size as usize;
     let bytes: Vec<u8> = block.iter().copied().cycle().take(n).collect();
     let ok = match target {
-        FillTarget::Pages(pages) => crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &bytes),
+        FillTarget::Pages(at_enqueue, place) => {
+            let list = page_list_at_turn("destination", r, r.destination as usize, at_enqueue, *place).0;
+            destination_pages(r.destination as usize, &list).is_ok_and(|pages| crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &bytes))
+        }
         FillTarget::Virtual => writable(r.destination as usize, n) && write_virtual(r.destination as usize, &bytes),
     };
     if ok {
@@ -687,7 +691,165 @@ impl Request {
     }
 }
 
-/// Snapshot a `PULONG_PTR` physical page array at enqueue time (callers often stack-allocate it).
+/// Where a request's physical page list was when the request was enqueued.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListPlace {
+    /// on the stack of the thread that called EnqueueRequest: gone when the call returned
+    CallersStack,
+    /// anywhere else: memory the title keeps (a slot of its own table)
+    Kept,
+}
+
+impl ListPlace {
+    /// Of the list of `pages` entries at `addr`, asked on the thread that enqueues the request.
+    fn of(addr: u64, pages: usize) -> ListPlace {
+        let (mut lo, mut hi) = (0usize, 0usize);
+        unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi) };
+        let (start, len) = (addr as usize, (pages * std::mem::size_of::<usize>()).max(1));
+        if start < hi && start.saturating_add(len) > lo {
+            ListPlace::CallersStack
+        } else {
+            ListPlace::Kept
+        }
+    }
+}
+
+/// What a page list is at its request's turn, against what it was at EnqueueRequest.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ListChange {
+    /// the same, not readable any more, or on the enqueuing thread's stack (not looked at)
+    Same,
+    /// other pages, all allocated: those are the request's
+    Taken,
+    /// something else that names no allocated pages: the list as enqueued stands
+    NotPages,
+}
+
+/// A request's physical page list at the request's turn. The console reads the list when it runs
+/// the request, not at EnqueueRequest: a retail title keeps its lists in slots of its own table
+/// and writes a slot's pages after EnqueueRequest, so at enqueue a slot can still name the pages
+/// of the request it held before – pages the title has given to something else by the time this
+/// request runs. Written by the list as enqueued, a texture's data went into a page mapped
+/// elsewhere as other data, and the request succeeded. (Upstream: xcl-dev/xcl#1405.)
+///
+/// So the list is read again, every entry of it, and taken as it is then when all it names are
+/// allocated pages. The list as enqueued (`at_enqueue`) stands in two cases:
+///  - it was on the enqueuing thread's stack (`ListPlace::CallersStack`). That memory is given to
+///    the thread's next calls when EnqueueRequest returns: what is there at the request's turn is
+///    not the list, and a number there may well be an allocated page. A caller that builds its
+///    list on its stack means the list as it calls.
+///  - what is there now does not name allocated pages (the memory was freed or reused, or an
+///    entry is still 0 – those are read again one by one, `destination_pages`).
+fn page_list_now<'a>(addr: usize, at_enqueue: &'a [usize], place: ListPlace) -> (Cow<'a, [usize]>, ListChange) {
+    let mut now = vec![0usize; at_enqueue.len()];
+    if place == ListPlace::CallersStack || at_enqueue.is_empty() || read_page_indices(addr, &mut now).is_err() || now[..] == at_enqueue[..] {
+        return (Cow::Borrowed(at_enqueue), ListChange::Same);
+    }
+    if !crate::hle::kernelx::pages_allocated(&now) {
+        return (Cow::Borrowed(at_enqueue), ListChange::NotPages);
+    }
+    (Cow::Owned(now), ListChange::Taken)
+}
+
+/// Page lists that were not at their request's turn what they were at EnqueueRequest, so far.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageListCounts {
+    /// taken as at the turn, with an entry that named a page at enqueue and another at the turn:
+    /// as enqueued, the request would have gone to a page of the slot's previous list
+    pub stale: u64,
+    /// of `stale`: such a page at enqueue was mapped somewhere at the turn – in use
+    pub stale_in_use: u64,
+    /// taken as at the turn, with only entries filled in that were 0 at enqueue and still at
+    /// Submit (those were always read at the turn, `destination_pages`; most are read at Submit)
+    pub filled: u64,
+    /// something that names no allocated pages at the turn: the list as enqueued stood
+    pub not_pages: u64,
+}
+
+static LISTS_CHANGED: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+pub fn page_list_counters() -> PageListCounts {
+    let n = |i: usize| LISTS_CHANGED[i].load(Ordering::Relaxed);
+    PageListCounts { stale: n(0), stale_in_use: n(1), filled: n(2), not_pages: n(3) }
+}
+
+/// `page_list_now` for the request `r` at its turn (`which` list: "destination" or "source"),
+/// counted and logged: the first lists that changed are shown entry by entry (8 with an entry
+/// that named a page at enqueue, 2 with only entries that were 0 until then), then the counts at each
+/// power of two. With it, what the list was, for the record of the request's payloads (`alias`).
+fn page_list_at_turn<'a>(which: &'static str, r: &Request, addr: usize, at_enqueue: &'a [usize], place: ListPlace) -> (Cow<'a, [usize]>, crate::alias::PageList) {
+    use crate::alias::PageList;
+    use crate::hle::kernelx::{page_places, pages_allocated};
+    let (list, change) = page_list_now(addr, at_enqueue, place);
+    let add = |i: usize, n: bool| LISTS_CHANGED[i].fetch_add(u64::from(n), Ordering::Relaxed) + u64::from(n);
+    let read = match change {
+        ListChange::Same if place == ListPlace::CallersStack => PageList::OnStack,
+        ListChange::Same => PageList::Same,
+        ListChange::NotPages => {
+            let k = add(3, true);
+            if k.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: {k} page lists held something else than allocated pages at their request's turn (the latest: the {which} list of a request with options {:#x}): the list as enqueued is used", r.options);
+            }
+            PageList::NotPages
+        }
+        ListChange::Taken => {
+            // (entries that named a page at enqueue first: those are the ones that went wrong)
+            let (stale, filled): (Vec<usize>, Vec<usize>) = (0..list.len()).filter(|&i| list[i] != at_enqueue[i]).partition(|&i| at_enqueue[i] != 0);
+            let in_use = stale.iter().any(|&i| page_places(at_enqueue[i]) > 0);
+            let (stales, _, filleds) = (add(0, !stale.is_empty()), add(1, in_use), add(2, stale.is_empty()));
+            let nth = if stale.is_empty() { filleds } else { stales };
+            if nth <= if stale.is_empty() { 2 } else { 8 } {
+                let entries: Vec<String> = stale
+                    .iter()
+                    .chain(&filled)
+                    .take(4)
+                    .map(|&i| match at_enqueue[i] {
+                        0 => format!("entry {i}: 0 -> page {:#x}", list[i]),
+                        was => format!(
+                            "entry {i}: page {was:#x} ({}, mapped at {} address(es) now) -> page {:#x}",
+                            if pages_allocated(&[was]) { "allocated" } else { "not allocated" },
+                            page_places(was),
+                            list[i]
+                        ),
+                    })
+                    .collect();
+                crate::xlog_info!(
+                    "DirectStorage: a {which} page list changed between EnqueueRequest and its request's turn ({}): request with options {:#x}, {} bytes at page offset {} of its destination, {} source bytes at {:#x}; list of {} at {addr:#x}, {} entries differ, {} of them named a page at enqueue: {}{}. The list as it is at the request's turn is used, as on the console",
+                    if stale.is_empty() {
+                        format!("#{nth} with only entries that were 0 at enqueue and at Submit, which were always read at the turn")
+                    } else {
+                        format!("#{nth} with an entry that named a page at enqueue: as enqueued, the request would have used that page")
+                    },
+                    r.options,
+                    r.destination_size,
+                    r.destination_page_offset,
+                    r.source_size,
+                    r.offset,
+                    list.len(),
+                    stale.len() + filled.len(),
+                    stale.len(),
+                    entries.join("; "),
+                    if stale.len() + filled.len() > entries.len() { "; ..." } else { "" }
+                );
+            }
+            if nth.is_power_of_two() {
+                let c = page_list_counters();
+                crate::xlog_info!(
+                    "DirectStorage: page lists that changed between EnqueueRequest and their request's turn so far: {} with an entry that named a page at enqueue and another at the turn ({} of them a page mapped somewhere at the turn), {} with only entries that were 0 at enqueue and at Submit, {} that held no pages at the turn and stood as enqueued",
+                    c.stale,
+                    c.stale_in_use,
+                    c.filled,
+                    c.not_pages
+                );
+            }
+            PageList::Changed { entries: (stale.len() + filled.len()).min(255) as u8, stale: stale.len().min(255) as u8 }
+        }
+    };
+    (list, read)
+}
+
+/// A `PULONG_PTR` physical page array as it is at enqueue time (`page_list_now`: read again at
+/// the request's turn, unless it is on the caller's stack).
 unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Vec<usize>, HRESULT> {
     if byte_len == 0 {
         return Ok(Vec::new());
@@ -772,6 +934,8 @@ unsafe fn write_virtual(destination: usize, payload: &[u8]) -> bool {
     );
     crate::hle::kernelx::note_written(destination, written);
     crate::eh::note_guest_write("DirectStorage", destination, written);
+    // (kept with its hash: at a crash the memory is checked against it, `alias::report`)
+    crate::alias::payload_written(destination, &payload[..written.min(payload.len())]);
     status >= 0 && written == payload.len()
 }
 
@@ -809,7 +973,8 @@ pub fn counters() -> (u64, u64, u64) {
 }
 
 /// Run a request and report any short write as a failure.
-unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[usize]>, src_pages: Option<&[usize]>) -> Result<(), HRESULT> {
+/// (`dest_pages`, `src_pages`: the request's page lists as at enqueue, and where they were.)
+unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<(&[usize], ListPlace)>, src_pages: Option<(&[usize], ListPlace)>) -> Result<(), HRESULT> {
     let n = r.destination_size as usize;
     {
         // the first requests: where a title's data goes and how it is packed
@@ -837,8 +1002,9 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
     let src: Vec<u8> = if r.memory_source() {
         let mut b = vec![0u8; r.source_size as usize];
         if r.source_physical_pages() {
-            let pages = src_pages.ok_or(E_ACCESS_VIOLATION)?;
-            if !crate::hle::kernelx::read_physical_pages(pages, r.source_page_offset as usize, &mut b) {
+            let (at_enqueue, place) = src_pages.ok_or(E_ACCESS_VIOLATION)?;
+            let pages = page_list_at_turn("source", r, r.source as usize, at_enqueue, place).0;
+            if !crate::hle::kernelx::read_physical_pages(&pages, r.source_page_offset as usize, &mut b) {
                 return Err(E_ACCESS_VIOLATION);
             }
         } else {
@@ -888,9 +1054,17 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             if r.memory_source() { format!("memory at {:#x}", r.source) } else { file.map(|f| String::from_utf16_lossy(&f.path)).unwrap_or_default() }
         )
     };
-    crate::eh::with_write_context(request, || {
+    let (list, list_was) = match dest_pages {
+        Some((at_enqueue, place)) if r.dest_physical_pages() => {
+            let (list, was) = page_list_at_turn("destination", r, r.destination as usize, at_enqueue, place);
+            (Some(list), was)
+        }
+        _ => (None, crate::alias::PageList::None),
+    };
+    let written_for = crate::alias::Request { options: r.options, offset: if r.memory_source() { r.source } else { r.offset }, source_size: r.source_size, list: list_was };
+    crate::alias::with_request(written_for, || crate::eh::with_write_context(request, || {
         if r.dest_physical_pages() {
-            let pages = destination_pages(r.destination as usize, dest_pages.ok_or(E_ACCESS_VIOLATION)?)?;
+            let pages = destination_pages(r.destination as usize, list.as_deref().ok_or(E_ACCESS_VIOLATION)?)?;
             if !crate::hle::kernelx::write_physical_pages(&pages, r.destination_page_offset as usize, &payload[..n]) {
                 return Err(E_ACCESS_VIOLATION);
             }
@@ -898,7 +1072,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
             return Err(E_ACCESS_VIOLATION);
         }
         Ok(())
-    })
+    }))
 }
 
 /// `XCL_DS_VALIDATE=1`: after each request, whether it could have broken memory it does not own –
@@ -907,7 +1081,7 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
 /// payload is cut to it). The first failure is logged with the request and a thread dump, then the
 /// checks stop. The checks run on a thread of their own: one that takes over 5 s (a heap lock held
 /// elsewhere) is reported the same way, naming the step it is on.
-unsafe fn validate_after(r: &Request, dest_pages: Option<&[usize]>, result: Result<(), HRESULT>) {
+unsafe fn validate_after(r: &Request, dest_pages: Option<(&[usize], ListPlace)>, result: Result<(), HRESULT>) {
     static ON: OnceLock<bool> = OnceLock::new();
     static FAILED_ONCE: AtomicBool = AtomicBool::new(false);
     static STEP: Mutex<String> = Mutex::new(String::new());
@@ -919,7 +1093,7 @@ unsafe fn validate_after(r: &Request, dest_pages: Option<&[usize]>, result: Resu
     let n = r.destination_size as usize;
     let destination = r.destination as usize;
     let physical = r.dest_physical_pages();
-    let pages: Option<Vec<usize>> = dest_pages.map(|s| s.to_vec());
+    let pages: Option<(Vec<usize>, ListPlace)> = dest_pages.map(|(s, place)| (s.to_vec(), place));
     let ok = result.is_ok();
     let check = move || -> Option<String> {
         use windows_sys::Win32::System::Memory::{GetProcessHeaps, HeapValidate};
@@ -957,7 +1131,7 @@ unsafe fn validate_after(r: &Request, dest_pages: Option<&[usize]>, result: Resu
             return None;
         }
         if physical {
-            return match pages.as_deref().map(|s| destination_pages(destination, s)) {
+            return match pages.as_ref().map(|(s, place)| destination_pages(destination, &page_list_now(destination, s, *place).0).map(Cow::into_owned)) {
                 Some(Ok(p)) if crate::hle::kernelx::pages_allocated(&p) => None,
                 Some(Ok(_)) => Some("a destination physical page is no longer allocated".into()),
                 _ => Some("the destination page array no longer resolves".into()),
@@ -1065,6 +1239,8 @@ enum Entry {
         file: Option<Arc<FileInner>>,
         dest_pages: Option<Vec<usize>>,
         src_pages: Option<Vec<usize>>,
+        /// where the destination and the source page list were at enqueue
+        places: (ListPlace, ListPlace),
     },
     /// refused at enqueue: reported in queue order by the worker
     Refused {
@@ -1221,13 +1397,14 @@ impl QueueInner {
                     continue;
                 }
                 match e {
-                    Entry::Request { seq, req, file, dest_pages, src_pages } => {
+                    Entry::Request { seq, req, file, dest_pages, src_pages, places } => {
                         if self.is_cancelled(seq, req.tag) {
                             // Cancelled requests are skipped without affecting status or error record.
                             continue;
                         }
-                        let result = unsafe { execute(&req, file.as_deref(), dest_pages.as_deref(), src_pages.as_deref()) };
-                        unsafe { validate_after(&req, dest_pages.as_deref(), result) };
+                        let dest = dest_pages.as_deref().map(|p| (p, places.0));
+                        let result = unsafe { execute(&req, file.as_deref(), dest, src_pages.as_deref().map(|p| (p, places.1))) };
+                        unsafe { validate_after(&req, dest, result) };
                         if let Err(hr) = result {
                             self.fail(hr, req, file.as_deref());
                             if since_status >= 0 {
@@ -1467,7 +1644,10 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
                 fill = if !r.dest_physical_pages() {
                     Some(FillTarget::Virtual)
                 } else {
-                    snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size).ok().map(FillTarget::Pages)
+                    snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size).ok().map(|pages| {
+                        let place = ListPlace::of(r.destination, pages.len());
+                        FillTarget::Pages(pages, place)
+                    })
                 };
             }
         }
@@ -1504,7 +1684,9 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) 
     } else {
         None
     };
-    q.enqueue(Entry::Request { seq: 0, req: r, file, dest_pages, src_pages });
+    let place = |addr: u64, pages: &Option<Vec<usize>>| pages.as_ref().map_or(ListPlace::Kept, |p| ListPlace::of(addr, p.len()));
+    let places = (place(r.destination, &dest_pages), place(r.source, &src_pages));
+    q.enqueue(Entry::Request { seq: 0, req: r, file, dest_pages, src_pages, places });
 }
 
 unsafe extern "system" fn queue_enqueue_status(p: *mut c_void, array: *mut c_void, index: u32) {
@@ -2310,6 +2492,32 @@ mod tests {
         }
     }
 
+    /// A request's payload is kept with its hash (`alias`): the record of a crash tells whether the
+    /// destination still holds what the request wrote, and what it was written for.
+    #[test]
+    fn a_requests_payload_is_checked_against_its_destination_in_a_crash_record() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let plain: Vec<u8> = (0..0x2800u32).map(|i| (i * 31 + i / 7) as u8).collect();
+            let packed = miniz_oxide::deflate::compress_to_vec_zlib(&plain, 6);
+            let dst = VirtualAlloc(std::ptr::null(), 0x1_0000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) as usize;
+            assert_ne!(dst, 0);
+            let req = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT, dst as u64 + 0x1000, plain.len() as u32, packed.as_ptr() as u64, 0, packed.len() as u32));
+            assert_eq!(execute(&req, None, None, None), Ok(()));
+            assert_eq!(std::slice::from_raw_parts((dst + 0x1000) as *const u8, plain.len()), &plain[..]);
+            let held = crate::alias::report(dst + 0x1010).expect("an address a request wrote to");
+            assert!(held.contains(&format!("{:#x} bytes at {:#x}", plain.len(), dst + 0x1000)) && held.contains("STILL HOLDS it"), "{held}");
+            assert!(held.contains(&format!("request with options {:#x}: {} bytes at {:#x} of its source", SOURCE_MEMORY_BIT | ZLIB_BIT, packed.len(), packed.as_ptr() as usize)), "{held}");
+            // (the address may have been other memory before, with payloads of its own)
+            assert!(crate::alias::report(dst + 0x8000).is_none_or(|r| !r.contains(&format!("{:#x} bytes at {:#x}", plain.len(), dst + 0x1000))), "memory of the page the request did not write");
+            // other bytes land there with no request
+            std::ptr::write_bytes((dst + 0x2000) as *mut u8, 0xB7, 0x40);
+            let gone = crate::alias::report(dst + 0x3000).expect("the payload's last page");
+            assert!(gone.contains("NO LONGER HOLDS it, and no later payload was written to that address"), "{gone}");
+            assert_ne!(VirtualFree(dst as *mut c_void, 0, MEM_RELEASE), 0);
+        }
+    }
+
     #[test]
     fn virtual_destination_decommitted_after_validation_fails_the_write() {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
@@ -2388,6 +2596,218 @@ mod tests {
         assert_eq!(destination_pages(0, &[0]).unwrap_err(), E_ACCESS_VIOLATION);
         let vacant = 0usize;
         assert_eq!(destination_pages(&vacant as *const usize as usize, &[0]).unwrap_err(), E_ACCESS_VIOLATION);
+    }
+
+    /// A queue with a status array, and five physical pages mapped where the title reads them
+    /// (views in its reservation of 64 KiB pages): for requests whose page list is a slot of the
+    /// title's that it writes after EnqueueRequest.
+    struct Slots {
+        q: *mut c_void,
+        s: *mut c_void,
+        pool: usize,
+        pages: [usize; 5],
+    }
+
+    impl Slots {
+        unsafe fn new() -> Slots {
+            use crate::hle::kernelx::{AllocateTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+            let mut count = 5usize;
+            let mut pages = [0usize; 5];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 8, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let pool = crate::hle::kernelx::reserve(5 * PHYS_PAGE_SIZE).unwrap();
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 5, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            Slots { q, s, pool, pages }
+        }
+
+        /// EnqueueRequest of `request` with status `index`, then `then` (the title writing its slot),
+        /// then Submit; the request's result.
+        unsafe fn run(&self, index: u32, request: &[u8], then: impl FnOnce()) -> HRESULT {
+            let qv = *(self.q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(self.s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+            enqueue(self.q, request.as_ptr());
+            then();
+            status(self.q, self.s, index);
+            submit(self.q);
+            let t = std::time::Instant::now();
+            while !complete(self.s, index) && t.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            hresult(self.s, index)
+        }
+
+        /// `len` bytes at `offset` of page `page`, where the title reads them.
+        unsafe fn at(&self, page: usize, offset: usize, len: usize) -> &[u8] {
+            std::slice::from_raw_parts((self.pool + page * crate::hle::kernelx::PHYS_PAGE_SIZE + offset) as *const u8, len)
+        }
+
+        /// A record chunk in page 0, written by a request of its own to where the page is mapped.
+        unsafe fn record(&self, index: u32) -> Vec<u8> {
+            let record: Vec<u8> = (0..0xF40u32).map(|i| (i * 13 + 5) as u8).collect();
+            assert_eq!(self.run(index, &request(SOURCE_MEMORY_BIT, (self.pool + 0x8000) as u64, record.len() as u32, record.as_ptr() as u64, 0, record.len() as u32), || ()), S_OK);
+            record
+        }
+
+        unsafe fn close(mut self) {
+            use crate::hle::kernelx::{FreeTitlePhysicalPages, MapTitlePhysicalPages};
+            assert_eq!(MapTitlePhysicalPages(self.pool as *mut c_void, 5, 0, 4, std::ptr::null_mut()) as usize, self.pool);
+            assert_eq!(crate::hle::kernelx::free_in_reservation(self.pool, 0, windows_sys::Win32::System::Memory::MEM_RELEASE), Some(1));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 5, self.pages.as_mut_ptr()), 1);
+            queue_close(self.q);
+            queue_release(self.q);
+            status_release(self.s);
+        }
+    }
+
+    /// The retail sequence: a texture's table slot still names the page of the request it held
+    /// before when its request is enqueued, and gets its own page before Submit. The old page is a
+    /// record chunk by then, mapped in the title's reservation and filled by a request of its own:
+    /// it keeps the record, and the texture's data goes to the page the slot names at the
+    /// request's turn. A list on the enqueuing thread's stack is the list as it was at
+    /// EnqueueRequest, whatever is on that stack later. A source list is read like a destination's.
+    #[test]
+    fn a_page_list_rewritten_after_enqueue_is_read_at_the_requests_turn() {
+        use crate::hle::kernelx::PHYS_PAGE_SIZE;
+        unsafe {
+            let t = Slots::new();
+            let pages = t.pages;
+            // 0. page 0 is a record chunk now
+            let record = t.record(0);
+            // 1. a texture's request: its slot names page 0 at EnqueueRequest, page 1 before Submit
+            let texels: Vec<u8> = (0..0x8000u32).map(|i| (i * 7 + i / 251) as u8 | 0x80).collect();
+            let mut slot = Box::new([pages[0]]);
+            let before = page_list_counters();
+            let texture = request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, slot.as_ptr() as u64, 0x8000, texels.len() as u32, texels.as_ptr() as u64, 0, texels.len() as u32, 0, 0);
+            assert_eq!(t.run(1, &texture, || std::ptr::write_volatile(&mut slot[0], pages[1])), S_OK);
+            assert_eq!(t.at(0, 0x8000, record.len()), &record[..], "the record chunk in the slot's previous page is left alone");
+            assert_eq!(t.at(1, 0x8000, texels.len()), &texels[..], "the data goes to the page the slot names at the request's turn");
+            let after = page_list_counters();
+            assert!(after.stale > before.stale && after.stale_in_use > before.stale_in_use, "counted, with its page at enqueue in use: {before:?} {after:?}");
+            let written = crate::alias::report(t.pool + PHYS_PAGE_SIZE + 0x8010).expect("an address a request wrote to");
+            assert!(written.contains("; 1 entries of its page list CHANGED between EnqueueRequest and its turn (1 of them named a page at enqueue), used as at its turn"), "{written}");
+
+            // 2. a list on the enqueuing thread's stack, overwritten there with another allocated
+            // page after EnqueueRequest: the list as it was
+            let small: Vec<u8> = (0..0x100u32).map(|i| (i * 3 + 5) as u8).collect();
+            let mut on_stack = [pages[0]];
+            let stack = request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, on_stack.as_ptr() as u64, 0, small.len() as u32, small.as_ptr() as u64, 0, small.len() as u32, 0, 0);
+            assert_eq!(t.run(2, &stack, || std::ptr::write_volatile(&mut on_stack[0], pages[2])), S_OK);
+            assert_eq!(t.at(0, 0, small.len()), &small[..], "a list on the stack: the page it named at EnqueueRequest");
+            assert!(t.at(2, 0, small.len()).iter().all(|&b| b == 0), "the page written on the stack since is left alone");
+            assert!(crate::alias::report(t.pool + 0x10).is_some_and(|r| r.contains("; its page list on the enqueuing thread's stack, used as enqueued")));
+
+            // 3. a source list in a slot, rewritten after EnqueueRequest: read from the page it names then
+            let mut readback = vec![0u8; 0x100];
+            let mut source = Box::new([pages[0]]);
+            let read = request_ex(SOURCE_MEMORY_BIT | SOURCE_PHYS_PAGES_BIT, readback.as_mut_ptr() as u64, 0, readback.len() as u32, source.as_ptr() as u64, 0x8000, readback.len() as u32, 0, 0);
+            assert_eq!(t.run(3, &read, || std::ptr::write_volatile(&mut source[0], pages[1])), S_OK);
+            assert_eq!(&readback[..], &texels[..0x100], "read from the page the source slot names at the request's turn");
+            t.close();
+        }
+    }
+
+    /// A slot that held a shorter list before: at EnqueueRequest its first entry still names the
+    /// page of that list (a record chunk now) and the rest are 0; the title writes all of them
+    /// before Submit. Entries that were 0 were always read again (at Submit) – the first one was
+    /// not, and that part of the data went into the record. Then a slot that is all 0 at
+    /// EnqueueRequest: read at Submit as before, and no change at the request's turn.
+    #[test]
+    fn a_slot_that_held_a_shorter_list_is_read_whole_at_the_requests_turn() {
+        use crate::hle::kernelx::PHYS_PAGE_SIZE;
+        unsafe {
+            let t = Slots::new();
+            let pages = t.pages;
+            let record = t.record(0);
+            let wide: Vec<u8> = (0..2 * PHYS_PAGE_SIZE as u32).map(|i| (i * 11 + i / 127) as u8 | 1).collect();
+            let mut slot = Box::new([pages[0], 0]);
+            let before = page_list_counters();
+            let texture = request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, slot.as_ptr() as u64, 0, wide.len() as u32, wide.as_ptr() as u64, 0, wide.len() as u32, 0, 0);
+            let write = |slot: &mut [usize; 2]| {
+                std::ptr::write_volatile(&mut slot[0], pages[3]);
+                std::ptr::write_volatile(&mut slot[1], pages[4]);
+            };
+            assert_eq!(t.run(1, &texture, || write(&mut slot)), S_OK);
+            assert_eq!(t.at(0, 0x8000, record.len()), &record[..], "the record chunk in the page the slot's first entry named before is left alone");
+            assert_eq!(t.at(3, 0, wide.len()), &wide[..], "all of the data in the pages the slot names at the request's turn");
+            let after = page_list_counters();
+            assert!(after.stale > before.stale && after.stale_in_use > before.stale_in_use, "counted as a list with a stale entry: {before:?} {after:?}");
+            let written = crate::alias::report(t.pool + 3 * PHYS_PAGE_SIZE + 0x10).expect("an address a request wrote to");
+            assert!(written.contains("; 1 entries of its page list CHANGED between EnqueueRequest and its turn (1 of them named a page at enqueue), used as at its turn"), "{written}");
+
+            // all 0 at EnqueueRequest
+            let again: Vec<u8> = wide.iter().rev().copied().collect();
+            let mut empty = Box::new([0usize, 0]);
+            let texture = request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, empty.as_ptr() as u64, 0, again.len() as u32, again.as_ptr() as u64, 0, again.len() as u32, 0, 0);
+            assert_eq!(t.run(2, &texture, || write(&mut empty)), S_OK);
+            assert_eq!(t.at(3, 0, again.len()), &again[..]);
+            let written = crate::alias::report(t.pool + 4 * PHYS_PAGE_SIZE + 0x4010).expect("an address a request wrote to");
+            assert!(written.contains("; its page list at its turn as it was at EnqueueRequest (entries that were 0 then: as at Submit)"), "{written}");
+            t.close();
+        }
+    }
+
+    /// A list is taken as it is at its request's turn only when it was not on the enqueuing
+    /// thread's stack and names allocated pages then.
+    #[test]
+    fn a_page_list_at_its_turn_is_taken_only_when_it_names_pages() {
+        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages};
+        unsafe {
+            let mut count = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
+            let at_enqueue = [pages[0], pages[1]];
+            let mut slot = Box::new(at_enqueue);
+            let addr = slot.as_ptr() as usize;
+            assert_eq!(ListPlace::of(addr as u64, 2), ListPlace::Kept);
+            assert_eq!(ListPlace::of(at_enqueue.as_ptr() as u64, 2), ListPlace::CallersStack);
+            assert!(matches!(page_list_now(addr, &at_enqueue, ListPlace::Kept), (Cow::Borrowed(_), ListChange::Same)));
+            slot.as_mut_ptr().write_volatile(pages[1]);
+            slot.as_mut_ptr().add(1).write_volatile(pages[0]);
+            let (now, change) = page_list_now(addr, &at_enqueue, ListPlace::Kept);
+            assert_eq!((now.as_ref(), change), (&[pages[1], pages[0]][..], ListChange::Taken));
+            assert!(matches!(page_list_now(addr, &at_enqueue, ListPlace::CallersStack), (Cow::Borrowed(_), ListChange::Same)));
+            // counted by what the entries were at enqueue: pages (stale), or 0 (filled in since)
+            use crate::alias::PageList;
+            let r = Request::parse(&request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, addr as u64, 0, 16, addr as u64, 0, 16, 0, 0));
+            let before = page_list_counters();
+            assert_eq!(page_list_at_turn("destination", &r, addr, &at_enqueue, ListPlace::Kept).1, PageList::Changed { entries: 2, stale: 2 });
+            assert_eq!(page_list_at_turn("destination", &r, addr, &[pages[0], 0], ListPlace::Kept).1, PageList::Changed { entries: 2, stale: 1 });
+            let between = page_list_counters();
+            assert!(between.stale >= before.stale + 2 && between.stale_in_use == before.stale_in_use, "two with a stale entry, no page of theirs mapped: {before:?} {between:?}");
+            assert_eq!(page_list_at_turn("destination", &r, addr, &[0, 0], ListPlace::Kept).1, PageList::Changed { entries: 2, stale: 0 });
+            assert_eq!(page_list_at_turn("destination", &r, addr, &[0, pages[0]], ListPlace::Kept).1, PageList::Changed { entries: 1, stale: 0 });
+            assert!(page_list_counters().filled >= between.filled + 2);
+            assert_eq!(page_list_at_turn("destination", &r, addr, &[pages[1], pages[0]], ListPlace::Kept).1, PageList::Same);
+            assert_eq!(page_list_at_turn("destination", &r, addr, &at_enqueue, ListPlace::CallersStack).1, PageList::OnStack);
+            // an entry not filled in yet, and memory that is no list any more
+            for other in [0, usize::MAX & !15, 7] {
+                slot.as_mut_ptr().add(1).write_volatile(other);
+                let (now, change) = page_list_now(addr, &at_enqueue, ListPlace::Kept);
+                assert_eq!((now.as_ref(), change), (&at_enqueue[..], ListChange::NotPages), "{other:#x}");
+            }
+            assert_eq!(page_list_now(0, &at_enqueue, ListPlace::Kept).1, ListChange::Same, "not readable any more");
+            // freed since: no pages, the list as enqueued stands (and the request fails on it)
+            slot.as_mut_ptr().add(1).write_volatile(pages[0]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            assert_eq!(page_list_now(addr, &at_enqueue, ListPlace::Kept).1, ListChange::NotPages);
+        }
     }
 
     #[test]

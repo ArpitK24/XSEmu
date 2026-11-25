@@ -122,6 +122,11 @@ fn place(held: &crate::hle::kernelx::Held, source: Source) -> Option<usize> {
 
 /// The view page `at` gets what `from` holds (zeros where nothing readable is).
 unsafe fn copy_to(at: usize, from: Option<usize>) {
+    if from != Some(at) {
+        // (XCL's write into the title's memory)
+        crate::alias::mapping_changed("a copied GPU page view is overwritten with what it shows", "CopyPageMappingsBatchX / a submit's look", at, PAGE);
+        crate::eh::note_guest_write("copied GPU page view overwritten with what it shows", at, PAGE);
+    }
     match from.filter(|&a| readable(a)) {
         Some(a) if a != at => std::ptr::copy_nonoverlapping(a as *const u8, at as *mut u8, PAGE),
         Some(_) => {}
@@ -212,6 +217,9 @@ pub(super) unsafe fn copy_batch(count: u32, batches: *const Batch, pool: usize, 
             held.unmap(at);
             let Some(slot) = slot.filter(|&p| p != at) else { continue };
             let page = held.page_at(slot);
+            if let Some(p) = page {
+                held.note_source(at, slot, p);
+            }
             if let Some(p) = page.filter(|&p| held.view(at, p)) {
                 gpu.insert(at, p);
                 viewed += 1;
@@ -272,6 +280,67 @@ pub(crate) fn forget(at: usize, len: usize) {
             VIEWED.store(gpu.at.len(), Ordering::Release);
         }
     }
+}
+
+/// The GPU's views of the memory an address of a crash record shows (`alias::report`).
+#[derive(Default)]
+pub(crate) struct AliasFacts {
+    /// what the address itself is to the GPU
+    pub here: Option<String>,
+    /// the other addresses (64 KiB aligned) that are the GPU's views of it, or that its copies are
+    /// taken from, and as what
+    pub aliases: Vec<(usize, &'static str)>,
+}
+
+/// For the 64 KiB page at `va`, which shows physical page `page` (None: none): whether it is a GPU
+/// view, the views that are the page itself, and the copied views XCL keeps in step with the page
+/// or with this address (XCL copies 64 KiB over each of those when its source changes). Locks
+/// another thread holds are not waited for.
+pub(crate) fn alias_facts(va: usize, page: Option<usize>) -> AliasFacts {
+    let at = va & !(PAGE - 1);
+    let mut f = AliasFacts::default();
+    let mut here = Vec::new();
+    if VIEWED.load(Ordering::Acquire) > 0 {
+        match crate::alias::try_lock(&GPU) {
+            Some(g) => {
+                if let Some(gpu) = g.as_ref() {
+                    if let Some(p) = gpu.at.get(&at) {
+                        here.push(format!("a GPU view of physical page {p:#x} (the page itself)"));
+                    }
+                    if let Some((views, _)) = page.and_then(|p| gpu.pages.get(&p)) {
+                        f.aliases.extend(views.iter().filter(|&&v| v != at).map(|&v| (v, "a GPU view (the page itself)")));
+                    }
+                }
+            }
+            None => here.push("(the GPU page views are locked by another thread)".to_string()),
+        }
+    }
+    if SHOWN.load(Ordering::Acquire) > 0 {
+        match crate::alias::try_lock(&VIEWS) {
+            Some(g) => {
+                if let Some(v) = g.as_ref() {
+                    match v.shown.get(&at) {
+                        Some(Source::Page(p)) => here.push(format!("a copied GPU view of physical page {p:#x}: XCL copies the page's 64 KiB over this address whenever the page changes")),
+                        Some(&Source::Address(a)) => {
+                            here.push(format!("a copied GPU view of the memory at {a:#x}: XCL copies those 64 KiB over this address whenever they change"));
+                            f.aliases.push((a, "the address this copied GPU view is filled from"));
+                        }
+                        None => {}
+                    }
+                    let copied = |s: Source| v.sources.get(&s).into_iter().flat_map(|s| s.views.iter().copied()).filter(|&a| a != at).collect::<Vec<usize>>();
+                    if let Some(p) = page {
+                        f.aliases.extend(copied(Source::Page(p)).into_iter().map(|a| (a, "a copied GPU view of the page (XCL copies the page over it)")));
+                    }
+                    f.aliases.extend(copied(Source::Address(at)).into_iter().map(|a| (a, "a copied GPU view of this address (XCL copies this memory over it)")));
+                }
+            }
+            None => here.push("(the copied GPU page views are locked by another thread)".to_string()),
+        }
+    }
+    if !here.is_empty() {
+        f.here = Some(format!("to the GPU this address is {}", here.join("; ")));
+    }
+    f
 }
 
 /// What the 64 KiB page at `va` is (diagnostics): a GPU view (of what, what both hold) or the

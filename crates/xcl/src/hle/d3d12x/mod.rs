@@ -37,6 +37,11 @@ mod single;
 mod residency_list;
 pub mod sparse;
 mod external_buffers;
+
+/// (diagnostics) The buffers the title placed over `[va, va + len)` outside unified memory.
+pub(crate) fn placed_buffers_over(va: usize, len: usize) -> Vec<String> {
+    external_buffers::placed_over(va, len)
+}
 pub mod title_list;
 pub mod title_textures;
 pub mod vram;

@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -27,8 +27,7 @@ const OP_BITS: u32 = 20;
 const OP_MASK: u32 = (1 << OP_BITS) - 1;
 
 pub(super) fn enabled() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XCL_GPU_MARKERS").is_ok_and(|v| v.trim() == "1"))
+    crate::config::gpu_markers_enabled()
 }
 
 #[derive(Clone, Copy)]

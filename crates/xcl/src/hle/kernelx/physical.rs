@@ -33,7 +33,7 @@ use std::sync::{LazyLock, Mutex, RwLock};
 
 use windows_sys::Win32::Foundation as fnd;
 use windows_sys::Win32::System::Memory as mem;
-use windows_sys::Win32::System::Threading::GetCurrentProcess;
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentThreadId};
 
 use super::lazy;
 
@@ -131,9 +131,25 @@ struct Phys {
     places: HashMap<usize, Vec<usize>>,
     /// the title's reservations of 64 KiB pages made of placeholders: base → reservation
     reservations: BTreeMap<usize, Reservation>,
+    /// the latest maps, unmaps, commits and frees, for a crash record (`alias_facts`)
+    history: crate::alias::MapHistory,
+    /// the call the changes being made are for (in `history`)
+    site: &'static str,
+}
+
+fn kind_name(kind: Kind, lazy: bool) -> &'static str {
+    match kind {
+        Kind::View => "view",
+        Kind::Copy if lazy => "copy (not used yet)",
+        Kind::Copy => "copy",
+    }
 }
 
 static PHYS: LazyLock<Mutex<Phys>> = LazyLock::new(|| Mutex::new(Phys::default()));
+
+/// How many addresses show a page as a copy (`Kind::Copy` in `Phys::at`): none while the title
+/// maps its pages in placeholder reservations only, and then `title_freed` has nothing to do.
+static COPIES: AtomicUsize = AtomicUsize::new(0);
 
 /// The section pages committed (used), by their place in their allocation's view. (Kept apart
 /// from `PHYS` for `lazy`'s fault handler; and asking Windows – VirtualQuery – walks the whole run
@@ -319,9 +335,40 @@ impl Phys {
         self.home(page).filter(|&h| used(h))
     }
 
+    /// A change of the 64 KiB pages of `[at, at + len)` (`len` 0: none) or of `page` (0: none) kept
+    /// in `history`.
+    fn note(&mut self, what: &'static str, at: usize, len: usize, page: usize) {
+        self.history.push(crate::alias::MapEvent { t: crate::log::uptime() as f32, thread: unsafe { GetCurrentThreadId() }, at, len, page, what, site: self.site });
+    }
+
     fn record(&mut self, at: usize, page: usize, kind: Kind) {
+        self.note(
+            match kind {
+                Kind::View => "map view of",
+                Kind::Copy if lazy::is_lazy(at) => "map copy (filled on first use) of",
+                Kind::Copy => "map copy of",
+            },
+            at,
+            PHYS_PAGE,
+            page,
+        );
+        if kind == Kind::Copy {
+            COPIES.fetch_add(1, Ordering::Release);
+        }
         self.at.insert(at, Mapping { page, kind });
         self.places.entry(page).or_default().push(at);
+    }
+
+    /// The addresses in `[lo, hi)` (`lo` a multiple of 64 KiB) that show a page, in order.
+    fn mapped_in(&self, lo: usize, hi: usize) -> Vec<usize> {
+        let slots = hi.saturating_sub(lo).div_ceil(PHYS_PAGE);
+        let mut found: Vec<usize> = if slots <= self.at.len() {
+            (0..slots).map(|i| lo + i * PHYS_PAGE).filter(|a| self.at.contains_key(a)).collect()
+        } else {
+            self.at.keys().copied().filter(|&a| a >= lo && a < hi).collect()
+        };
+        found.sort_unstable();
+        found
     }
 
     /// Page `page` mapped at `at` (false: it could not be; the last error says why).
@@ -329,7 +376,9 @@ impl Phys {
         if self.at.get(&at).is_some_and(|m| m.page == page) {
             return true;
         }
-        self.unmap_at(at);
+        if !self.unmap_at(at) {
+            return false;
+        }
         if self.in_reservation(at) {
             let Some((section, offset)) = self.block_of(page).map(|(b, off)| (b.section, off)) else { return false };
             let home = self.home(page).unwrap();
@@ -342,6 +391,7 @@ impl Phys {
             if let Some(from) = from {
                 // the copy in use has the data: into the section, which the view shows
                 std::ptr::copy_nonoverlapping(from as *const u8, home as *mut u8, PHYS_PAGE);
+                crate::eh::note_guest_write("physical page section filled from the page's copy (its first view)", home, PHYS_PAGE);
             }
             let r = self.reservation(at).unwrap();
             if !r.placeholder(at) || !map_into(section, offset, at) {
@@ -376,6 +426,11 @@ impl Phys {
                 crate::hle::d3d12x::sparse::committed(at, PHYS_PAGE);
             }
         }
+        if owner.is_some() || !fresh {
+            // (XCL's write into the title's memory: what was committed there is overwritten)
+            crate::alias::mapping_changed("a physical page is mapped as a copy over memory", self.site, at, PHYS_PAGE);
+            crate::eh::note_guest_write(if owner.is_some() { "physical page copy filled (mapped)" } else { "physical page copy zeroed (mapped, page never used)" }, at, PHYS_PAGE);
+        }
         match owner {
             Some(from) => std::ptr::copy_nonoverlapping(from as *const u8, at as *mut u8, PHYS_PAGE),
             None if !fresh => std::ptr::write_bytes(at as *mut u8, 0, PHYS_PAGE),
@@ -385,20 +440,50 @@ impl Phys {
         true
     }
 
-    /// Whatever page is mapped at `at` unmapped.
-    unsafe fn unmap_at(&mut self, at: usize) {
-        let Some(m) = self.at.remove(&at) else { return };
+    /// Whatever page is mapped at `at` unmapped. False: Windows refused to unmap the view there –
+    /// the address still shows the page, the model still says so, and the call this is for
+    /// fails (an unmap taken as done left the title's address showing a page XCL no longer
+    /// counted among the page's addresses).
+    unsafe fn unmap_at(&mut self, at: usize) -> bool {
+        let Some(m) = self.at.remove(&at) else { return true };
+        if m.kind == Kind::Copy {
+            COPIES.fetch_sub(1, Ordering::Release);
+        }
         if let Some(v) = self.places.get_mut(&m.page) {
             v.retain(|&a| a != at);
             if v.is_empty() {
                 self.places.remove(&m.page);
             }
         }
+        self.note(
+            match m.kind {
+                Kind::View => "unmap view of",
+                Kind::Copy if lazy::is_lazy(at) => "unmap copy (never used) of",
+                Kind::Copy => "unmap copy of",
+            },
+            at,
+            PHYS_PAGE,
+            m.page,
+        );
+        crate::alias::mapping_changed("a physical page is unmapped", self.site, at, PHYS_PAGE);
         match m.kind {
             Kind::View => {
                 if let Some(r) = self.reservation(at) {
                     if unmap_into_placeholder(at) {
                         r.slots.insert(at, Slot::Placeholder);
+                    } else {
+                        let error = fnd::GetLastError();
+                        self.at.insert(at, m);
+                        self.places.entry(m.page).or_default().push(at);
+                        self.note("UNMAP REFUSED BY WINDOWS, the view stays: of", at, PHYS_PAGE, m.page);
+                        static SITES: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
+                        let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+                        if !sites.contains(&self.site) {
+                            sites.push(self.site);
+                            crate::xlog_warn!("physical pages: Windows refused to unmap the view of a page (error {error}) for {}: the address still shows the page, the call fails", self.site);
+                        }
+                        fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
+                        return false;
                     }
                 }
                 lazy::unview(at);
@@ -406,6 +491,8 @@ impl Phys {
                     // the copies have the data again
                     let home = self.home(m.page).filter(|&h| used(h));
                     for a in self.copies(m.page) {
+                        crate::alias::mapping_changed("a physical page's copy is overwritten with its section (its last view unmapped)", self.site, a, PHYS_PAGE);
+                        crate::eh::note_guest_write("physical page copy overwritten with its section (its last view unmapped)", a, PHYS_PAGE);
                         match home {
                             Some(h) => std::ptr::copy_nonoverlapping(h as *const u8, a as *mut u8, PHYS_PAGE),
                             None => std::ptr::write_bytes(a as *mut u8, 0, PHYS_PAGE),
@@ -415,12 +502,13 @@ impl Phys {
             }
             Kind::Copy => {
                 if lazy::unmark(at) {
-                    return; // never used
+                    return true; // never used
                 }
                 if !self.has_views(m.page) && self.copies(m.page).is_empty() {
                     if let Some(home) = self.home(m.page) {
                         if use_page(home) {
                             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
+                            crate::eh::note_guest_write("physical page section filled from the page's last copy (unmapped)", home, PHYS_PAGE);
                         }
                     }
                 }
@@ -433,6 +521,7 @@ impl Phys {
                 }
             }
         }
+        true
     }
 
     /// Unified memory for the block of `page` (mapping its pages at no chosen address).
@@ -506,20 +595,34 @@ pub unsafe extern "system" fn FreeTitlePhysicalPages(_p: HANDLE, n: usize, arr: 
     // freed pages still mapped somewhere: those addresses keep showing them until they are
     // unmapped (a view keeps its section)
     let mut g = PHYS.lock().unwrap();
+    g.site = "FreeTitlePhysicalPages";
     for i in 0..n {
-        let Some(index) = page_index(*arr.add(i)) else { continue };
+        let page = *arr.add(i);
+        let Some(index) = page_index(page) else { continue };
         let Some((&first, b)) = g.blocks.range_mut(..=index).next_back() else { continue };
-        if !b.release(index - first) || b.live != 0 {
+        let released = b.release(index - first);
+        let emptied = released && b.live == 0;
+        if released {
+            g.note("freed:", 0, 0, page);
+        }
+        if !emptied {
             continue;
         }
         let b = g.blocks.remove(&first).unwrap();
+        g.note("every page of the allocation freed, XCL's view of it unmapped: first", b.view, b.count * PHYS_PAGE, page_number(first));
+        crate::alias::mapping_changed("physical pages are freed (XCL's view of them unmapped)", "FreeTitlePhysicalPages", b.view, b.count * PHYS_PAGE);
         lazy::unview(b.view);
         lazy::forget_fills(b.view, b.count * PHYS_PAGE);
         USED.write().unwrap_or_else(|e| e.into_inner()).retain(|&h| h < b.view || h >= b.view + b.count * PHYS_PAGE);
-        mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b.view as *mut c_void });
+        // (forgotten before it goes: once unmapped, the address may be another thread's)
         crate::memmap::released(b.view);
+        mem::UnmapViewOfFile(mem::MEMORY_MAPPED_VIEW_ADDRESS { Value: b.view as *mut c_void });
         fnd::CloseHandle(b.section as HANDLE);
         if let (Some(h), Some(u)) = (b.uma_home, crate::gpu::uma::get()) {
+            // (the unified memory the allocation had goes back: nothing stays mapped in it)
+            for at in g.mapped_in(h, h + b.count * PHYS_PAGE) {
+                g.unmap_at(at);
+            }
             if u.is_sparse(h) {
                 crate::hle::d3d12x::sparse::free(h);
             } else {
@@ -534,6 +637,7 @@ pub unsafe extern "system" fn MapTitlePhysicalPages(va: *mut c_void, n: usize, _
     let t0 = std::time::Instant::now();
     let mut g = PHYS.lock().unwrap();
     let locked = t0.elapsed();
+    g.site = "MapTitlePhysicalPages";
     let r = map_pages(&mut g, va, n, arr);
     trace_map("MapPhysicalPages", va as usize, n, arr, r as usize, (locked, t0.elapsed()));
     r
@@ -588,7 +692,9 @@ unsafe fn map_pages(g: &mut Phys, va: *mut c_void, n: usize, arr: *mut usize) ->
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
         if p == 0 {
-            g.unmap_at(at);
+            if !g.unmap_at(at) {
+                return std::ptr::null_mut();
+            }
         } else if !g.map_at(at, p) {
             return std::ptr::null_mut();
         }
@@ -619,6 +725,7 @@ pub unsafe extern "system" fn XMemMapPhysicalPagesScatter(addresses: *const *mut
     let t0 = std::time::Instant::now();
     let mut g = PHYS.lock().unwrap();
     let locked = t0.elapsed();
+    g.site = "XMemMapPhysicalPagesScatter";
     static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if pages.is_null() && *KEEP.get_or_init(|| std::env::var("XCL_SCATTER_UNMAP").is_ok_and(|v| v == "0")) {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -669,18 +776,29 @@ pub(crate) unsafe fn commit_in_reservation(a: usize, size: usize, protect: u32) 
         fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
         return Some(std::ptr::null_mut());
     };
-    let mut slot = a & !(PHYS_PAGE - 1);
+    let first = a & !(PHYS_PAGE - 1);
+    let mut slot = first;
+    let mut failed = false;
     while slot < end {
         let (lo, hi) = (a.max(slot), end.min(slot + PHYS_PAGE));
         if r.slots.get(&slot) != Some(&Slot::View) && !r.private(slot) {
             fnd::SetLastError(fnd::ERROR_INVALID_ADDRESS);
-            return Some(std::ptr::null_mut());
+            failed = true;
+            break;
         }
         if mem::VirtualAlloc((lo & !0xFFF) as *const c_void, hi - (lo & !0xFFF), mem::MEM_COMMIT, protect).is_null() {
-            return Some(std::ptr::null_mut());
+            failed = true;
+            break;
         }
         crate::memmap::committed(lo, hi - lo, protect);
         slot += PHYS_PAGE;
+    }
+    if slot > first {
+        g.site = "VirtualAlloc";
+        g.note("the title commits memory in its reservation (private memory in the slots that show no page)", first, slot - first, 0);
+    }
+    if failed {
+        return Some(std::ptr::null_mut());
     }
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| crate::xlog_info!("physical pages: the title commits memory in its reservation of 64 KiB pages at {a:#x} ({size:#x} bytes): private memory there, write-watched"));
@@ -703,6 +821,9 @@ pub(crate) unsafe fn free_in_reservation(a: usize, size: usize, t: u32) -> Optio
         return fail();
     }
     let range_end = if release || size == 0 { end } else { a.saturating_add(size).min(end) };
+    g.site = "VirtualFree";
+    g.note(if release { "the title releases its reservation (pages unmapped, private memory gone)" } else { "the title decommits in its reservation (pages unmapped, private memory decommitted)" }, a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)), 0);
+    crate::alias::mapping_changed(if release { "the title's reservation of 64 KiB pages is released" } else { "a range of the title's reservation of 64 KiB pages is decommitted" }, "VirtualFree", a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)));
     crate::hle::d3d12x::page_mappings::forget(a & !(PHYS_PAGE - 1), range_end - (a & !(PHYS_PAGE - 1)));
     let mapped: Vec<usize> = g.at.keys().copied().filter(|&x| x >= (a & !(PHYS_PAGE - 1)) && x < range_end).collect();
     for x in mapped {
@@ -721,10 +842,61 @@ pub(crate) unsafe fn free_in_reservation(a: usize, size: usize, t: u32) -> Optio
         r.placeholder(x);
     }
     mem::VirtualFree(base as *mut c_void, end - base, COALESCE);
-    let ok = mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+    // (forgotten before it goes: once released, the address may be another thread's)
     crate::memmap::released(base);
+    let ok = mem::VirtualFree(base as *mut c_void, 0, mem::MEM_RELEASE);
+    if ok == 0 {
+        // (still there: a view Windows would not unmap. The model keeps the reservation.)
+        crate::xlog_warn!("physical pages: Windows refused to release a reservation of 64 KiB pages (error {}): kept", fnd::GetLastError());
+        crate::memmap::reserved(base, end - base);
+        return Some(0);
+    }
     g.reservations.remove(&base);
+    // (gone with everything in it: no address there shows a page any more)
+    for x in g.mapped_in(base, end) {
+        if let Some(m) = g.at.remove(&x) {
+            if m.kind == Kind::Copy {
+                COPIES.fetch_sub(1, Ordering::Release);
+            }
+            if let Some(v) = g.places.get_mut(&m.page) {
+                v.retain(|&a| a != x);
+                if v.is_empty() {
+                    g.places.remove(&m.page);
+                }
+            }
+            lazy::unview(x);
+        }
+    }
     Some(ok)
+}
+
+/// The title frees or decommits `[start, start + len)` outside those reservations (VirtualFree,
+/// XMemFree): the physical pages mapped there are unmapped first, each keeping its data
+/// (`unmap_at`) – on the console a mapping goes with its address space. Left in the model, a copy
+/// there stayed a place XCL writes the page's data to (`write_physical_pages`, the copies of a
+/// page whose last view goes) and takes it from (the page's first view) after the address had
+/// become other memory. Returns how many pages were unmapped.
+pub(crate) unsafe fn title_freed(start: usize, len: usize, site: &'static str) -> usize {
+    if len == 0 || COPIES.load(Ordering::Acquire) == 0 {
+        return 0;
+    }
+    let (lo, hi) = (start & !(PHYS_PAGE - 1), start.saturating_add(len));
+    let mut g = PHYS.lock().unwrap();
+    let mapped = g.mapped_in(lo, hi);
+    if mapped.is_empty() {
+        return 0;
+    }
+    g.site = site;
+    g.note("the title frees memory that still shows physical pages (unmapped first, each keeps its data)", lo, hi - lo, 0);
+    crate::hle::d3d12x::page_mappings::forget(lo, hi - lo);
+    for &at in &mapped {
+        g.unmap_at(at);
+    }
+    static LOGGED: AtomicUsize = AtomicUsize::new(0);
+    if LOGGED.fetch_add(1, Ordering::Relaxed) < 8 {
+        crate::xlog_info!("physical pages: the title freed memory with {} page(s) still mapped in it ({site}): unmapped first, each page keeps its data", mapped.len());
+    }
+    mapped.len()
 }
 
 // --- XCL's access to the pages ------------------------------------------------------------
@@ -761,6 +933,8 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     if src.is_empty() {
         return offset < PHYS_PAGE;
     }
+    // (each page's piece hashed before the pages are held: `alias::payload_written_as`)
+    let hashes: Vec<u64> = if offset < PHYS_PAGE { crate::alias::pieces(offset, src.len()).map(|(at, n)| crate::alias::hash(&src[at - offset..at - offset + n])).collect() } else { Vec::new() };
     let g = PHYS.lock().unwrap();
     let Some(need) = span(pages, offset, src.len()) else { return false };
     if pages[..need].iter().any(|&p| g.block_of(p).is_none()) {
@@ -768,7 +942,7 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
     }
     let mut done = 0;
     let mut page_off = offset;
-    for &p in &pages[..need] {
+    for (i, &p) in pages[..need].iter().enumerate() {
         let chunk = (PHYS_PAGE - page_off).min(src.len() - done);
         let home = g.home(p).unwrap();
         let owner = g.owner(p).unwrap_or_else(|| {
@@ -783,6 +957,8 @@ pub unsafe fn write_physical_pages(pages: &[usize], offset: usize, src: &[u8]) -
         for &t in &targets {
             std::ptr::copy_nonoverlapping(src.as_ptr().add(done), (t + page_off) as *mut u8, chunk);
             crate::eh::note_guest_write("physical page write", t + page_off, chunk);
+            let kind = if t == home { "written through XCL's view of its section: a physical destination" } else { "written through its copy: a physical destination" };
+            crate::alias::payload_written_as(t + page_off, &src[done..done + chunk], hashes[i], Some(crate::alias::Backing { page: p, kind }));
         }
         // every address showing the page: the textures there are uploaded again
         for &a in g.places(p) {
@@ -843,6 +1019,7 @@ pub(crate) fn alias_ranges(ranges: &[(usize, usize)]) -> Vec<(usize, usize)> {
 /// Runs `f` with the physical pages held still (no page is mapped or unmapped meanwhile).
 pub(crate) unsafe fn hold_physical_pages<R>(f: impl FnOnce(&mut Held) -> R) -> R {
     let mut g = PHYS.lock().unwrap();
+    g.site = "a GPU page view (CopyPageMappingsBatchX)";
     f(&mut Held(&mut g))
 }
 
@@ -866,7 +1043,10 @@ impl Held<'_> {
     /// The 64 KiB at `at` as memory of its own for a GPU view XCL fills itself (a pool slot that
     /// shows no page): committed (false: it could not be).
     pub(crate) unsafe fn claim(&mut self, at: usize) -> bool {
-        self.0.unmap_at(at);
+        if !self.0.unmap_at(at) {
+            return false;
+        }
+        self.0.note("claimed as memory of its own for a GPU view XCL fills (a copied view)", at, PHYS_PAGE, 0);
         if let Some(r) = self.0.reservation(at) {
             if !r.private(at) {
                 return false;
@@ -889,6 +1069,15 @@ impl Held<'_> {
     /// The physical page the address `va` shows.
     pub(crate) fn page_at(&self, va: usize) -> Option<usize> {
         self.0.page_at(va)
+    }
+
+    /// (diagnostics) The GPU view at `at` is about to show `page`, which `slot` shows: kept in
+    /// the map history when no page is mapped at `slot` – it is `page`'s own place in its
+    /// allocation (`page_at`), whatever the title has mapped the page for since.
+    pub(crate) fn note_source(&mut self, at: usize, slot: usize, page: usize) {
+        if !self.0.at.contains_key(&(slot & !(PHYS_PAGE - 1))) {
+            self.0.note("a GPU view here takes its page from a pool slot where no page is mapped (the page's own place in its allocation):", at, PHYS_PAGE, page);
+        }
     }
 
     /// Where page `p`'s data is (None: not allocated, or never used – zeros).
@@ -950,6 +1139,109 @@ pub(crate) fn describe_address(va: usize) -> String {
         None if g.in_reservation(at) => "a placeholder of a reservation of 64 KiB pages (no page)".into(),
         None => "no physical page".into(),
     }
+}
+
+/// The physical page the title's address `va` shows, for a payload written there
+/// (`alias::payload_written`): the page mapped at it, or a slot of one of the title's reservations
+/// that shows none. None: plain memory. (A lookup of the address only: no search of the
+/// allocations.)
+pub(crate) fn backing(va: usize) -> Option<crate::alias::Backing> {
+    let at = va & !(PHYS_PAGE - 1);
+    let g = PHYS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.at.get(&at) {
+        return Some(crate::alias::Backing { page: m.page, kind: kind_name(m.kind, false) });
+    }
+    g.in_reservation(at).then_some(crate::alias::Backing { page: 0, kind: "a slot of the title's reservation of 64 KiB pages that shows no physical page" })
+}
+
+/// (diagnostics) Where physical page `page`'s data is now: its section through XCL's view, or its
+/// copy in use while it has no view. None: freed with its whole allocation, never used, or the
+/// model is locked by another thread.
+pub(crate) fn page_data(page: usize) -> Option<usize> {
+    crate::alias::try_lock(&PHYS)?.owner(page)
+}
+
+/// XCL's account of the 64 KiB page at an address of a crash record (`alias::report`).
+pub(crate) struct AliasFacts {
+    pub what: String,
+    /// the physical page shown there (page 0: a slot of a reservation that shows none)
+    pub backing: Option<crate::alias::Backing>,
+    /// the other addresses showing the page (64 KiB aligned), and as what
+    pub aliases: Vec<(usize, String)>,
+    /// the latest maps and unmaps of the address / of the page elsewhere, the latest first
+    pub history_here: Vec<String>,
+    pub history_page: Vec<String>,
+}
+
+/// What the 64 KiB page at `va` is in the model of physical pages: the page it shows, the page's
+/// allocation, where its data is, every other address showing it, and the latest changes. None:
+/// nothing (plain memory no page was mapped at within the history kept), or the model is locked
+/// by another thread – at a crash it is not waited for.
+pub(crate) fn alias_facts(va: usize) -> Option<AliasFacts> {
+    let at = va & !(PHYS_PAGE - 1);
+    let Some(g) = crate::alias::try_lock(&PHYS) else {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| crate::xlog_warn!("alias report: the physical pages are locked by another thread, no account of them"));
+        return None;
+    };
+    let mapped = g.at.get(&at).copied();
+    let page = mapped.map(|m| m.page).or_else(|| g.page_at(at));
+    let slot = g.reservations.range(..=at).next_back().filter(|(_, r)| at < r.end).map(|(&base, r)| (base, r.end, r.slots.get(&at).copied()));
+    let history_here: Vec<String> = g.history.at(at, 8).iter().map(|e| e.to_string()).collect();
+    if page.is_none() && slot.is_none() && history_here.is_empty() {
+        return None;
+    }
+    let mut what = match (mapped, page) {
+        (Some(m), _) => format!("physical page {:#x} is mapped here as a {}", m.page, kind_name(m.kind, lazy::is_lazy(at))),
+        (None, Some(p)) => format!("XCL's own view of physical page {p:#x} (its place in its allocation's view, or its unified-memory home)"),
+        (None, None) => "no physical page is mapped here".to_string(),
+    };
+    if let Some((base, end, s)) = slot {
+        let s = match s {
+            None => "never split out of it",
+            Some(Slot::Placeholder) => "a placeholder now",
+            Some(Slot::View) => "a view",
+            Some(Slot::Private) => "private memory",
+        };
+        what += &format!("; a slot of the title's reservation of 64 KiB pages {base:#x}..{end:#x} ({s})");
+    }
+    let mut aliases = Vec::new();
+    let mut history_page = Vec::new();
+    if let Some(p) = page {
+        match g.backing_block(p) {
+            Some((b, offset)) => {
+                let first = page_number(page_index(p).map_or(0, |i| i - offset));
+                what += &format!("; the page is page {offset} of an allocation of {} from page {first:#x}, {} of them live{}", b.count, b.live, if b.is_live(offset) { "" } else { " – THIS PAGE WAS FREED by the title" });
+            }
+            None => what += "; the page's allocation is gone (all its pages were freed)",
+        }
+        let home = g.home(p);
+        what += &match g.owner(p) {
+            Some(o) if Some(o) == home => format!("; its data is in its section (XCL's view of it: {o:#x})"),
+            Some(o) => format!("; its data is in its copy at {o:#x} (it has no view)"),
+            None => "; it was never used (zeros)".to_string(),
+        };
+        if let Some(h) = home.filter(|&h| h != at) {
+            aliases.push((h, "XCL's view of the page's section".to_string()));
+        }
+        for &a in g.places(p) {
+            if a != at {
+                aliases.push((a, g.at.get(&a).map_or("?", |m| kind_name(m.kind, lazy::is_lazy(a))).to_string()));
+            }
+        }
+        history_page = g.history.of_page(p, at, 8).iter().map(|e| e.to_string()).collect();
+    }
+    let backing = match (mapped, page) {
+        (Some(m), _) => Some(crate::alias::Backing { page: m.page, kind: kind_name(m.kind, false) }),
+        (None, Some(p)) => Some(crate::alias::Backing { page: p, kind: "XCL's own view of it" }),
+        (None, None) => slot.map(|_| crate::alias::Backing { page: 0, kind: "a slot of the title's reservation of 64 KiB pages that shows no physical page" }),
+    };
+    Some(AliasFacts { what, backing, aliases, history_here, history_page })
+}
+
+/// At how many addresses physical page `page` is mapped now.
+pub(crate) fn page_places(page: usize) -> usize {
+    PHYS.lock().unwrap().places(page).len()
 }
 
 /// Whether every one of `pages` is an allocated physical page.
@@ -1098,7 +1390,7 @@ mod tests {
             let mut buf = [0u8; 4];
             assert!(read_physical_pages(&pages[1..], 0, &mut buf));
             assert_eq!(u32::from_le_bytes(buf), 0x55AA);
-            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let r = super::super::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
             let mut one = [pages[1]];
             assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r);
             assert_eq!(std::ptr::read_volatile(r as *const u32), 0x55AA, "a copy in plain memory");
@@ -1109,7 +1401,184 @@ mod tests {
             validate_physical().unwrap();
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 3, pages.as_mut_ptr()), 1);
             assert!(MapTitlePhysicalPages(std::ptr::null_mut(), 3, 0, 4, pages.as_mut_ptr()).is_null());
-            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            assert_eq!(super::super::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert!(PHYS.lock().unwrap().places(pages[1]).is_empty(), "released: the page is mapped nowhere");
+        }
+    }
+
+    /// The title decommits, then releases, memory that shows physical pages as copies: the pages
+    /// are unmapped and keep what was written there, and the memory at those addresses afterwards
+    /// is not theirs – XCL neither writes a page's data there nor takes it from there.
+    #[test]
+    fn memory_the_title_frees_shows_no_page_any_more() {
+        unsafe {
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let r = super::super::VirtualAlloc(std::ptr::null(), 4 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            assert!(r != 0);
+            // page 0 holds data and is written through its copy; page 1 is mapped and never used
+            assert!(write_physical_pages(&pages[..1], 0, &[1u8; 8]));
+            assert_eq!(MapTitlePhysicalPages(r as *mut c_void, 2, 0, 4, pages.as_mut_ptr()) as usize, r);
+            assert!(!lazy::is_lazy(r) && lazy::is_lazy(r + PHYS_PAGE));
+            std::ptr::write_volatile((r + 16) as *mut u32, 0xC0FFEE);
+            // decommitted with the pages still mapped, committed again, used for something else
+            assert_eq!(super::super::VirtualFree(r as *mut c_void, 2 * PHYS_PAGE, mem::MEM_DECOMMIT), 1);
+            assert!(!physical_page_at(r) && !physical_page_at(r + PHYS_PAGE) && !lazy::is_lazy(r + PHYS_PAGE));
+            assert_eq!(super::super::VirtualAlloc(r as *const c_void, 2 * PHYS_PAGE, mem::MEM_COMMIT, mem::PAGE_READWRITE) as usize, r);
+            std::ptr::write_bytes(r as *mut u8, 0x5A, 2 * PHYS_PAGE);
+            // the page kept what was written through its copy, and a write to the pages by their
+            // numbers goes to the pages
+            let mut buf = [0u8; 4];
+            assert!(read_physical_pages(&pages[..1], 16, &mut buf));
+            assert_eq!(u32::from_le_bytes(buf), 0xC0FFEE);
+            assert!(write_physical_pages(&pages, 0x100, &[0xB7; PHYS_PAGE]));
+            assert!(std::slice::from_raw_parts(r as *const u8, 2 * PHYS_PAGE).iter().all(|&b| b == 0x5A), "the memory there now is not the pages'");
+            // the pages' first views show the pages, not that memory
+            let pool = reserve(2 * PHYS_PAGE).unwrap();
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 2, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            assert_eq!(std::ptr::read_volatile((pool + 16) as *const u32), 0xC0FFEE);
+            assert_eq!(std::ptr::read_volatile((pool + 0x100) as *const u8), 0xB7);
+            assert_eq!(std::ptr::read_volatile((pool + PHYS_PAGE + 0xFF) as *const u8), 0xB7);
+            assert_eq!(std::ptr::read_volatile((pool + PHYS_PAGE + 0x100) as *const u8), 0, "page 1 past the write");
+            // released with a page mapped in it: the page is left at its view only
+            let mut one = [pages[0]];
+            assert_eq!(MapTitlePhysicalPages((r + 2 * PHYS_PAGE) as *mut c_void, 1, 0, 4, one.as_mut_ptr()) as usize, r + 2 * PHYS_PAGE);
+            assert_eq!(std::ptr::read_volatile((r + 2 * PHYS_PAGE + 16) as *const u32), 0xC0FFEE);
+            assert_eq!(super::super::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE), 1);
+            assert_eq!(PHYS.lock().unwrap().places(pages[0]), [pool]);
+            validate_physical().unwrap();
+            assert_eq!(free_in_reservation(pool, 0, mem::MEM_RELEASE), Some(1));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+        }
+    }
+
+    /// An unmap Windows refuses leaves the view up: the title's call fails and the model still
+    /// says the address shows the page.
+    #[test]
+    fn an_unmap_windows_refuses_fails_and_the_page_stays_mapped() {
+        unsafe {
+            let mut n = 1usize;
+            let mut pages = [0usize; 1];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let pool = reserve(2 * PHYS_PAGE).unwrap();
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            // (the view taken away behind the model, so that Windows refuses the unmap)
+            assert!(unmap_into_placeholder(pool));
+            assert!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, std::ptr::null_mut()).is_null(), "the unmap fails");
+            assert_eq!(PHYS.lock().unwrap().places(pages[0]), [pool], "still counted among the page's addresses");
+            assert!(alias_facts(pool).unwrap().history_here[0].contains("UNMAP REFUSED BY WINDOWS"));
+            // (put back: now it goes)
+            let (section, offset) = PHYS.lock().unwrap().block_of(pages[0]).map(|(b, off)| (b.section, off)).unwrap();
+            assert!(map_into(section, offset, pool));
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, std::ptr::null_mut()) as usize, pool);
+            assert!(PHYS.lock().unwrap().places(pages[0]).is_empty());
+            assert_eq!(free_in_reservation(pool, 0, mem::MEM_RELEASE), Some(1));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            validate_physical().unwrap();
+        }
+    }
+
+    /// Pages freed while still mapped in the unified memory they were given are unmapped from it:
+    /// that memory goes back to be handed out again.
+    #[test]
+    fn pages_freed_are_unmapped_from_their_unified_memory() {
+        unsafe {
+            if crate::gpu::uma::get().is_none() {
+                return;
+            }
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let p = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert!(p != 0);
+            std::ptr::write_volatile(p as *mut u32, 5);
+            assert_eq!(PHYS.lock().unwrap().places(pages[0]), [p]);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            let g = PHYS.lock().unwrap();
+            assert!(g.places(pages[0]).is_empty() && g.places(pages[1]).is_empty());
+        }
+    }
+
+    /// A crash record's account of an address: the page it shows, every other address showing it,
+    /// what was written through those, whether a payload is still there, and the page's maps.
+    #[test]
+    fn a_crash_record_names_the_other_addresses_of_a_page_and_what_was_written_through_them() {
+        unsafe {
+            // (the addresses used here were other memory before, another test's a moment ago, with
+            // a history of its own, which a crash record keeps: what is counted is what this
+            // thread did since)
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            let t0 = crate::log::uptime();
+            let mine = format!("thread {})", GetCurrentThreadId());
+            let since = |h: &[String]| h.iter().filter(|e| e.ends_with(&mine) && e.split(' ').next().and_then(|t| t.parse::<f64>().ok()).is_some_and(|t| t > t0 - 0.001)).count();
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let pool = reserve(4 * PHYS_PAGE).unwrap();
+            let fill = reserve(4 * PHYS_PAGE).unwrap();
+            assert_eq!(MapTitlePhysicalPages(pool as *mut c_void, 1, 0, 4, pages.as_mut_ptr()) as usize, pool);
+            let at = [(fill + PHYS_PAGE) as *mut c_void];
+            let mut one = [pages[0] as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 1, one.as_mut_ptr()), 1);
+            assert_eq!(backing(fill + PHYS_PAGE + 0x123), Some(crate::alias::Backing { page: pages[0], kind: "view" }));
+            assert_eq!(backing(fill).map(|b| b.page), Some(0), "a slot of the reservation that shows no page");
+            assert_eq!(backing(&n as *const usize as usize), None, "plain memory");
+            // a record written where the page was mapped to be filled
+            let record = [0x5Au8; 0xC00];
+            let dst = fill + PHYS_PAGE + 0xE000;
+            std::ptr::copy_nonoverlapping(record.as_ptr(), dst as *mut u8, record.len());
+            crate::alias::payload_written(dst, &record);
+            let f = alias_facts(pool + 0xE010).unwrap();
+            assert!(f.what.contains(&format!("physical page {:#x} is mapped here as a view", pages[0])) && f.what.contains("page 0 of an allocation of 2") && f.what.contains("its data is in its section"), "{}", f.what);
+            assert_eq!(f.backing.map(|b| b.page), Some(pages[0]));
+            let home = PHYS.lock().unwrap().home(pages[0]).unwrap();
+            let mut aliases: Vec<usize> = f.aliases.iter().map(|a| a.0).collect();
+            aliases.sort_unstable();
+            let mut expected = vec![home, fill + PHYS_PAGE];
+            expected.sort_unstable();
+            assert_eq!(aliases, expected, "XCL's view of the section and the address it was filled at");
+            assert!(since(&f.history_here) == 1 && f.history_here[0].contains("map view of") && f.history_here[0].contains("MapTitlePhysicalPages"), "{:?}", f.history_here);
+            assert!(since(&f.history_page) == 1 && f.history_page[0].contains("XMemMapPhysicalPagesScatter") && f.history_page[0].contains(&format!("at {:#x}", fill + PHYS_PAGE)), "{:?}", f.history_page);
+            // other bytes written into the same page by its number: no write to either address
+            assert!(write_physical_pages(&pages[..1], 0xE000, &[0xB7; 0xC00]));
+            let r = crate::alias::report(pool + 0xE010).unwrap();
+            assert!(r.contains(&format!("payload written through {:#x}", dst + 0x10)) && r.contains("NO LONGER HOLDS it, and no later payload was written to that address"), "{r}");
+            assert!(r.contains(&format!("payload written through {:#x}", home + 0xE010)) && r.contains("STILL HOLDS it") && r.contains("a physical destination"), "{r}");
+            assert!(r.contains("the same memory at 2 other address(es)"), "{r}");
+            // a second record, left alone
+            let other = fill + PHYS_PAGE + 0x2000;
+            std::ptr::copy_nonoverlapping(record.as_ptr(), other as *mut u8, record.len());
+            crate::alias::payload_written(other, &record);
+            // a third, found from the pool slot later by the page it was written to
+            let third = fill + PHYS_PAGE + 0x5000;
+            std::ptr::copy_nonoverlapping(record.as_ptr(), third as *mut u8, record.len());
+            crate::alias::payload_written(third, &record);
+            // the fill address shows another page now: its payload is told apart by the page
+            one[0] = pages[1] as u64;
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 1, one.as_mut_ptr()), 1);
+            let r = crate::alias::report(dst + 0x20).unwrap();
+            assert!(r.contains(&format!("showing physical page {:#x} (view) then, physical page {:#x} (view) NOW", pages[0], pages[1])), "{r}");
+            assert!(r.contains(&format!("physical page {:#x} itself no longer holds it either (at {:#x})", pages[0], home + 0xE000)), "the page it showed then was written by its number: {r}");
+            let r = crate::alias::report(other + 0x20).unwrap();
+            assert!(r.contains("NO LONGER HOLDS it") && r.contains(&format!("physical page {:#x} itself STILL HOLDS it (at {:#x})", pages[0], home + 0x2000)), "only the address moved: {r}");
+            let r = crate::alias::report(pool + 0x5010).unwrap();
+            assert!(r.contains(&format!("payload written to physical page {:#x} through {third:#x}, an address that shows the page no longer", pages[0])) && r.contains("the page STILL HOLDS it"), "written where the page is no longer mapped: {r}");
+            let f = alias_facts(dst).unwrap();
+            assert_eq!(since(&f.history_here), 3, "{:?}", f.history_here);
+            assert!(f.history_here[0].contains(&format!("map view of page {:#x}", pages[1])) && f.history_here[1].contains(&format!("unmap view of page {:#x}", pages[0])), "{:?}", f.history_here);
+            // unmapped and freed: the slot and the history remain
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 1, std::ptr::null_mut()), 1);
+            let f = alias_facts(dst).unwrap();
+            assert!(f.what.starts_with("no physical page is mapped here") && f.what.contains("a placeholder now") && f.backing.map(|b| b.page) == Some(0), "{}", f.what);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages.as_mut_ptr()), 1);
+            let f = alias_facts(pool).unwrap();
+            assert!(f.what.contains("THIS PAGE WAS FREED") && f.history_page.iter().any(|e| e.contains("freed:")), "{} {:?}", f.what, f.history_page);
+            assert_eq!(free_in_reservation(fill, 0, mem::MEM_RELEASE), Some(1));
+            assert_eq!(free_in_reservation(pool, 0, mem::MEM_RELEASE), Some(1));
+            assert!(alias_facts(pool).unwrap().history_here.iter().any(|e| e.contains("the title releases its reservation") && e.contains("VirtualFree")));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 1, pages[1..].as_mut_ptr()), 1);
+            validate_physical().unwrap();
         }
     }
 }

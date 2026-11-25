@@ -213,6 +213,22 @@ pub mod mirrors {
         s.gpu.retain(|_, &mut (_, c)| c != base);
     }
 
+    /// (diagnostics) The address at the same offset in the other reservation of a CPU view / GPU
+    /// view pair holding `va`, and what that reservation is. Not waited for at a crash.
+    pub fn counterparts(va: usize) -> Vec<(usize, &'static str)> {
+        let Some(s) = crate::alias::try_lock(&STATE) else { return Vec::new() };
+        let mut out = Vec::new();
+        for (&gpu, &(size, cpu)) in s.gpu.iter() {
+            if va >= gpu && va - gpu < size {
+                out.push((cpu + (va - gpu), "this address is in a GPU-view reservation; the same offset in the CPU view it mirrors,"));
+            }
+            if va >= cpu && va - cpu < size {
+                out.push((gpu + (va - cpu), "the same offset in the GPU-view reservation of this CPU view,"));
+            }
+        }
+        out
+    }
+
     /// The CPU-view address behind `va` when `va` lies in a GPU view.
     pub fn source(va: usize) -> Option<usize> {
         let s = STATE.lock().unwrap();
@@ -352,8 +368,10 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
     let q = watched.unwrap_or_else(|| mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p)));
     if !q.is_null() {
         let flags = sanitize_alloc_type(t);
-        if flags & mem::MEM_RESERVE != 0 {
-            crate::memmap::reserved(q as usize, size);
+        // (no address chosen: a new allocation whatever the flags – a commit alone reserves too.
+        // Recorded as a reservation so its release takes what was committed in it along.)
+        if addr.is_null() || flags & mem::MEM_RESERVE != 0 {
+            crate::memmap::reserved(q as usize, if addr.is_null() { size } else { (addr as usize + size).saturating_sub(q as usize) });
         }
         if flags & mem::MEM_COMMIT != 0 {
             crate::memmap::committed(if addr.is_null() { q as usize } else { addr as usize }, size, sanitize_protect(p));
@@ -477,6 +495,11 @@ fn keep_last_error<R>(f: impl FnOnce() -> R) -> R {
 /// Blocks of the unified memory region go back to it (MEM_RELEASE) or stay (MEM_DECOMMIT
 /// zeroes them); others to Windows.
 pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    // (`XCL_DS_TRIPWIRE`; size 0: to the end of the reservation, as far as XCL knows it)
+    if crate::alias::tripwire_on() {
+        let len = if size != 0 { size } else { crate::memmap::reservation(addr as usize).map_or(crate::alias::PAGE, |(_, end)| end - addr as usize) };
+        crate::alias::mapping_changed(if t & mem::MEM_RELEASE != 0 { "the title releases memory" } else { "the title decommits memory" }, "VirtualFree", addr as usize, len);
+    }
     if t & mem::MEM_RELEASE != 0 {
         mirrors::released(addr as usize);
     }
@@ -514,6 +537,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
             }
         };
         if n > 0 {
+            physical::title_freed(a, n, "VirtualFree");
             // sparse first: under its lock, so no copy of CPU writes to video memory reads the
             // pages while they go (the submit thread's copy faulted on them)
             crate::hle::d3d12x::sparse::decommitted(a, n);
@@ -528,12 +552,22 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     }
     if let Some(u) = crate::gpu::uma::get().filter(|u| u.contains(addr as usize)) {
         if t & 0x8000 != 0 {
+            physical::title_freed(addr as usize, u.block_size(addr as usize).unwrap_or(0), "VirtualFree");
             return u.free(addr as usize) as BOOL;
         }
         if t & 0x4000 != 0 && size > 0 {
+            physical::title_freed(addr as usize, size, "VirtualFree");
             std::ptr::write_bytes(addr as *mut u8, 0, size);
+            crate::eh::note_guest_write("unified memory zeroed (decommit)", addr as usize, size);
         }
         return 1;
+    }
+    // (a call Windows takes: a release names the whole reservation, a decommit a range or – size
+    // 0 – the reservation from its start; the size of a reservation is what XCL recorded of it)
+    let (release, decommit) = (t & mem::MEM_RELEASE != 0, t & mem::MEM_DECOMMIT != 0);
+    if release != decommit && !(release && size != 0) {
+        let len = if size != 0 { size } else { crate::memmap::reservation(addr as usize).filter(|&(start, _)| start == addr as usize).map_or(0, |(start, end)| end - start) };
+        physical::title_freed(addr as usize, len, "VirtualFree");
     }
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
@@ -554,14 +588,9 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
 }
 
 pub unsafe extern "system" fn VirtualFreeEx(proc_: HANDLE, addr: *mut c_void, size: usize, t: u32) -> BOOL {
+    // (the title's own memory whatever it is: XCL's records of it go with it)
     if proc_ == thr::GetCurrentProcess() {
-        let a = addr as usize;
-        if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(a) || u.contains(a))
-            || (t & 0x8000 != 0 && in_graphics_reservation(a))
-            || physical::in_reservation(a)
-        {
-            return VirtualFree(addr, size, t);
-        }
+        return VirtualFree(addr, size, t);
     }
     mem::VirtualFreeEx(proc_, addr, size, t)
 }
@@ -687,7 +716,15 @@ pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
     }
     if XAllocAttrs::decode(attrs).memory_type == 0 {
         aligned_heap_free(p);
-    } else if !crate::hle::d3d12x::sparse::free(p as usize) && !crate::gpu::uma::get().is_some_and(|u| u.free(p as usize)) {
+        return;
+    }
+    let a = p as usize;
+    let uma = crate::gpu::uma::get();
+    let len = uma
+        .and_then(|u| u.sparse_reservation(a).filter(|&(start, _)| start == a).map(|(_, len)| len).or_else(|| u.block_size(a)))
+        .or_else(|| crate::memmap::reservation(a).filter(|&(start, _)| start == a).map(|(start, end)| end - start));
+    physical::title_freed(a, len.unwrap_or(0), "XMemFree");
+    if !crate::hle::d3d12x::sparse::free(p as usize) && !crate::gpu::uma::get().is_some_and(|u| u.free(p as usize)) {
         mem::VirtualFree(p, 0, mem::MEM_RELEASE);
         crate::memmap::released(p as usize);
         if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(p as usize)).is_some() {
@@ -2068,6 +2105,39 @@ mod tests {
                 assert_eq!(&buf[..n], &[(a + 0x2_1000) as *mut c_void], "flags {t:#x}: the written page is reported");
                 assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
                 assert!(!in_graphics_reservation(a));
+            }
+        }
+    }
+
+    /// A commit with no address reserves too: released, nothing of it stays in XCL's record of
+    /// title memory (the span left there answered "committed" for the next owner of the address).
+    #[test]
+    fn a_commit_with_no_address_is_forgotten_when_released() {
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x2800, mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert!(!p.is_null());
+            assert_eq!(crate::memmap::access(p as usize, 0x2800), Some(crate::memmap::Access::Write));
+            assert_eq!(crate::memmap::reservation(p as usize), Some((p as usize, p as usize + 0x3000)));
+            assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
+            // (the address reserved again behind XCL, if no other thread took it meanwhile)
+            if mem::VirtualAlloc(p, 0x3000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) == p {
+                assert_eq!(crate::memmap::access(p as usize, 4), None);
+                assert_eq!(crate::memmap::access(p as usize + 0x2800, 4), None);
+                mem::VirtualFree(p, 0, mem::MEM_RELEASE);
+            }
+        }
+    }
+
+    /// The title's own memory freed through VirtualFreeEx is forgotten as through VirtualFree.
+    #[test]
+    fn virtual_free_ex_of_the_title_itself_is_virtual_free() {
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x1_0000, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert_eq!(crate::memmap::access(p as usize, 4), Some(crate::memmap::Access::Write));
+            assert_eq!(VirtualFreeEx(thr::GetCurrentProcess(), p, 0, mem::MEM_RELEASE), 1);
+            if mem::VirtualAlloc(p, 0x1_0000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) == p {
+                assert_eq!(crate::memmap::access(p as usize, 4), None);
+                mem::VirtualFree(p, 0, mem::MEM_RELEASE);
             }
         }
     }

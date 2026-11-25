@@ -5041,14 +5041,21 @@ impl Em {
             let _ = writeln!(h, "{ty} xcl_ss{k} : register(s{k}, space1);");
         }
         let _ = writeln!(h, "#define XCL_LOOP_GUARD {}u", super::loop_guard());
+        h.push_str(PRELUDE_START);
         if self.packed_compute() {
-            h.push_str(&PRELUDE.replace("static uint xcl_tripped = 0u;", "static uint xcl_tripped = 0u;\nstatic uint xcl_valid_lanes;")
+            h.push_str("static uint xcl_valid_lanes;\n");
+        }
+        if !self.opt.guard_trip_counters {
+            h.push_str("void xcl_trip(uint k) {}\n");
+        } else if self.packed_compute() {
+            h.push_str(&PRELUDE_TRIP_COUNTERS
                 .replace("if (((xcl_tripped >> k) & 1u) != 0u) return;", "uint bit = k + select(and(k == 3u, lane_id >= 32u), 16u, 0u);\n    if (((xcl_tripped >> bit) & 1u) != 0u) return;")
                 .replace("xcl_tripped | (1u << k)", "xcl_tripped | (1u << bit)")
                 .replace("at + 4u * k, 1u, o", "at + 4u * k, select(k == 3u, 1u, (uint)(WaveGetLaneIndex() < xcl_valid_lanes) + (uint)(WaveGetLaneIndex() + 32u < xcl_valid_lanes)), o"));
         } else {
-            h.push_str(PRELUDE);
+            h.push_str(PRELUDE_TRIP_COUNTERS);
         }
+        h.push_str(PRELUDE);
         if self.x64() {
             self.x64_prelude(&mut h);
         }
@@ -6623,11 +6630,13 @@ void xcl_s_barrier() {
 }
 "#;
 
-const PRELUDE: &str = r#"
+const PRELUDE_START: &str = r#"
 static uint lane_id;
 // loop iterations a lane may run (`LOOP_GUARD`; the translation's `loop_guard`)
 static uint xcl_budget = XCL_LOOP_GUARD;
-// a guard gave up in this lane (0: the loop budget, 1: a wave64 meet, 2: a barrier, 3: a
+"#;
+
+const PRELUDE_TRIP_COUNTERS: &str = r#"// a guard gave up in this lane (0: the loop budget, 1: a wave64 meet, 2: a barrier, 3: a
 // compare-exchange loop): once per kind, one more in the counter XCL reads back
 // (io[IO_TRIP_AT] = 460: its place in memory window io[IO_TRIP_WINDOW] = 464, whose view is
 // at io[IO_MEM_VIEWS] = 452 + that window)
@@ -6641,7 +6650,9 @@ void xcl_trip(uint k) {
     if (at != 0u) { RWByteAddressBuffer xcl_tb = ResourceDescriptorHeap[io.Load(452u) + io.Load(464u)]; uint o; xcl_tb.InterlockedAdd(at + 4u * k, 1u, o); }
 #endif
 }
-// the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
+"#;
+
+const PRELUDE: &str = r#"// the high half of a 32 x 32-bit product, from 16-bit parts: DXC turns
 // `(uint)(((uint64_t)a * b) >> 32) != 0` (the console's integer division code) into
 // umul.with.overflow, which DXIL does not allow (validation fails)
 uint mul_hi_u32(uint a, uint b) {

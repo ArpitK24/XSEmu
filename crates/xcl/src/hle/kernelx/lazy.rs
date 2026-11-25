@@ -61,6 +61,7 @@ unsafe fn commit(page: usize) -> bool {
     }
     if from != 0 && super::physical::used(from) {
         std::ptr::copy_nonoverlapping(from as *const u8, page as *mut u8, PAGE);
+        crate::eh::note_guest_write("physical page copy filled on first use", page, PAGE);
     }
     g.remove(&page);
     true
@@ -218,6 +219,27 @@ mod tests {
             mark(r + 2 * PAGE, Some(r));
             assert_eq!(std::ptr::read_volatile((r + 2 * PAGE + 8) as *const u32), 0, "a source that is no used physical page: zeros");
             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+
+    /// A first use in memory XCL did not see reserved (it will not see it released either) leaves
+    /// nothing in XCL's record of title memory: a span kept there answered "committed" for
+    /// whatever Windows put at the address next (a fresh reservation read as committed, and a
+    /// page mapped there was copied into memory that was not).
+    #[test]
+    fn a_first_use_in_memory_xcl_did_not_reserve_leaves_no_record() {
+        unsafe {
+            let r = VirtualAlloc(std::ptr::null(), 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
+            mark(r, None);
+            std::ptr::write_volatile(r as *mut u32, 7);
+            assert_eq!(crate::memmap::access(r, 4), None, "asked of Windows");
+            assert!(committed(r) && !committed(r + PAGE));
+            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            // (the address reserved again, if no other thread took it meanwhile)
+            if VirtualAlloc(r as *const c_void, 2 * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize == r {
+                assert!(!committed(r), "reserved, not committed");
+                VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+            }
         }
     }
 

@@ -512,6 +512,7 @@ pub struct Options {
     pub split_wave64: bool,
     pub legacy_compute_wave64: bool,
     pub loop_profile: bool,
+    pub guard_trip_counters: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
     /// pipeline may come first)
     pub static_sampler_base: u32,
@@ -532,7 +533,7 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), loop_profile: false, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
     }
 }
 

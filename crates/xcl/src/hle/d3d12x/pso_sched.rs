@@ -98,10 +98,6 @@ pub struct Room {
     pub urgent_floor: u64,
     /// the process's private memory now (read with `Ask::cap`)
     pub commit: u64,
-    /// `floor` is the line a run is stopped at, not a margin: the expected peaks of the compiles
-    /// running count whole against a background compile, not half (one that has not grown yet
-    /// would otherwise be counted for half of what it will take)
-    pub firm: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,26 +110,34 @@ pub enum Verdict {
     Hold,
 }
 
-/// Whether a driver compile starts now. The memory available, less half the expected peaks of
+pub fn fits_on_machine(peak: u64, floor: u64, physical_total: u64) -> bool {
+    physical_total == 0 || peak <= physical_total.saturating_sub(floor)
+}
+
+/// Whether a driver compile starts now. The memory available, less the full expected peaks of
 /// the compiles running (they may still be growing), must hold its own expected peak and the
-/// floor. A compile a bind waits for needs nothing else. A background one also stays within
+/// floor. Every giant also needs room under the concurrent giant cap. A background one stays within
 /// `most` at once and the private-memory cap, holds back while a waited-for compile waits
 /// for memory, and as a giant starts only as the second at once, or the third
 /// (`GIANTS_AT_ONCE`) while the memory would still hold one more giant after it – counting the
 /// giants binds wait for, so those never add to a full set of background ones.
 pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
     let cost = peak(ask.dxil_len);
-    let spare = room.available.saturating_sub(load.reserved / 2);
+    let spare = room.available.saturating_sub(load.reserved);
     if ask.wanted {
-        return if spare >= cost + room.urgent_floor { Verdict::Urgent } else { Verdict::Hold };
+        return if (ask.dxil_len < GIANT_DXIL || load.giants < GIANTS_AT_ONCE) && spare >= cost + room.urgent_floor {
+            Verdict::Urgent
+        } else {
+            Verdict::Hold
+        };
     }
-    let spare = if room.firm { room.available.saturating_sub(load.reserved) } else { spare };
-    let giants = if spare >= room.floor + cost + peak(GIANT_DXIL.max(ask.dxil_len)) { GIANTS_AT_ONCE } else { GIANTS_AT_ONCE - 1 };
+    let floor = room.floor.max(room.urgent_floor);
+    let giants = if spare >= floor + cost + peak(GIANT_DXIL.max(ask.dxil_len)) { GIANTS_AT_ONCE } else { GIANTS_AT_ONCE - 1 };
     let held = load.starving > 0
         || load.running.saturating_sub(load.urgent) >= ask.most
         || (ask.dxil_len >= GIANT_DXIL && load.giants >= giants)
-        || spare < room.floor + cost
-        || ask.cap.is_some_and(|c| room.commit + load.reserved / 2 + cost > c);
+        || spare < floor + cost
+        || ask.cap.is_some_and(|c| room.commit + load.reserved + cost > c);
     if held {
         Verdict::Hold
     } else {
@@ -146,6 +150,7 @@ pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
 pub enum Lane {
     /// its big driver compile did not fit the memory when a worker came to it (`Backlog::park`)
     Parked,
+    ParkedPeer,
     /// console shaders of `HEAVY_SHADER_BYTES` or more: its driver compile is likely a big one
     Heavy,
     /// shaders an earlier run used
@@ -164,12 +169,17 @@ pub const HEAVY_SHADER_BYTES: usize = 16 << 10;
 /// Root signatures of the pipelines bound last that `Backlog::pop` looks at.
 pub const RECENT_GROUPS: usize = 8;
 
+struct Parked<T> {
+    group: u64,
+    id: u64,
+    first_use: Option<usize>,
+    item: T,
+}
+
 /// The pipelines made for later, in the order background workers take them – by how soon a
 /// bind is likely to ask for them, not by when they were made:
-/// 1. a parked one whose compile fits now – first those a bind asked for and went without
-///    (they fit as the compiles binds wait for do), then the others; of each first those of a
-///    group bound lately (2.), then the biggest (what is biggest fits least often, and the
-///    game's own memory only grows);
+/// 1. parked pipelines which fit now, preferring peers of an active bind, then
+///    groups bound lately (2.), then by previous first use, or biggest first without history;
 /// 2. those of a group (the title's root signature: a pass's pipelines share one) bound
 ///    lately, the last bound group first, the newest of it first;
 /// 3. the heavy ones, the biggest first, on a share of the workers so the rest keep going
@@ -179,10 +189,8 @@ pub const RECENT_GROUPS: usize = 8;
 ///    pipeline when what draws with it comes in, and of the tens of thousands it makes while
 ///    it loads the first ones are no likelier than the last.
 pub struct Backlog<T> {
-    /// (DXIL bytes, (group, pipeline)) a bind asked for, parked for memory, smallest first
-    asked: Vec<(usize, (u64, u64, T))>,
-    /// (DXIL bytes, (group, pipeline)), smallest first
-    parked: Vec<(usize, (u64, u64, T))>,
+    /// By DXIL size, smallest first
+    parked: Vec<(usize, Parked<T>)>,
     /// the pipelines waiting for a worker, by the number each got when it was made; a number
     /// in the lists below that is no longer here was taken through another list
     waiting: HashMap<u64, (T, Lane)>,
@@ -200,12 +208,12 @@ pub struct Backlog<T> {
     heavy_waiting: usize,
     /// workers building a heavy one now
     heavy_out: usize,
+    peer_out: usize,
 }
 
 impl<T> Default for Backlog<T> {
     fn default() -> Self {
         Backlog {
-            asked: Vec::new(),
             parked: Vec::new(),
             waiting: HashMap::new(),
             heavy: Vec::new(),
@@ -217,6 +225,7 @@ impl<T> Default for Backlog<T> {
             next: 1,
             heavy_waiting: 0,
             heavy_out: 0,
+            peer_out: 0,
         }
     }
 }
@@ -276,9 +285,9 @@ impl<T> Backlog<T> {
     }
 
     /// A pipeline of `group` whose driver compile of `dxil_len` bytes did not fit: it waits for
-    /// memory. `asked`: a bind asked for it and went without.
-    pub fn park(&mut self, dxil_len: usize, asked: bool, group: u64, n: u64, item: T) {
-        insert_by_size(if asked { &mut self.asked } else { &mut self.parked }, dxil_len, (group, n, item));
+    /// memory. A bind that needs it schedules an urgent build instead.
+    pub fn park(&mut self, dxil_len: usize, group: u64, id: u64, first_use: Option<usize>, item: T) {
+        insert_by_size(&mut self.parked, dxil_len, Parked { group, id, first_use, item });
     }
 
     fn take(&mut self, n: u64) -> Option<(T, Lane)> {
@@ -293,33 +302,44 @@ impl<T> Backlog<T> {
     /// The next pipeline for one of `workers` background workers, and the lane it came from
     /// (`done` is told when it is built). `recent`: the groups of the pipelines bound last, the
     /// last one first; `live`: it still wants building (parked ones that do not are dropped);
-    /// `fits`: a driver compile of so many bytes of DXIL would start now, as one a bind asked
-    /// for (true) or as a background one.
-    pub fn pop(&mut self, workers: usize, recent: &[u64], live: impl Fn(&T) -> bool, fits: impl Fn(usize, bool) -> bool) -> Option<(T, Lane)> {
+    /// `fits`: a worker can start a parked compile of this DXIL size under the ordinary floor.
+    pub fn pop(&mut self, workers: usize, recent: &[u64], live: impl Fn(&T) -> bool, fits: impl Fn(usize) -> bool, peer_fits: impl Fn(usize) -> bool) -> Option<(T, Lane)> {
         let recent = &recent[..recent.len().min(RECENT_GROUPS)];
-        for asked in [true, false] {
-            let list = if asked { &mut self.asked } else { &mut self.parked };
-            list.retain(|(_, (_, _, p))| live(p));
-            if !asked {
-                let promoted = self.promoted.iter().enumerate().rev().find_map(|(pos, &id)| {
-                    if self.waiting.contains_key(&id) {
-                        Some((pos, id, None))
-                    } else {
-                        list.iter().position(|(len, (_, n, _))| *n == id && fits(*len, false)).map(|at| (pos, id, Some(at)))
-                    }
-                });
-                if let Some((pos, id, parked)) = promoted {
-                    self.promoted.remove(pos);
-                    if let Some(at) = parked {
-                        return Some((list.remove(at).1 .2, Lane::Parked));
-                    }
-                    return self.take(id);
-                }
+        let list = &mut self.parked;
+        list.retain(|(_, p)| live(&p.item));
+        if self.peer_out < GIANTS_AT_ONCE - 1 {
+            let peer = recent.iter().filter(|g| **g != 0).find_map(|g| {
+                list.iter().enumerate().filter(|(_, (len, p))| p.group == *g && peer_fits(*len))
+                    .min_by_key(|(_, (_, p))| (p.first_use.unwrap_or(usize::MAX), std::cmp::Reverse(p.id))).map(|(at, _)| at)
+            });
+            if let Some(at) = peer {
+                let (_, Parked { id, item, .. }) = list.remove(at);
+                self.promoted.retain(|&n| n != id);
+                self.peer_out += 1;
+                return Some((item, Lane::ParkedPeer));
             }
-            let lately = recent.iter().filter(|g| **g != 0).find_map(|g| list.iter().rposition(|(len, (group, _, _))| group == g && fits(*len, asked)));
-            if let Some(at) = lately.or_else(|| list.iter().rposition(|(len, _)| fits(*len, asked))) {
-                return Some((list.remove(at).1 .2, Lane::Parked));
+        }
+        let promoted = self.promoted.iter().enumerate().rev().find_map(|(pos, &id)| {
+            if self.waiting.contains_key(&id) {
+                Some((pos, id, None))
+            } else {
+                list.iter().position(|(len, p)| p.id == id && fits(*len)).map(|at| (pos, id, Some(at)))
             }
+        });
+        if let Some((pos, id, parked)) = promoted {
+            self.promoted.remove(pos);
+            if let Some(at) = parked {
+                return Some((list.remove(at).1.item, Lane::Parked));
+            }
+            return self.take(id);
+        }
+        let pick = |group: Option<u64>| {
+            list.iter().enumerate().rev().filter(|(_, (len, p))| group.is_none_or(|g| g == p.group) && fits(*len))
+                .min_by_key(|(_, (_, p))| p.first_use.unwrap_or(usize::MAX))
+                .map(|(at, _)| at)
+        };
+        if let Some(at) = recent.iter().copied().filter(|&g| g != 0).find_map(|g| pick(Some(g))).or_else(|| pick(None)) {
+            return Some((list.remove(at).1.item, Lane::Parked));
         }
         for group in recent {
             let Some(list) = self.groups.get_mut(group) else { continue };
@@ -350,23 +370,29 @@ impl<T> Backlog<T> {
 
     /// A worker is done with what it took from `lane`.
     pub fn done(&mut self, lane: Lane) {
-        if lane == Lane::Heavy {
-            self.heavy_out = self.heavy_out.saturating_sub(1);
+        match lane {
+            Lane::Heavy => self.heavy_out = self.heavy_out.saturating_sub(1),
+            Lane::ParkedPeer => self.peer_out -= 1,
+            _ => {}
         }
     }
 
     /// (pipelines waiting for a worker, of them parked for memory)
     pub fn waiting(&self) -> (usize, usize) {
-        (self.asked.len() + self.parked.len() + self.waiting.len(), self.asked.len() + self.parked.len())
+        (self.parked.len() + self.waiting.len(), self.parked.len())
     }
 
     pub fn has_parked(&self) -> bool {
-        !self.parked.is_empty() || !self.asked.is_empty()
+        !self.parked.is_empty()
+    }
+
+    pub fn parked_peers(&self, recent: &[u64]) -> usize {
+        self.parked.iter().filter(|(_, p)| p.group != 0 && recent.contains(&p.group)).count()
     }
 
     /// The smallest driver compile parked, in bytes of DXIL (0: none).
     pub fn least_parked(&self) -> usize {
-        self.asked.first().into_iter().chain(self.parked.first()).map(|(len, _)| (*len).max(1)).min().unwrap_or(0)
+        self.parked.first().map_or(0, |(len, _)| (*len).max(1))
     }
 }
 
@@ -450,6 +476,66 @@ pub const CALM_HEADROOM: u64 = 3 << 29;
 pub struct TitleMemory {
     pub backed: u64,
     pub commit: u64,
+}
+
+const STEADY_WINDOW_MS: u64 = 30_000;
+const STEADY_GROWTH: u64 = 64 << 20;
+
+/// A title can leave part of its budget unused. Use two 30-second medians so brief driver
+/// compiles do not look like sustained title growth; backings and storage are sampled directly.
+#[derive(Default)]
+pub struct TitleReserve {
+    samples: VecDeque<(u64, u64)>,
+    backed: u64,
+    projected: u64,
+    steady: bool,
+}
+
+impl TitleReserve {
+    pub const fn empty() -> Self {
+        Self { samples: VecDeque::new(), backed: 0, projected: 0, steady: false }
+    }
+
+    pub fn note(&mut self, now: u64, memory: TitleMemory, budget: u64, loading: bool) {
+        self.projected = memory.host_reserve(budget);
+        if loading || memory.backed.abs_diff(self.backed) >= STEADY_GROWTH {
+            self.samples.clear();
+            self.backed = memory.backed;
+        }
+        self.samples.push_back((now, memory.commit));
+        let window = 2 * STEADY_WINDOW_MS;
+        while self.samples.len() > 1 && now - self.samples[1].0 >= window {
+            self.samples.pop_front();
+        }
+        self.steady = false;
+        if now - self.samples[0].0 < window {
+            return;
+        }
+        let split = self.samples.partition_point(|&(at, _)| now - at >= STEADY_WINDOW_MS);
+        if split < 3 || self.samples.len() - split < 3 {
+            return;
+        }
+        let median = |lo, hi| {
+            let mut bytes: Vec<_> = self.samples.range(lo..hi).map(|&(_, bytes)| bytes).collect();
+            let mid = bytes.len() / 2;
+            *bytes.select_nth_unstable(mid).1
+        };
+        let before = median(0, split);
+        let recent = median(split, self.samples.len());
+        self.steady = recent.saturating_sub(before) < STEADY_GROWTH;
+        if self.steady {
+            self.steady = self.samples.iter().rev().take_while(|&&(at, _)| now - at <= 2_000)
+                .any(|&(_, bytes)| bytes.saturating_sub(recent) <= 512 << 20);
+        }
+    }
+
+    pub fn effective(&self) -> u64 {
+        if self.steady { 0 } else { self.projected }
+    }
+
+    pub fn is_steady(&self) -> bool {
+        self.steady
+    }
 }
 
 impl TitleMemory {
@@ -563,8 +649,37 @@ mod tests {
 
     const GB: u64 = 1 << 30;
 
+    #[test]
+    fn only_total_physical_capacity_can_make_a_runtime_compile_impossible() {
+        let cost = peak(3_515_708);
+        assert!(fits_on_machine(cost, GB, 32 * GB));
+        assert!(fits_on_machine(cost, GB, cost + GB));
+        assert!(!fits_on_machine(cost, GB, cost + GB - 1));
+        assert!(fits_on_machine(cost, GB, 0), "unknown total capacity is not a refusal");
+    }
+
     fn room(available: u64) -> Room {
-        Room { available, floor: GB, urgent_floor: GB, commit: 0, firm: false }
+        Room { available, floor: GB, urgent_floor: GB, commit: 0 }
+    }
+
+    #[test]
+    fn no_compile_starts_at_the_275_second_emergency_floor() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 2, urgent: 2, starving: 1, reserved: 2 * peak(512 << 10), ..Load::default() };
+        for floor in [10_463 * MIB, 2_856 * MIB, GB] {
+            let room = Room { available: 1_024 * MIB, floor, ..room(0) };
+            assert_eq!(admit(&ask(121_004, false), &load, &room), Verdict::Hold);
+            assert_eq!(admit(&ask(148_428, true), &load, &room), Verdict::Hold);
+        }
+    }
+
+    #[test]
+    fn urgent_admission_requires_all_in_flight_reservations_to_fit() {
+        let len = 148_428;
+        let load = Load { running: 2, urgent: 2, reserved: 2 * peak(512 << 10), ..Load::default() };
+        let needed = GB + load.reserved + peak(len);
+        assert_eq!(admit(&ask(len, true), &load, &room(needed - 1)), Verdict::Hold);
+        assert_eq!(admit(&ask(len, true), &load, &room(needed)), Verdict::Urgent);
     }
 
     fn ask(dxil_len: usize, wanted: bool) -> Ask {
@@ -608,14 +723,14 @@ mod tests {
         assert_eq!(admit(&ask(len, true), &Load::default(), &room(cost + GB - 1)), Verdict::Hold);
     }
 
-    /// Half the expected peaks of the compiles running count against the memory available.
+    /// All the expected peaks of the compiles running count against the memory available.
     #[test]
     fn running_compiles_count_against_the_memory() {
         let len = 512 << 10;
         let cost = peak(len);
         let load = Load { running: 2, reserved: 2 * cost, ..Load::default() };
-        assert_eq!(admit(&ask(len, false), &load, &room(2 * cost + GB)), Verdict::Background);
-        assert_eq!(admit(&ask(len, false), &load, &room(2 * cost + GB - 1)), Verdict::Hold);
+        assert_eq!(admit(&ask(len, false), &load, &room(3 * cost + GB)), Verdict::Background);
+        assert_eq!(admit(&ask(len, false), &load, &room(3 * cost + GB - 1)), Verdict::Hold);
     }
 
     /// The floor of a background compile is its own: a run keeps the 1 GB its watchdog stops
@@ -624,24 +739,17 @@ mod tests {
     fn a_background_compile_keeps_its_own_floor() {
         let len = 512 << 10;
         let cost = peak(len);
-        let warm = Room { available: cost + 2 * GB, floor: 6 * GB, urgent_floor: GB, commit: 0, firm: false };
+        let warm = Room { available: cost + 2 * GB, floor: 6 * GB, urgent_floor: GB, commit: 0 };
         assert_eq!(admit(&ask(len, false), &Load::default(), &warm), Verdict::Hold);
         assert_eq!(admit(&ask(len, true), &Load::default(), &warm), Verdict::Urgent);
         assert_eq!(admit(&ask(len, false), &Load::default(), &Room { floor: GB, ..warm }), Verdict::Background);
     }
 
-    /// Against a firm floor the peaks of the compiles running count whole for a background
-    /// compile: three of them admitted at once on half counts would together pass the floor.
     #[test]
-    fn a_firm_floor_counts_running_peaks_whole() {
-        let len = 900 << 10;
-        let cost = peak(len);
-        let one = Load { running: 1, reserved: cost, ..Load::default() };
-        let firm = |available| Room { firm: true, ..room(available) };
-        assert_eq!(admit(&ask(len, false), &one, &room(cost + cost / 2 + GB)), Verdict::Background);
-        assert_eq!(admit(&ask(len, false), &one, &firm(cost + cost / 2 + GB)), Verdict::Hold);
-        assert_eq!(admit(&ask(len, false), &one, &firm(2 * cost + GB)), Verdict::Background);
-        assert_eq!(admit(&ask(len, true), &one, &firm(cost + cost / 2 + GB)), Verdict::Urgent, "a bind's compile counts them half, as before");
+    fn background_floor_cannot_drop_below_the_emergency_floor() {
+        let below = Room { floor: 0, ..room(GB) };
+        assert_eq!(admit(&ask(121_004, false), &Load::default(), &below), Verdict::Hold);
+        assert_eq!(admit(&ask(121_004, true), &Load::default(), &room(0)), Verdict::Hold, "no RAM sample");
     }
 
     /// Two giants at once, a third only while the memory would hold one more after it; the
@@ -654,14 +762,16 @@ mod tests {
         let two = Load { running: 2, giants: 2, reserved: 2 * cost, ..Load::default() };
         assert_eq!(admit(&ask(giant, false), &Load { running: 1, giants: 1, reserved: cost, ..Load::default() }, &plenty), Verdict::Background);
         assert_eq!(admit(&ask(giant, false), &two, &plenty), Verdict::Background, "the third, with memory for a fourth");
-        assert_eq!(admit(&ask(giant, false), &two, &room(3 * cost + GB)), Verdict::Background);
-        assert_eq!(admit(&ask(giant, false), &two, &room(3 * cost + GB - 1)), Verdict::Hold, "no third without memory for one more after it");
+        assert_eq!(admit(&ask(giant, false), &two, &room(4 * cost + GB)), Verdict::Background);
+        assert_eq!(admit(&ask(giant, false), &two, &room(4 * cost + GB - 1)), Verdict::Hold, "no third without memory for one more after it");
         let three = Load { running: 3, giants: 3, reserved: 3 * cost, ..Load::default() };
         assert_eq!(admit(&ask(giant, false), &three, &plenty), Verdict::Hold);
         assert_eq!(admit(&ask(512 << 10, false), &three, &plenty), Verdict::Background, "the cap is on giants only");
         let waited = Load { running: 3, giants: 3, urgent: 1, reserved: 3 * cost, ..Load::default() };
         assert_eq!(admit(&ask(giant, false), &waited, &plenty), Verdict::Hold, "a giant a bind waits for takes a place of the three");
-        assert_eq!(admit(&ask(giant, true), &three, &plenty), Verdict::Urgent, "a bind's giant is not held by the count");
+        assert_eq!(admit(&ask(giant, true), &three, &plenty), Verdict::Hold, "a bind cannot start a fourth giant");
+        assert_eq!(admit(&ask(giant, true), &two, &plenty), Verdict::Urgent, "a bind can start when a giant slot frees");
+        assert_eq!(admit(&ask(512 << 10, true), &three, &plenty), Verdict::Urgent, "the cap does not hold a smaller bind");
     }
 
     /// Background compiles hold back while a compile a bind waits for waits for memory, and stay
@@ -683,7 +793,7 @@ mod tests {
 
     fn drain(b: &mut Backlog<&'static str>, workers: usize) -> Vec<&'static str> {
         std::iter::from_fn(|| {
-            let (p, lane) = b.pop(workers, &[], |_| true, |_, _| true)?;
+            let (p, lane) = b.pop(workers, &[], |_| true, |_| true, |_| false)?;
             b.done(lane);
             Some(p)
         })
@@ -721,7 +831,7 @@ mod tests {
         b.push(100, false, true, 0, "c2");
         let workers = 8;
         assert_eq!(heavy_share(workers), 2);
-        let take = |b: &mut Backlog<&'static str>| b.pop(workers, &[], |_| true, |_, _| true).unwrap();
+        let take = |b: &mut Backlog<&'static str>| b.pop(workers, &[], |_| true, |_| true, |_| false).unwrap();
         assert_eq!(take(&mut b), ("h1", Lane::Heavy));
         assert_eq!(take(&mut b), ("h2", Lane::Heavy));
         assert_eq!(take(&mut b), ("c2", Lane::Compute), "two workers hold heavy ones: the third takes a small one");
@@ -740,19 +850,19 @@ mod tests {
         let mut b = Backlog::default();
         b.push(100, false, true, 0, "c1");
         b.push(100, false, false, 0, "g1");
-        b.park(3 << 20, false, 0, 0, "giant");
-        b.park(300 << 10, false, 0, 0, "mid");
-        b.park(600 << 10, false, 0, 0, "big");
+        b.park(3 << 20, 0, 0, None, "giant");
+        b.park(300 << 10, 0, 0, None, "mid");
+        b.park(600 << 10, 0, 0, None, "big");
         assert_eq!(b.waiting(), (5, 3));
         assert!(b.has_parked());
         assert_eq!(b.least_parked(), 300 << 10);
-        let none_fit = |b: &mut Backlog<&'static str>| b.pop(4, &[], |_| true, |_, _| false).map(|(p, _)| p);
+        let none_fit = |b: &mut Backlog<&'static str>| b.pop(4, &[], |_| true, |_| false, |_| false).map(|(p, _)| p);
         assert_eq!(none_fit(&mut b), Some("c1"), "no memory for the parked ones: the others go on");
-        assert_eq!(b.pop(4, &[], |_| true, |len, _| len < 1 << 20), Some(("big", Lane::Parked)), "the biggest that fits");
-        assert_eq!(b.pop(4, &[], |_| true, |_, _| true), Some(("giant", Lane::Parked)));
-        assert_eq!(b.pop(4, &[], |_| true, |len, _| len < 100 << 10), Some(("g1", Lane::Graphics)));
+        assert_eq!(b.pop(4, &[], |_| true, |len| len < 1 << 20, |_| false), Some(("big", Lane::Parked)), "the biggest that fits");
+        assert_eq!(b.pop(4, &[], |_| true, |_| true, |_| false), Some(("giant", Lane::Parked)));
+        assert_eq!(b.pop(4, &[], |_| true, |len| len < 100 << 10, |_| false), Some(("g1", Lane::Graphics)));
         assert_eq!(none_fit(&mut b), None, "only a parked one left, and no memory for it: the worker waits");
-        assert_eq!(b.pop(4, &[], |_| true, |_, _| true), Some(("mid", Lane::Parked)));
+        assert_eq!(b.pop(4, &[], |_| true, |_| true, |_| false), Some(("mid", Lane::Parked)));
         assert!(!b.has_parked());
         assert_eq!(b.least_parked(), 0);
     }
@@ -762,11 +872,11 @@ mod tests {
     #[test]
     fn a_parked_build_something_else_took_is_dropped() {
         let mut b = Backlog::default();
-        b.park(300 << 10, false, 0, 0, "taken by a bind");
-        b.park(600 << 10, false, 0, 0, "still waiting");
-        assert_eq!(b.pop(4, &[], |p| *p != "taken by a bind", |_, _| false), None);
+        b.park(300 << 10, 0, 0, None, "taken by a bind");
+        b.park(600 << 10, 0, 0, None, "still waiting");
+        assert_eq!(b.pop(4, &[], |p| *p != "taken by a bind", |_| false, |_| false), None);
         assert_eq!(b.waiting(), (1, 1));
-        assert_eq!(b.pop(4, &[], |_| true, |_, _| true), Some(("still waiting", Lane::Parked)));
+        assert_eq!(b.pop(4, &[], |_| true, |_| true, |_| false), Some(("still waiting", Lane::Parked)));
     }
 
     #[test]
@@ -794,24 +904,6 @@ mod tests {
         assert_eq!(gone, [1, 2, 5], "and the oldest beyond the two newest");
         assert!(idle_to_release(&mut built, 30_500, 30_000, 5).is_empty());
         assert_eq!(idle_to_release(&mut built, 35_000, 30_000, 0).len(), 5);
-    }
-
-    #[test]
-    fn a_parked_build_a_bind_asked_for_goes_first_and_fits_as_its_own_kind() {
-        let mut b = Backlog::default();
-        b.park(3 << 20, false, 0, 0, "giant made ahead");
-        b.park(600 << 10, true, 0, 0, "asked");
-        b.park(2 << 20, true, 0, 0, "asked giant");
-        b.push(100, false, false, 0, "g1");
-        assert_eq!(b.waiting(), (4, 3));
-        assert_eq!(b.least_parked(), 600 << 10);
-        // background compiles have no room: only what a bind asked for comes back, the biggest first
-        assert_eq!(b.pop(4, &[], |_| true, |_, asked| asked), Some(("asked giant", Lane::Parked)));
-        assert_eq!(b.pop(4, &[], |_| true, |len, asked| asked && len > 1 << 20), Some(("g1", Lane::Graphics)));
-        // with room for both kinds, the asked one still goes before the bigger one made ahead
-        assert_eq!(b.pop(4, &[], |_| true, |_, _| true), Some(("asked", Lane::Parked)));
-        assert_eq!(b.pop(4, &[], |_| true, |_, _| true), Some(("giant made ahead", Lane::Parked)));
-        assert!(!b.has_parked());
     }
 
     #[test]
@@ -935,10 +1027,10 @@ mod tests {
         b.push(100, false, false, shadow, "shadow 2");
         b.push(100, false, false, 0, "no group");
         assert_eq!(b.waiting(), (6, 0));
-        let take = |b: &mut Backlog<&'static str>, recent: &[u64]| b.pop(1, recent, |_| true, |_, _| true).map(|(p, _)| p);
+        let take = |b: &mut Backlog<&'static str>, recent: &[u64]| b.pop(1, recent, |_| true, |_| true, |_| false).map(|(p, _)| p);
         // post was bound last, shadow before it: post's first (its newest first), then shadow's
         let recent = [post, shadow];
-        assert_eq!(b.pop(1, &recent, |_| true, |_, _| true), Some(("post heavy", Lane::Heavy)));
+        assert_eq!(b.pop(1, &recent, |_| true, |_| true, |_| false), Some(("post heavy", Lane::Heavy)));
         b.done(Lane::Heavy);
         assert_eq!(take(&mut b, &recent), Some("post 1"));
         assert_eq!(take(&mut b, &recent), Some("shadow 2"));
@@ -958,7 +1050,7 @@ mod tests {
         b.push(100, false, false, 0x51, "a");
         b.push(HEAVY_SHADER_BYTES, false, true, 0x51, "heavy");
         b.push(100, false, true, 0x51, "c");
-        let take = |b: &mut Backlog<&'static str>, recent: &[u64]| b.pop(4, recent, |_| true, |_, _| true).map(|(p, _)| p);
+        let take = |b: &mut Backlog<&'static str>, recent: &[u64]| b.pop(4, recent, |_| true, |_| true, |_| false).map(|(p, _)| p);
         assert_eq!(take(&mut b, &[]), Some("heavy"));
         assert_eq!(take(&mut b, &[]), Some("c"));
         assert_eq!(b.waiting(), (1, 0));
@@ -1001,15 +1093,10 @@ mod tests {
     #[test]
     fn parked_builds_of_a_group_bound_lately_come_back_before_bigger_ones() {
         let mut b = Backlog::default();
-        b.park(900 << 10, false, 0x61, 0, "big, another pass");
-        b.park(600 << 10, false, 0x62, 0, "this pass");
-        b.park(500 << 10, false, 0x62, 0, "this pass, smaller");
-        b.park(700 << 10, true, 0x61, 0, "asked, another pass");
-        b.park(300 << 10, true, 0x62, 0, "asked, this pass");
-        let take = |b: &mut Backlog<&'static str>, recent: &[u64], most: usize| b.pop(4, recent, |_| true, |len, _| len <= most).map(|(p, _)| p);
-        // what a bind asked for first, of the pass bound last first; then the same among the others
-        assert_eq!(take(&mut b, &[0x62, 0], 1 << 20), Some("asked, this pass"));
-        assert_eq!(take(&mut b, &[0x62, 0], 1 << 20), Some("asked, another pass"));
+        b.park(900 << 10, 0x61, 0, None, "big, another pass");
+        b.park(600 << 10, 0x62, 0, None, "this pass");
+        b.park(500 << 10, 0x62, 0, None, "this pass, smaller");
+        let take = |b: &mut Backlog<&'static str>, recent: &[u64], most: usize| b.pop(4, recent, |_| true, |len| len <= most, |_| false).map(|(p, _)| p);
         assert_eq!(take(&mut b, &[0x62, 0], 1 << 20), Some("this pass"));
         // only what fits: the smaller one of the pass, not the big one of another
         assert_eq!(take(&mut b, &[0x62], 550 << 10), Some("this pass, smaller"));
@@ -1055,17 +1142,102 @@ mod tests {
         let mut b = Backlog::default();
         let promoted = b.push(100, false, false, 11, "promoted");
         b.push(100, true, true, 12, "hot");
-        b.park(600 << 10, true, 12, 0, "actually waited");
         b.promote(promoted);
-        assert_eq!(b.pop(4, &[12], |_| true, |_, _| true), Some(("actually waited", Lane::Parked)));
-        assert_eq!(b.pop(4, &[12], |_| true, |_, _| true), Some(("promoted", Lane::Graphics)));
+        assert_eq!(b.pop(4, &[12], |_| true, |_| true, |_| false), Some(("promoted", Lane::Graphics)));
 
-        b.park(700 << 10, false, 11, promoted, "promoted after parking");
+        b.park(700 << 10, 11, promoted, None, "promoted after parking");
         b.promote(promoted);
-        assert_eq!(b.pop(4, &[12], |_| true, |_, asked| asked), Some(("hot", Lane::Known)));
-        assert_eq!(b.pop(4, &[12], |_| true, |_, asked| asked), None);
-        assert_eq!(b.pop(4, &[12], |_| true, |_, _| true), Some(("promoted after parking", Lane::Parked)));
-        assert_eq!(b.pop(4, &[12], |_| true, |_, _| true), None);
+        assert_eq!(b.pop(4, &[12], |_| true, |_| false, |_| false), Some(("hot", Lane::Known)));
+        assert_eq!(b.pop(4, &[12], |_| true, |_| false, |_| false), None);
+        assert_eq!(b.pop(4, &[12], |_| true, |_| true, |_| false), Some(("promoted after parking", Lane::Parked)));
+        assert_eq!(b.pop(4, &[12], |_| true, |_| true, |_| false), None);
+    }
+
+    #[test]
+    fn a_parked_peer_uses_the_bind_window_before_unrelated_work() {
+        let mut b = Backlog::default();
+        b.park(900 << 10, 10, 1, None, "unrelated");
+        b.park(700 << 10, 20, 2, None, "newest group, older pipeline");
+        b.park(600 << 10, 30, 3, None, "previous group");
+        b.park(800 << 10, 30, 4, None, "previous group, too big");
+        b.park(500 << 10, 20, 5, None, "newest group, newer pipeline");
+        b.push(64, false, false, 20, "unparked");
+        let pop = |b: &mut Backlog<_>| b.pop(8, &[20, 30], |_| true, |_| false, |len| len <= 700 << 10);
+        assert_eq!(pop(&mut b), Some(("newest group, newer pipeline", Lane::ParkedPeer)));
+        assert_eq!(pop(&mut b), Some(("newest group, older pipeline", Lane::ParkedPeer)));
+        assert_eq!(pop(&mut b), Some(("unparked", Lane::Graphics)));
+        assert_eq!(pop(&mut b), None);
+        b.done(Lane::ParkedPeer);
+        assert_eq!(pop(&mut b), Some(("previous group", Lane::ParkedPeer)));
+        assert_eq!(b.parked_peers(&[20, 30]), 1);
+        assert_eq!(b.pop(8, &[20, 30], |_| true, |_| true, |_| false), Some(("previous group, too big", Lane::Parked)));
+    }
+
+    #[test]
+    fn prior_compute_use_orders_only_fitting_work_within_the_current_priority() {
+        let mut b = Backlog::default();
+        b.park(950 << 10, 10, 4, Some(0), "earliest, does not fit");
+        b.park(880 << 10, 10, 3, None, "unknown");
+        b.park(600 << 10, 10, 2, Some(2), "second");
+        b.park(500 << 10, 10, 1, Some(1), "first");
+        b.park(400 << 10, 20, 5, Some(8), "recent group");
+        let take = |b: &mut Backlog<_>, recent: &[u64]| b.pop(8, recent, |_| true, |len| len <= 900 << 10, |_| false);
+        assert_eq!(take(&mut b, &[20]), Some(("recent group", Lane::Parked)));
+        assert_eq!(b.pop(8, &[10], |_| true, |_| false, |len| len <= 900 << 10), Some(("first", Lane::ParkedPeer)));
+        assert_eq!(take(&mut b, &[]), Some(("second", Lane::Parked)));
+        assert_eq!(take(&mut b, &[]), Some(("unknown", Lane::Parked)));
+        assert_eq!(take(&mut b, &[]), None);
+    }
+
+    #[test]
+    fn steady_memory_releases_the_title_reserve_and_load_restores_it() {
+        let mib = 1 << 20;
+        let (budget, backed) = (8192 * mib, 5817 * mib);
+        let mut reserve = TitleReserve::empty();
+        let sample = |r: &mut TitleReserve, t, commit, backed, loading| {
+            r.note(t * 1000, TitleMemory { backed, commit: commit * mib }, budget, loading);
+        };
+        for t in 0..60 {
+            sample(&mut reserve, t, 17_300 + (t % 5) * 125, backed, false);
+        }
+        assert!(!reserve.is_steady());
+        sample(&mut reserve, 60, 17_300, backed, false);
+        assert!(reserve.is_steady(), "temporary driver noise is not sustained growth");
+        assert_eq!(reserve.effective(), 0);
+        sample(&mut reserve, 61, 17_300, backed + 64 * mib, false);
+        assert!(!reserve.is_steady());
+        assert!(reserve.effective() > 0);
+        for t in 62..=121 {
+            sample(&mut reserve, t, 17_300, backed + 64 * mib, false);
+        }
+        assert!(reserve.is_steady());
+        sample(&mut reserve, 122, 17_300, backed + 64 * mib, true);
+        assert!(!reserve.is_steady());
+    }
+
+    #[test]
+    fn sustained_commit_growth_restores_the_title_reserve_without_storage_activity() {
+        let mib = 1 << 20;
+        let mut reserve = TitleReserve::empty();
+        for t in 0u64..=90 {
+            let commit = 17_300 + t.saturating_sub(60) * 8;
+            reserve.note(t * 1000, TitleMemory { backed: 5817 * mib, commit: commit * mib }, 8192 * mib, false);
+            if t == 60 { assert!(reserve.is_steady()); }
+        }
+        assert!(!reserve.is_steady());
+        assert!(reserve.effective() > 0);
+    }
+
+    #[test]
+    fn a_commit_step_restores_the_reserve_before_the_median_catches_up() {
+        let mib = 1 << 20;
+        let mut reserve = TitleReserve::empty();
+        for t in 0..=64 {
+            let commit = if t <= 60 { 17_300 } else { 17_900 };
+            reserve.note(t * 1000, TitleMemory { backed: 5817 * mib, commit: commit * mib }, 8192 * mib, false);
+            if t == 60 { assert!(reserve.is_steady()); }
+        }
+        assert!(reserve.effective() > 0);
     }
 
     #[test]

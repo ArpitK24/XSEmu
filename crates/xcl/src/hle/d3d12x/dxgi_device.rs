@@ -1,7 +1,7 @@
 //! The console device is also an IDXGIDevice: titles reach the display output through it
 //! (device → IDXGIDevice1 → GetAdapter → EnumOutputs, the output SetFrameIntervalX takes –
 //! as Microsoft's public GDK samples do). A PC D3D12 device is not, so a small object answers
-//! IDXGIDevice / 1 / 2 with the device's real adapter; every other interface is the device's.
+//! IDXGIDevice / 1 / 2 with the device's adapter; every other interface is the device's.
 //! Console code only (`real::dev_qi_x`): DXGI asks the device the same and needs the PC answer.
 
 use std::ffi::c_void;
@@ -17,6 +17,9 @@ use windows::Win32::Graphics::Direct3D12::{
 use windows::Win32::Graphics::Dxgi::*;
 
 use crate::util::{HRESULT, S_OK};
+
+#[path = "display_output.rs"]
+mod display_output;
 
 const E_NOTIMPL: HRESULT = 0x8000_4001u32 as i32;
 const E_POINTER: HRESULT = 0x8000_4003u32 as i32;
@@ -115,11 +118,14 @@ unsafe extern "system" fn get_private_data(p: *mut c_void, name: *const GUID, si
     device(p).GetPrivateData(name, size, Some(data)).map_or_else(|e| e.code().0, |_| S_OK)
 }
 
-/// the device's adapter (as on PC: the DXGI adapter with its LUID)
 unsafe fn adapter(p: *mut c_void) -> Result<IDXGIAdapter, HRESULT> {
     let luid = device(p).GetAdapterLuid();
     let factory: IDXGIFactory4 = CreateDXGIFactory1().map_err(|e| e.code().0)?;
-    factory.EnumAdapterByLuid(luid).map_err(|e| e.code().0)
+    if let Some(mode) = crate::state::config().reported_display_mode() {
+        factory.EnumAdapterByLuid::<IDXGIAdapter4>(luid).map(|host| display_output::adapter(host, mode)).map_err(|e| e.code().0)
+    } else {
+        factory.EnumAdapterByLuid(luid).map_err(|e| e.code().0)
+    }
 }
 
 unsafe extern "system" fn get_parent(p: *mut c_void, riid: *const GUID, out: *mut *mut c_void) -> HRESULT {

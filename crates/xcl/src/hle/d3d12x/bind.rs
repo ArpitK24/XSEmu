@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::console_list::{self, Layout, Param};
+use super::console_list::{self, Layout, Param, UavBinding};
 
 #[derive(Default)]
 struct State {
@@ -259,7 +259,15 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
     let title_pso = with(this, |s| s.pso);
     let kind = super::indirect::note_call(sig);
-    let pso = super::pso_async::resolve_wait(title_pso);
+    let dispatches = super::indirect::dispatches(sig);
+    let pso = if dispatches {
+        match super::pso_async::resolve_for_compute_use(title_pso) {
+            Ok(pso) => pso,
+            Err(skip) => return note_pending_compute_skip(this, title_pso, "ExecuteIndirect(Dispatch)", skip),
+        }
+    } else {
+        super::pso_async::resolve_wait(title_pso)
+    };
     note_named_use(title_pso, pso, "indirect call");
     // a mesh signature needs a mesh pipeline and a mesh pipeline a mesh signature: the PC call
     // with any other pair is invalid (a PC pipeline or a stand-in is the title's own pair)
@@ -279,7 +287,6 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // dispatch should have written is skipped too
     let title = |r: usize, off: u64| (r != 0).then(|| super::real::title_address(r).map(|a| a as u64 + off)).flatten();
     let (args_title, count_title) = (title(args, args_off), title(count_buf, count_off));
-    let dispatches = super::indirect::dispatches(sig);
     if let Err(why) = super::indirect::check(sig, max, args_title, count_title) {
         if dispatches {
             note_skipped_writer(this, pso, title_pso);
@@ -903,11 +910,79 @@ static SKIPPED_WRITERS: Mutex<Vec<(usize, Vec<(u64, u64, usize, String)>)>> = Mu
 /// written is kept, for the log and as unwritten (`indirect::skipped_producer`).
 fn note_skipped_writer(this: *mut c_void, pso: usize, title_pso: usize) {
     let writes = with(this, |s| s.layout.as_ref().map_or_else(Vec::new, |l| bound_writes(l, &s.args)));
+    record_skipped_writes(pso, title_pso, writes);
+}
+
+fn record_skipped_writes(pso: usize, title_pso: usize, writes: Vec<(u64, u64, usize, String)>) {
     super::indirect::skipped_producer(title_pso, &writes.iter().map(|&(base, size, _, _)| (base, if size == 16 << 20 { 64 << 10 } else { size })).collect::<Vec<_>>());
     let mut w = SKIPPED_WRITERS.lock().unwrap();
     if w.len() < 256 && !w.iter().any(|e| e.0 == pso) {
         w.push((pso, writes));
     }
+}
+
+static PENDING_COMPUTE_SKIPS: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
+
+fn note_pending_compute_skip(this: *mut c_void, title_pso: usize, call: &str, skip: super::pso_async::PendingComputeSkip) {
+    if matches!(skip, super::pso_async::PendingComputeSkip::ImageOnly) {
+        count(DISPATCHES_SKIPPED);
+        return;
+    }
+    let (layout, args) = with(this, |s| (s.layout.clone(), s.args.clone()));
+    note_pending_compute_skip_with_args(title_pso, call, skip, layout.as_deref(), &args);
+}
+
+pub(super) fn note_pending_compute_skip_with_args(title_pso: usize, call: &str, skip: super::pso_async::PendingComputeSkip, layout: Option<&Layout>, args: &[u8]) {
+    count(DISPATCHES_SKIPPED);
+    let super::pso_async::PendingComputeSkip::Deadline { shader, waited_ms } = skip else { return };
+    let writes = layout.map_or_else(Vec::new, |l| bound_writes(l, args));
+    record_skipped_writes(title_pso, title_pso, writes);
+    let n = {
+        let mut counts = PENDING_COMPUTE_SKIPS.lock().unwrap();
+        let n = counts.get_or_insert_with(HashMap::new).entry(shader).or_default();
+        *n += 1;
+        *n
+    };
+    if n == 1 {
+        let uavs = layout.map_or_else(Vec::new, |l| describe_uavs(l, args, super::console_heap::words_at));
+        crate::xlog_warn!(
+            "D3D12.X: {call} skipped while shader {shader:016x} was pending after {} ms (pipeline {title_pso:#x}); UAV bindings: {}",
+            waited_ms,
+            if uavs.is_empty() { "none captured (bindless and indirect root changes may not be visible)".to_string() } else { uavs.join("; ") }
+        );
+    } else if n.is_power_of_two() {
+        crate::xlog_warn!("D3D12.X: shader {shader:016x}: {n} compute calls skipped while its pipeline was pending");
+    }
+}
+
+fn describe_uavs(layout: &Layout, args: &[u8], words_at: impl Fn(u32) -> Option<[u32; 8]>) -> Vec<String> {
+    let word = |at| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut out = Vec::new();
+    const MAX: usize = 32;
+    for binding in &layout.uavs {
+        if out.len() >= MAX {
+            break;
+        }
+        match *binding {
+            UavBinding::Root { param, at } => {
+                let at = at as usize;
+                let va = word(at) as u64 | (word(at + 4) as u64) << 32;
+                out.push(format!("p{param} root UAV {va:#x}"));
+            }
+            UavBinding::Table { param, at, first, count } => {
+                let table = word(at as usize);
+                for slot in first..first.saturating_add(count.min((MAX - out.len()) as u32)) {
+                    let words = slot.checked_mul(32).and_then(|off| table.checked_add(off)).and_then(&words_at);
+                    let words = words.map_or_else(|| "descriptor unavailable".to_string(), |w| format!("{w:08x?}"));
+                    out.push(format!("p{param} UAV table {table:#x} slot {slot}: {words}"));
+                }
+            }
+        }
+    }
+    if out.len() == MAX {
+        out.push("capture limited to 32 declared UAV slots".into());
+    }
+    out
 }
 
 /// Whether indirect calls are captured now (`XCL_GPU_MARKERS`): fewer than the most so far, and
@@ -966,8 +1041,14 @@ pub fn indirect_calls() -> String {
     let c = |k: usize| MESH_CALLS[k].load(Ordering::Relaxed);
     let (native, two_pass) = super::real::mesh_pipeline_counts();
     let trips = trips(0).first().map_or(String::new(), |t| format!("; {t}"));
+    let pending = PENDING_COMPUTE_SKIPS.lock().unwrap().as_ref().map_or_else(String::new, |counts| {
+        let mut top: Vec<_> = counts.iter().collect();
+        top.sort_unstable_by_key(|(&shader, &count)| (std::cmp::Reverse(count), shader));
+        let top = top.into_iter().take(8).map(|(&shader, &count)| format!("{shader:016x}={count}")).collect::<Vec<_>>().join(", ");
+        format!("; {} compute calls skipped while pending across {} shaders (highest counts: {top})", counts.values().sum::<u64>(), counts.len())
+    });
     format!(
-        "ExecuteIndirect {}; mesh pipelines {native} as host mesh shaders, {two_pass} in two passes; mesh calls {} as host mesh shaders, {} in two passes, {} skipped{trips}",
+        "ExecuteIndirect {}; mesh pipelines {native} as host mesh shaders, {two_pass} in two passes; mesh calls {} as host mesh shaders, {} in two passes, {} skipped{trips}{pending}",
         super::indirect::calls_summary(),
         c(MESH_NATIVE),
         c(MESH_TWO_PASS),
@@ -1813,7 +1894,10 @@ fn note_named_use(title_pso: usize, pso: usize, what: &str) {
 /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
 pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     let title_pso = with(this, |s| s.pso);
-    let pso = super::pso_async::resolve_wait(title_pso);
+    let pso = match super::pso_async::resolve_for_compute_use(title_pso) {
+        Ok(pso) => pso,
+        Err(skip) => return note_pending_compute_skip(this, title_pso, "Dispatch", skip),
+    };
     note_named_use(title_pso, pso, "dispatch");
     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
     if !super::real::is_translated_compute(pso) {
@@ -2100,6 +2184,27 @@ mod tests {
     use super::super::{device_x, list_x, pso_async, real, title_list};
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn pending_skip_logs_only_declared_uav_slots() {
+        let words = [
+            2u32, 2, 24, 0, 0, 0,
+            4, 0, 48, 0, 0, 60,
+            0, 0, 0, 2, 68,
+            0, 3, 0, 0, 0, 0,
+            1, 1, 0, 0, 0, u32::MAX,
+        ];
+        let blob: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let layout = console_list::layout_from_blob(&blob).unwrap();
+        let args: Vec<_> = [0x9000u32, 1, 0x40].into_iter().flat_map(u32::to_le_bytes).collect();
+        let uavs = describe_uavs(&layout, &args, |addr| {
+            assert_eq!(addr, 0x40 + 3 * 32, "the preceding SRV range is not captured");
+            Some([0x42; 8])
+        });
+        assert_eq!(uavs.len(), 2);
+        assert_eq!(uavs[0], "p0 root UAV 0x100009000");
+        assert!(uavs[1].starts_with("p1 UAV table 0x40 slot 3: "));
+    }
 
     #[test]
     fn marker_buffer_probe_checks_descriptor_type_and_bounds() {
@@ -2531,6 +2636,34 @@ mod tests {
             1,
             "failed async compute stand-in must not enter translated ExecuteIndirect path"
         );
+
+        let pending = 0x7200_0004usize;
+        let finished = 0x7200_0005usize;
+        let sig_compute = 0x7200_00F1usize;
+        let shader = 0x7200_4321u64;
+        let (finish, gate) = std::sync::mpsc::channel();
+        let gate = Mutex::new(gate);
+        pso_async::submit_lazy_described(pending, true, Box::new(move || {
+            let _ = gate.lock().unwrap().recv();
+            finished
+        }), 0, format!("CS {shader:016x}"), 0, 0);
+        super::super::indirect::note_signature(sig_compute, super::super::indirect::DISPATCH, 12, true);
+        reset(list_ptr, 0x7200_0100, pending);
+        pso_async::COMPUTE_SKIP_LIMIT.with(|limit| {
+            limit.set(Some(std::time::Duration::ZERO));
+            assert_eq!(pso_async::resolve_for_bind(pending), pending, "state bind must not block");
+            unsafe {
+                dispatch(list_ptr, 1, 1, 1);
+                execute_indirect(list_ptr, sig_compute, 1, 0, 0, 0, 0);
+            }
+            limit.set(None);
+        });
+        assert_eq!(fake.dispatch_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fake.execute_indirect_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(PENDING_COMPUTE_SKIPS.lock().unwrap().as_ref().unwrap().get(&shader), Some(&2));
+        finish.send(()).unwrap();
+        assert_eq!(pso_async::resolve_wait(pending), finished);
+        assert_eq!(pso_async::released(pending), finished);
 
         forget(list_ptr);
         let _ = pso_async::released(standin_ok);

@@ -305,13 +305,10 @@ fn adjust_pending(delta: isize) {
     }
 }
 
+/// References to textures of the table, taken with its lock held (`real::reference`: one being
+/// released for good on another thread is left out).
 unsafe fn clone_resources(ptrs: &[usize]) -> Vec<ID3D12Resource> {
-    ptrs.iter()
-        .filter_map(|&raw| {
-            let p = raw as *mut c_void;
-            ID3D12Resource::from_raw_borrowed(&p).map(|r| r.clone())
-        })
-        .collect()
+    ptrs.iter().filter_map(|&raw| super::real::reference(raw)).collect()
 }
 
 /// PC texture → its place in the title's memory
@@ -538,6 +535,27 @@ pub fn note_gpu_write(res: usize) {
 }
 
 static GPU_WRITTEN: AtomicU64 = AtomicU64::new(0);
+
+/// (diagnostics, `alias::report`) The textures the title placed over `[va, va + len)` (the first 4
+/// kept in step, 2 shadowed by newer ones): where each is, where its bytes are read from, and
+/// whether the GPU wrote it. Not waited for while another thread holds the table.
+pub(crate) fn placed_over(va: usize, len: usize) -> Vec<String> {
+    let Some(t) = crate::alias::try_lock(&TEXTURES) else { return Vec::new() };
+    let end = va.saturating_add(len);
+    let line = |res: usize, e: &Entry, state: &str| {
+        format!(
+            "a texture is placed over this memory ({state}): PC texture {res:#x} at {:#x} + {:#x}, read from {:#x}{}{}",
+            e.va,
+            e.tex.size(),
+            e.src,
+            if e.in_gpu_view { " (in a GPU view)" } else { "" },
+            if e.gpu_written { ", written by the GPU (no longer uploaded)" } else { "" }
+        )
+    };
+    let mut out: Vec<String> = t.active_overlaps(va, end).into_iter().take(4).filter_map(|(_, res, _)| t.by_res.get(&res).map(|e| line(res, e, "kept in step"))).collect();
+    out.extend(t.shadowed_overlaps(va, end).into_iter().take(2).filter_map(|(_, res, _)| t.shadowed.get(&res).map(|e| line(res, e, "shadowed by a newer one"))));
+    out
+}
 
 /// The textures kept in step whose memory `[va, va + len)` overlaps (PC texture, its address).
 pub fn overlapping(va: usize, len: usize) -> Vec<(usize, usize)> {
@@ -871,12 +889,19 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 dirty.get(i).is_some_and(|&p| p < e.src + e.tex.size() as usize)
             })
             .filter_map(|(&res, e)| {
+                let Some(r) = super::real::reference(res) else {
+                    // being released on another thread: for good, or it is uploaded next time
+                    if !e.pending {
+                        e.pending = true;
+                        PENDING.fetch_add(1, Ordering::Relaxed);
+                    }
+                    return None;
+                };
                 if e.pending {
                     e.pending = false;
                     PENDING.fetch_sub(1, Ordering::Relaxed);
                 }
-                let p = res as *mut c_void;
-                ID3D12Resource::from_raw_borrowed(&p).map(|r| (r.clone(), (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
+                Some((r, (e.device, e.src, Arc::clone(&e.tex), e.states.clone())))
             })
             .collect()
     });
@@ -1037,10 +1062,14 @@ pub unsafe fn probe_gpu_content(res: usize) {
         }
         g.push(res);
     }
-    let Some((device, va, tex, gpu_written)) = TEXTURES.lock().unwrap().by_res.get(&res).map(|e| (e.device, e.src, Arc::clone(&e.tex), e.gpu_written)) else { return };
+    let Some((device, va, tex, gpu_written, r)) = ({
+        let t = TEXTURES.lock().unwrap();
+        t.by_res.get(&res).and_then(|e| Some((e.device, e.src, Arc::clone(&e.tex), e.gpu_written, super::real::reference(res)?)))
+    }) else {
+        return;
+    };
     let d = device as *mut c_void;
-    let r = res as *mut c_void;
-    let (Some(dev), Some(r)) = (ID3D12Device::from_raw_borrowed(&d), ID3D12Resource::from_raw_borrowed(&r)) else { return };
+    let (Some(dev), r) = (ID3D12Device::from_raw_borrowed(&d), &r) else { return };
     let rd = r.GetDesc();
     let result = read_gpu_subresource(dev, r, 0, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     let cpu = subresources(va, &tex).into_iter().next().map(|s| s.data).unwrap_or_default();
@@ -1716,6 +1745,158 @@ mod tests {
         assert_eq!(states()[4], D3D12_RESOURCE_STATE_COPY_SOURCE, "a reset list has nothing to apply");
         forget(res);
         assert!(LIST_NOTES.lock().unwrap().get(&l1).is_none());
+    }
+
+    /// A texture kept in step is forgotten before its last reference goes, not after: a refresh on
+    /// another thread takes its reference for an upload from the table, and between the Release
+    /// that ended the object and a forget after it the table named an object that was gone.
+    #[test]
+    fn a_texture_is_forgotten_before_its_last_reference_goes() {
+        use std::sync::atomic::AtomicU32;
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // an object as `real::adopt` leaves one: XCL's vtable, the original one slot before it
+        #[repr(C)]
+        struct Object {
+            vtable: *const usize,
+            references: AtomicU32,
+            /// 0: alive; when its last reference went: 1 forgotten by then, 2 still in the table
+            at_its_end: AtomicU32,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            (*(this as *const Object)).references.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let o = &*(this as *const Object);
+            let n = o.references.fetch_sub(1, Ordering::SeqCst) - 1;
+            if n == 0 {
+                // what a refresh on another thread finds from here on
+                o.at_its_end.store(1 + u32::from(address(this as usize).is_some()), Ordering::SeqCst);
+            }
+            n
+        }
+        let original = [0usize, add_ref as usize, release as usize];
+        let ours = [original.as_ptr() as usize, 0, add_ref as usize, super::super::real::res_release as usize];
+        let object = Object { vtable: ours[1..].as_ptr(), references: AtomicU32::new(2), at_its_end: AtomicU32::new(0) };
+        let res = &object as *const Object as usize;
+
+        // RGBA8 64×64, one mip, 4KB_S
+        let mut d = [0u8; 0x38];
+        d[0..4].copy_from_slice(&3u32.to_le_bytes());
+        d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+        let tex = Arc::new(xg::Texture::new(&d).unwrap());
+        let va = 0x7E57_0010_0000usize;
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+            TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        }
+        unsafe {
+            assert_eq!(super::super::real::res_release(res as *mut c_void), 1);
+            assert_eq!(address(res), Some(va), "a reference is left: still kept in step");
+            assert_eq!(object.at_its_end.load(Ordering::SeqCst), 0);
+            assert_eq!(super::super::real::res_release(res as *mut c_void), 0);
+        }
+        assert_eq!(object.at_its_end.load(Ordering::SeqCst), 1, "the table had forgotten the texture when its last reference went");
+        assert_eq!(address(res), None);
+    }
+
+    /// Two references given up at the same moment: neither Release sees the last one coming, so
+    /// the texture is still in the table when the object ends. Until the table has forgotten it,
+    /// nothing takes a reference to it from the table (`real::reference`).
+    #[test]
+    fn no_reference_is_taken_from_the_table_once_the_last_release_is_under_way() {
+        use std::sync::atomic::{AtomicBool, AtomicU32};
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        #[repr(C)]
+        struct Object {
+            vtable: *const usize,
+            references: AtomicU32,
+            releases: AtomicU32,
+            ended: AtomicBool,
+            asked: AtomicBool,
+            referenced_after_its_end: AtomicU32,
+        }
+        unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
+            let o = &*(this as *const Object);
+            if o.ended.load(Ordering::SeqCst) {
+                o.referenced_after_its_end.fetch_add(1, Ordering::SeqCst);
+            }
+            o.references.fetch_add(1, Ordering::SeqCst) + 1
+        }
+        unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+            let o = &*(this as *const Object);
+            // (the first Release is `res_release` reading the count; with the second, another
+            // thread's Release of the other reference lands)
+            let gone = if o.releases.fetch_add(1, Ordering::SeqCst) == 1 { 2 } else { 1 };
+            let n = o.references.fetch_sub(gone, Ordering::SeqCst) - gone;
+            if n == 0 {
+                o.ended.store(true, Ordering::SeqCst);
+                // the object is gone and this Release has not returned: a refresh asks for it now
+                let t = std::time::Instant::now();
+                while !o.asked.load(Ordering::SeqCst) && t.elapsed().as_secs() < 5 {
+                    std::thread::yield_now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            n
+        }
+        let original = [0usize, add_ref as usize, release as usize];
+        let ours = [original.as_ptr() as usize, 0, add_ref as usize, super::super::real::res_release as usize];
+        let object = Object {
+            vtable: ours[1..].as_ptr(),
+            references: AtomicU32::new(2),
+            releases: AtomicU32::new(0),
+            ended: AtomicBool::new(false),
+            asked: AtomicBool::new(false),
+            referenced_after_its_end: AtomicU32::new(0),
+        };
+        let res = &object as *const Object as usize;
+        let mut d = [0u8; 0x38];
+        d[0..4].copy_from_slice(&3u32.to_le_bytes());
+        d[0x10..0x18].copy_from_slice(&64u64.to_le_bytes());
+        d[0x18..0x1C].copy_from_slice(&64u32.to_le_bytes());
+        d[0x1C..0x1E].copy_from_slice(&1u16.to_le_bytes());
+        d[0x1E..0x20].copy_from_slice(&1u16.to_le_bytes());
+        d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
+        d[0x24..0x28].copy_from_slice(&1u32.to_le_bytes());
+        d[0x2C..0x30].copy_from_slice(&0x105u32.to_le_bytes());
+        let tex = Arc::new(xg::Texture::new(&d).unwrap());
+        let va = 0x7E57_0020_0000usize;
+        {
+            let mut t = TEXTURES.lock().unwrap();
+            t.insert(res, Entry { device: 0, va, src: va, in_gpu_view: false, tex, states: vec![D3D12_RESOURCE_STATE_COMMON], pending: false, gpu_written: true, placed: false, unmapped: false, seq: 0 });
+            TEXTURES_LEN.store(t.by_res.len(), Ordering::Relaxed);
+        }
+        std::thread::scope(|s| {
+            s.spawn(|| unsafe { assert_eq!(super::super::real::res_release(res as *mut c_void), 0) });
+            let t0 = std::time::Instant::now();
+            while !object.ended.load(Ordering::SeqCst) && t0.elapsed().as_secs() < 5 {
+                std::thread::yield_now();
+            }
+            let (taken, after_its_end) = {
+                let t = TEXTURES.lock().unwrap();
+                assert!(t.by_res.contains_key(&res), "the last Release has not returned: still in the table");
+                object.asked.store(true, Ordering::SeqCst);
+                let taken = unsafe { super::super::real::reference(res) };
+                (taken, object.referenced_after_its_end.load(Ordering::SeqCst))
+            };
+            assert_eq!(after_its_end, 0, "a reference was taken to an object that was gone");
+            assert!(taken.is_none());
+        });
+        assert_eq!(address(res), None, "forgotten once its last Release had returned");
+        // a texture no Release of which is under way: its reference is there
+        let alive = Object { vtable: ours[1..].as_ptr(), references: AtomicU32::new(1), releases: AtomicU32::new(2), ended: AtomicBool::new(false), asked: AtomicBool::new(true), referenced_after_its_end: AtomicU32::new(0) };
+        let taken = unsafe { super::super::real::reference(&alive as *const Object as usize) };
+        assert!(taken.is_some());
+        assert_eq!(alive.references.load(Ordering::SeqCst), 2);
+        drop(taken);
+        assert_eq!(alive.references.load(Ordering::SeqCst), 1);
     }
 
     /// The title's bytes are used where they are when all of them are readable, and read with the

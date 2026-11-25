@@ -285,7 +285,7 @@ mod tests {
     /// Constants are shown in full and by register; an argument nothing was set for is said so.
     #[test]
     fn root_arguments_are_shown_by_register_and_parameter() {
-        let layout = Layout { params: vec![Param::Constants { at: 0, count: 2 }, Param::Descriptor { at: 8 }, Param::Constants { at: 16, count: 1 }], size: 20, inline: 8, inline_gfx: 16 };
+        let layout = Layout { params: vec![Param::Constants { at: 0, count: 2 }, Param::Descriptor { at: 8 }, Param::Constants { at: 16, count: 1 }], size: 20, inline: 8, inline_gfx: 16, ..Default::default() };
         let mut args = vec![0u8; 20];
         args[..4].copy_from_slice(&0x11u32.to_le_bytes());
         args[4..8].copy_from_slice(&0x22u32.to_le_bytes());

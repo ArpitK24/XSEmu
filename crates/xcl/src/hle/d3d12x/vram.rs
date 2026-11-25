@@ -827,20 +827,28 @@ impl Pages {
     /// A target the GPU writes got its pages in `va..end`: the sampled textures at those
     /// addresses that have memory only where they have texels take them too – what the GPU
     /// writes there is what they read, as on the console.
-    unsafe fn share_with_sampled(&mut self, dev: &ID3D12Device, va: usize, end: usize) {
+    ///
+    /// Those textures are known here by their address alone: each is used through a reference of
+    /// its own (`real::reference`; one being released for good on another thread is left out).
+    /// The references are returned for the caller to let go of once the pages are unlocked – the
+    /// last reference to a texture, let go of under that lock, came back for the lock (`forget`).
+    #[must_use]
+    unsafe fn share_with_sampled(&mut self, dev: &ID3D12Device, va: usize, end: usize) -> Vec<ID3D12Resource> {
         let start = va.saturating_sub(self.max_target_span);
         let keys: Vec<usize> = self.target_starts.range((start, 0)..(end, 0)).map(|&(_, resource)| resource)
             .filter(|r| self.targets.get(r).is_some_and(|t| t.mapped && t.wanted.is_some() && va < t.end()))
             .collect();
+        let mut used = Vec::new();
         for key in keys {
             let Some(mut t) = self.targets.remove(&key) else { continue };
-            let raw = key as *mut c_void;
-            if let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) {
+            if let Some(res) = super::real::reference(key) {
                 let all = 0..t.units.len();
-                self.acquire(dev, res, &mut t, all, false, false);
+                self.acquire(dev, &res, &mut t, all, false, false);
+                used.push(res);
             }
             self.targets.insert(key, t);
         }
+        used
     }
 }
 
@@ -1031,19 +1039,21 @@ unsafe fn place_on_pages(
     let Some(pages) = g.get_mut(&(dev.as_raw() as usize)).and_then(Option::as_mut) else {
         return fail(g);
     };
+    let mut shared = Vec::new();
     if lazy {
         pages.acquire(dev, res, &mut target, all, false, false);
     } else if !pages.acquire(dev, res, &mut target, all, true, true) {
         pages.release(&mut target, 0..total as usize, std::time::Instant::now(), true);
         return fail(g);
     } else {
-        pages.share_with_sampled(dev, va, target.end());
+        shared = pages.share_with_sampled(dev, va, target.end());
     }
     pages.max_target_span = pages.max_target_span.max(target.end() - va);
     pages.target_starts.insert((va, raw as usize));
     pages.targets.insert(raw as usize, target);
     report_growth(pages);
     drop(g);
+    drop(shared);
     if lazy {
         LAZY.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     }
@@ -1131,6 +1141,8 @@ pub(super) unsafe fn note_gpu_write(resource: usize) {
     let raw = resource as *mut c_void;
     let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else { return };
     let Some(dev) = device_of(res) else { return };
+    // (declared before the lock: let go of after it)
+    let mut shared = Vec::new();
     let mut g = PAGES.lock().unwrap();
     let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let Some(mut t) = pages.targets.remove(&resource) else { return };
@@ -1142,9 +1154,11 @@ pub(super) unsafe fn note_gpu_write(resource: usize) {
     if t.mapped {
         let all = 0..t.units.len();
         pages.acquire(&dev, res, &mut t, all, true, true);
-        pages.share_with_sampled(&dev, t.va, t.end());
+        shared = pages.share_with_sampled(&dev, t.va, t.end());
     }
     pages.targets.insert(resource, t);
+    drop(g);
+    drop(shared);
 }
 
 /// Unmap a placed texture superseded by a placement with a different address range, returning its
