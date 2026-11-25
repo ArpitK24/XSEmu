@@ -1247,6 +1247,18 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
 #[cfg(test)]
 pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+/// (tests) The pages of `device` that no resource uses go back to the pools now, not after
+/// `IDLE`: a test that counts the device's pages (`page_bytes_for`) starts from those in use.
+/// Tests of one adapter share its device, and the pages an earlier test left idle are swept
+/// while the next one counts – in a run one test at a time, 2 s later: its count fell below
+/// where it started.
+#[cfg(test)]
+pub(super) fn sweep_idle_now(device: usize) {
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get_mut(&device) else { return };
+    p.sweep(std::time::Instant::now() + IDLE);
+}
+
 #[cfg(test)]
 pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
     let g = PAGES.lock().unwrap();

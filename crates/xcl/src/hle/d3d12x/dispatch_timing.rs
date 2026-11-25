@@ -31,21 +31,26 @@ fn capture_selection() -> Option<(u64, u32)> {
 pub(super) fn note(pso: usize, shader: &[u8]) {
     let selected = selection();
     let capture = capture_selection().map(|(hash, _)| hash);
-    if selected.is_empty() && capture.is_none() {
+    let profile = super::gpu_timing::enabled();
+    if selected.is_empty() && capture.is_none() && !profile {
         return;
     }
     let hash = crate::gpu::shader::fnv64(shader);
-    if selected.contains(&hash) || capture == Some(hash) {
+    if profile || selected.contains(&hash) || capture == Some(hash) {
         SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso, hash);
     }
 }
 
 pub(super) fn forget(pso: usize) {
-    if !selection().is_empty() || capture_selection().is_some() {
+    if !selection().is_empty() || capture_selection().is_some() || super::gpu_timing::enabled() {
         if let Some(h) = SHADERS.lock().unwrap().as_mut() {
             h.remove(&pso);
         }
     }
+}
+
+pub(super) fn profile_shader(pso: usize) -> Option<u64> {
+    SHADERS.lock().unwrap().as_ref()?.get(&pso).copied()
 }
 
 struct Queries {

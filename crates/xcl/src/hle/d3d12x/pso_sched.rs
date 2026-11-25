@@ -10,30 +10,26 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const GIANT_DXIL: usize = 1 << 20;
 pub const GIANTS_AT_ONCE: usize = 3;
 
-/// A driver compile's expected peak of this process's private memory, from the bytes of its
-/// DXIL. Measured on an NVIDIA driver (RTX 3080), one compile at a time, private bytes sampled
-/// every 50 ms (`real::driver_measure`):
+/// An estimated driver compile budget, calibrated with isolated cold compiles on the NVIDIA
+/// Windows driver (GeForce RTX 3080). Growth is relative to the pre-compile sample, in MiB.
 ///
-/// | DXIL      | peak    | per byte | time  |
-/// |-----------|---------|----------|-------|
-/// | 0.51 MB   | 0.30 GB | 575 B    | 11 s  |
-/// | 0.63 MB   | 0.42 GB | 643 B    | 18 s  |
-/// | 1.64 MB   | 1.04 GB | 621 B    | 38 s  |
-/// | 1.86 MB   | 1.19 GB | 625 B    | 47 s  |
-/// | 3.09 MB   | 2.83 GB | 894 B    | 173 s |
-/// | 3.35 MB   | 4.36 GB | 1271 B   | 166 s |
+/// | DXIL bytes | Peak private commit | Peak working set | Available RAM drop |
+/// |-----------:|--------------------:|-----------------:|-------------------:|
+/// |    533,812 |                 307 |                — |                  — |
+/// |    660,536 |                 425 |                — |                  — |
+/// |  1,208,312 |                 947 |              953 |                  — |
+/// |  1,588,808 |               1,067 |            1,059 |                  — |
+/// |  1,717,176 |               1,067 |            1,067 |              1,104 |
+/// |  1,727,332 |               1,775 |            1,777 |                  — |
+/// |  1,945,712 |               1,217 |            1,218 |              1,351 |
+/// |  3,240,760 |               3,034 |            3,021 |                  — |
+/// |  3,241,524 |               2,897 |            2,874 |              3,047 |
+/// |  3,515,708 |               4,468 |            4,432 |              4,282 |
 ///
-/// All of it came back when the compile ended. A giant's cost grows faster than its size (by
-/// its square, among these), and two of nearly one size differ by half. Under the giant line
-/// the estimate is `SMALL_PEAK_PER_BYTE` for each byte of DXIL (`set_small_peak`), a fifth to a
-/// third over the measured: a retail game makes some 1 100 compute programs of 0.5 to 1 MB,
-/// and at 1 KB a byte (~700 MB each) with ~4 GB available hardly one of them started in the
-/// background. From there it is one and a half times the most measured: 600 MB times the square
-/// of its MB (2 GB at least); and from 4 MB, where nothing was measured, 3.3 GB for each MB as
-/// before (a 6.69 MB program took a warm-up's process to a 21.9 GB working set, the driver's
-/// mapped shader cache included). The estimates at first were 1.5 GB and 3.3 GB for each MB
-/// throughout: 2.5 to 5 times what the four giants above took, so that none of them was
-/// admitted beside a game that left 4.6 GB available.
+/// The giant curve interpolates between the highest observed costs with 10% headroom below
+/// 1.5 MiB of DXIL and 25% above it. Nearby lower samples do not pull the budget down.
+/// Between the largest measured point and 4 MiB the curve returns to the old conservative
+/// bound. At 4 MiB and up it keeps the unmeasured-size guard.
 pub fn peak(dxil_len: usize) -> u64 {
     peak_at(dxil_len, SMALL_PEAK.load(Ordering::Relaxed))
 }
@@ -41,13 +37,27 @@ pub fn peak(dxil_len: usize) -> u64 {
 /// `peak` with `small` bytes of memory for each byte of DXIL under the giant line.
 pub fn peak_at(dxil_len: usize, small: u64) -> u64 {
     let len = dxil_len as u64;
-    if dxil_len >= 4 * GIANT_DXIL {
+    const MIB: u64 = 1 << 20;
+    const SMALL_CAP: u64 = 2 << 30;
+    const GIANT_BUDGET_MIB: &[(u64, u64)] = &[
+        (MIB, 911),
+        (1_208_312, 1049),
+        (1_588_808, 1334),
+        (1_727_332, 2222),
+        (1_945_712, 2222),
+        (3_240_760, 3809),
+        (3_515_708, 5585),
+        (4 * MIB, 9600),
+    ];
+    if len >= 4 * MIB {
         len * 3380
-    } else if dxil_len >= GIANT_DXIL {
-        (len * len * 600 >> 20).max(2 << 30)
+    } else if dxil_len < GIANT_DXIL {
+        (len * small).clamp(128 << 20, SMALL_CAP)
     } else {
-        // (never over the least giant's: more DXIL is never expected to take less)
-        (len * small).clamp(128 << 20, 2 << 30)
+        let range = GIANT_BUDGET_MIB.windows(2).find(|p| len <= p[1].0).unwrap();
+        let (from, to) = (range[0], range[1]);
+        let budget = from.1 * MIB + ((len - from.0) * (to.1 - from.1) * MIB).div_ceil(to.0 - from.0);
+        budget.max((MIB * small).min(SMALL_CAP))
     }
 }
 
@@ -724,8 +734,8 @@ mod tests {
         let newer = std::thread::spawn(|| std::thread::current().id()).join().unwrap();
         let oldest = std::thread::current().id();
         let now = std::time::Instant::now();
-        let available = 4_608 << 20;
         let giant = 3_241_524;
+        let available = GB + peak(giant) - (256 << 20);
         assert!(fits_on_machine(peak(giant), GB, 32 * GB));
         assert_eq!(admit(&ask(giant, true), &Load::default(), &room(available)), Verdict::Hold);
         assert!(!breaker.hold(oldest, true, 0, available, GB, now));
@@ -762,15 +772,14 @@ mod tests {
         // (bytes of DXIL, the private peak measured in MB)
         for (len, measured) in [(533_812, 307), (660_536, 425), (1_717_176, 1067), (1_945_712, 1217), (3_241_524, 2897), (3_515_708, 4468)] {
             let estimate = peak_at(len, SMALL_PEAK_PER_BYTE);
-            // (under the giant line a fifth over at least, from it a half)
-            let (least, most) = if len < GIANT_DXIL { (measured * MB * 115 / 100, measured * MB * 3 / 2) } else { (measured * MB * 3 / 2, measured * MB * 3) };
+            let (least, most) = if len < GIANT_DXIL { (measured * MB * 115 / 100, measured * MB * 3 / 2) } else { (measured * MB * 125 / 100, measured * MB * 9 / 4) };
             assert!(estimate >= least, "{len} B: {} MB estimated, {measured} MB measured", estimate / MB);
             assert!(estimate <= most, "{len} B: {} MB estimated is no longer near the {measured} MB measured", estimate / MB);
         }
         let at = |len| peak_at(len, SMALL_PEAK_PER_BYTE);
         assert_eq!(at(1000), 128 << 20);
         assert_eq!(at(512 << 10), (512 << 10) * 800);
-        assert_eq!(at(GIANT_DXIL), 2 << 30);
+        assert_eq!(at(GIANT_DXIL), 911 << 20);
         assert_eq!(at(6 << 20), 6 * 3380 << 20);
         // never less for more DXIL, whatever a byte under the giant line is expected to take
         let sizes = [0, 1000, 256 << 10, GIANT_DXIL - 1, GIANT_DXIL, 2 << 20, (4 << 20) - 1, 4 << 20, 27 << 20];
@@ -779,6 +788,19 @@ mod tests {
         }
         assert_eq!(peak_at(700 << 10, 1024), 700 << 20, "what it was before");
         assert_eq!(peak_at(900 << 10, 4096), 2 << 30, "never over the least giant's");
+        assert_eq!(peak_at(GIANT_DXIL, 4096), 2 << 30, "the small override cannot make the first giant cheaper");
+    }
+
+    #[test]
+    fn the_giant_estimate_covers_isolated_rtx_peaks_without_the_old_overestimate() {
+        const MIB: u64 = 1 << 20;
+        for (bytes, observed, headroom) in [(1_208_312, 953u64, 110), (1_588_808, 1067, 125), (1_727_332, 1777, 125), (3_240_760, 3047, 125), (3_515_708, 4468, 125)] {
+            let estimate = peak_at(bytes, SMALL_PEAK_PER_BYTE);
+            assert_eq!(estimate, (observed * headroom).div_ceil(100) * MIB, "{bytes} B");
+        }
+        let giant = ask(3_240_760, true);
+        assert_eq!(admit(&giant, &Load::default(), &room(4_833 * MIB)), Verdict::Urgent);
+        assert_eq!(admit(&giant, &Load::default(), &room(4_832 * MIB)), Verdict::Hold);
     }
 
     /// A compile is admitted when its expected peak fits the memory available less the floor,

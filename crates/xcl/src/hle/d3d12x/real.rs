@@ -715,6 +715,13 @@ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
     *orig.add(slot)
 }
 
+pub(super) unsafe fn original_or_native(this: *mut c_void, slot: usize) -> (usize, bool) {
+    let table = vt(this);
+    let adopted = is_ext(table as usize);
+    let original = if adopted { *table.sub(1) as *const usize } else { table };
+    (*original.add(slot), adopted)
+}
+
 fn module_of(addr: usize) -> usize {
     use windows_sys::Win32::System::LibraryLoader::{
         GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
@@ -1444,15 +1451,36 @@ pub(super) unsafe fn place_external_buffer(this: *mut c_void, title: usize, desc
         return crate::util::E_INVALIDARG;
     }
     let mut raw = std::ptr::null_mut();
+    // inside a buffer that is mirrored already: the same memory on the console, and the same
+    // video memory here – placed in that mirror, which lives as long as either
+    if let Some((at, block)) = super::external_buffers::hold(title, bytes) {
+        let Some((hr, delta)) = super::sparse::place_buffer(this, at, desc, state, riid, &mut raw) else {
+            if let Some(block) = super::external_buffers::unhold(block) {
+                super::sparse::release_owned_block(block);
+            }
+            return crate::util::E_FAIL;
+        };
+        UMA_BUFFERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, (at, bytes, false));
+        if delta != 0 {
+            BUFFER_DELTA.lock().unwrap().get_or_insert_with(HashMap::new).insert(raw as usize, delta as u64);
+        }
+        super::external_buffers::register_in(raw as usize, title, at, bytes, block);
+        *ppv = raw;
+        return hr;
+    }
     let Some(hr) = place_console_buffer_sparse(this, desc, bytes, state, false, riid, &mut raw) else {
         return crate::util::E_FAIL;
     };
-    let (mirror, _) = console_buffer(raw as usize).unwrap();
-    if !super::external_buffers::register(raw as usize, title, mirror, bytes) {
-        crate::xlog_warn!("D3D12.X: buffer at {title:#x} ({bytes:#x} bytes) outside unified memory overlaps a mirrored one");
-        res_release(raw);
-        return crate::util::E_INVALIDARG;
-    }
+    // (the mirror's video memory is given back when the last buffer placed in it goes,
+    // `external_buffers::forget` – not with this one)
+    let mirror = match UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&(raw as usize))) {
+        Some(entry) => {
+            entry.2 = false;
+            entry.0
+        }
+        None => return crate::util::E_FAIL,
+    };
+    super::external_buffers::register(raw as usize, title, mirror, bytes);
     *ppv = raw;
     hr
 }
@@ -1805,7 +1833,9 @@ pub(super) unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
         if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
             m.remove(&(this as usize));
         }
-        super::external_buffers::forget(this as usize);
+        if let Some(block) = super::external_buffers::forget(this as usize) {
+            super::sparse::release_owned_block(block);
+        }
         if let Some(pins) = pins {
             super::sparse::forget_buffer(this as usize, pins);
         }
@@ -2589,6 +2619,9 @@ pub(super) unsafe extern "system" fn dev_create_uav_x(this: *mut c_void, res: *m
             static N: AtomicU64 = AtomicU64::new(0);
             if N.fetch_add(1, Ordering::Relaxed) < 4 {
                 crate::xlog_warn!("D3D12.X: a UAV of a resource that cannot have one on the PC and has no shadow texture (format {}, {} samples, flags {:#x}) – a null view", rd.Format.0, rd.SampleDesc.Count, rd.Flags.0);
+                if super::present::writer_trace_configured() {
+                    crate::xlog_warn!("present writer: null UAV resource {res:p} {}x{}, requested view format {:?}, dimension {}", rd.Width, rd.Height, desc.as_ref().map(|d| d.Format.0), dim.0);
+                }
             }
             f(this, std::ptr::null_mut(), std::ptr::null_mut(), &null_desc, at)
         } else {
@@ -2860,10 +2893,26 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
         Kind::Fence => v.extend_from_slice(&[("Signal", fence_signal as usize), ("SetEventOnCompletion", fence_set_event as usize)]),
         _ => {}
     }
-    if super::residency::eviction_enabled() {
+    let timing_hooks = cfg!(test) || super::gpu_timing::enabled();
+    if timing_hooks {
+        match kind {
+            Kind::CommandQueue => v.extend_from_slice(&[
+                ("Wait", q_timed_wait as usize),
+                ("Signal", q_timed_signal as usize),
+            ]),
+            Kind::Fence => v.push(("Release", timing_fence_release as usize)),
+            Kind::CommandList => v.extend_from_slice(&[
+                ("BeginRenderPass", cl_timed_begin_render_pass as usize),
+                ("EndRenderPass", cl_timed_end_render_pass as usize),
+                ("DispatchMesh", cl_timed_dispatch_mesh as usize),
+            ]),
+            _ => {}
+        }
+    }
+    if super::residency::eviction_enabled() || timing_hooks {
         match kind {
             Kind::CommandList | Kind::DmaList => residency_list::overrides(&mut v),
-            Kind::CommandQueue => v.extend_from_slice(&[
+            Kind::CommandQueue if super::residency::eviction_enabled() => v.extend_from_slice(&[
                 ("UpdateTileMappings", q_update_tile_mappings as usize),
                 ("CopyTileMappings", q_copy_tile_mappings as usize),
             ]),
@@ -2920,6 +2969,7 @@ macro_rules! as_usize {
 /// subsequent Reset and console calls dispatch through the current native table.
 unsafe extern "system" fn cl_close(this: *mut c_void) -> HRESULT {
     super::list_x::before_close(this);
+    super::gpu_timing::before_close(this);
     let ext = *(this as *const usize);
     let f: RefFn = std::mem::transmute(orig_fn(this, slot_of(this, "Close")));
     let hr = f(this) as HRESULT;
@@ -2942,6 +2992,7 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, in
     preserve_vtable(this, ext);
     if hr >= 0 {
         super::list_x::on_pc_reset(this);
+        super::gpu_timing::opened(this, initial_state as usize);
         super::residency::list_reset(this as usize);
         super::depth_uav::list_reset(this as usize);
     }
@@ -3090,6 +3141,15 @@ macro_rules! creator {
             }
             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
                 adopt(*ppv, $kind);
+                if $method == "CreateCommandList" {
+                    super::gpu_timing::opened(*ppv, [$($a,)*].get(3).copied().unwrap_or(0));
+                }
+                if $method == "CreateCommandQueue" || $method == "CreateCommandQueue1" {
+                    super::gpu_timing::queue_created(*ppv);
+                }
+                if $method == "CreateFence" && super::gpu_timing::enabled() {
+                    super::gpu_timing_waits::forget_fence(*ppv as usize);
+                }
             }
             hr
         }
@@ -3125,6 +3185,7 @@ pub(super) unsafe fn create_raw_pc_command_list(
         let hr = f(dev, 0, ty, alloc, init_pso, &iid, &mut out);
         if hr >= 0 && !out.is_null() {
             adopt(out, Kind::CommandList);
+            super::gpu_timing::opened(out, init_pso);
         }
         hr
     };
@@ -3580,7 +3641,11 @@ creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
 
 pub(super) unsafe fn create_residency_fence(dev: &ID3D12Device) -> windows::core::Result<ID3D12Fence> {
     if !is_ext(vt(dev.as_raw()) as usize) {
-        return dev.CreateFence(0, D3D12_FENCE_FLAG_NONE);
+        let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        if super::gpu_timing::enabled() {
+            super::gpu_timing_waits::forget_fence(fence.as_raw() as usize);
+        }
+        return Ok(fence);
     }
     let mut out = std::ptr::null_mut();
     let iid = pc_iid(Kind::Fence);
@@ -3973,6 +4038,7 @@ struct Governor {
 
 struct GovState {
     running: usize,
+    started: u64,
     giants: usize,
     /// compiles a bind waits for among `running`
     urgent: usize,
@@ -3988,8 +4054,71 @@ struct GovGuard {
     giant: bool,
     urgent: bool,
     available_at_idle_break: Option<u64>,
+    started: u64,
+    already_overlapping: bool,
+    commit_measure: Option<GiantCommitMeasure>,
     _running: crate::progress::Task,
     _large: Option<crate::progress::Task>,
+}
+
+struct GiantCommitMeasure {
+    shader: String,
+    dxil_len: usize,
+    baseline: u64,
+    began: std::time::Instant,
+}
+
+#[derive(Default)]
+struct CommitPeak {
+    bytes: u64,
+    samples: usize,
+}
+
+impl CommitPeak {
+    fn record(&mut self, bytes: u64) {
+        if bytes != 0 {
+            self.bytes = self.bytes.max(bytes);
+            self.samples += 1;
+        }
+    }
+
+    fn growth(&self, baseline: u64) -> Option<u64> {
+        (baseline != 0 && self.samples != 0).then(|| self.bytes.saturating_sub(baseline))
+    }
+}
+
+static GIANT_COMMIT: (Mutex<Vec<(u64, CommitPeak)>>, std::sync::Condvar) = (Mutex::new(Vec::new()), std::sync::Condvar::new());
+
+impl GiantCommitMeasure {
+    fn start(id: u64, shader: String, dxil_len: usize) -> Self {
+        static START: std::sync::Once = std::sync::Once::new();
+        START.call_once(|| {
+            let _ = std::thread::Builder::new().name("xcl-giant-commit".into()).spawn(|| loop {
+                let (active, ready) = &GIANT_COMMIT;
+                let mut active = ready.wait_while(active.lock().unwrap(), |active| active.is_empty()).unwrap();
+                let bytes = crate::util::process_commit_bytes();
+                for (_, peak) in active.iter_mut() {
+                    peak.record(bytes);
+                }
+                drop(active);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            });
+        });
+        let (active, ready) = &GIANT_COMMIT;
+        let mut active = active.lock().unwrap();
+        let baseline = crate::util::process_commit_bytes();
+        active.push((id, CommitPeak::default()));
+        ready.notify_one();
+        Self { shader, dxil_len, baseline, began: std::time::Instant::now() }
+    }
+
+    fn finish(id: u64) -> CommitPeak {
+        let mut active = GIANT_COMMIT.0.lock().unwrap();
+        let Some(index) = active.iter().position(|(key, _)| *key == id) else { return CommitPeak::default() };
+        let (_, mut peak) = active.swap_remove(index);
+        peak.record(crate::util::process_commit_bytes());
+        peak
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4325,20 +4454,23 @@ impl Governor {
         s.idle_breaker.started(id);
         // (a giant a bind waits for counts too: the background ones leave it its place)
         let giant = dxil_len >= GIANT_DXIL;
+        let already_overlapping = s.running != 0;
+        s.started = s.started.wrapping_add(1);
         s.running += 1;
         s.urgent += urgent as usize;
         s.giants += giant as usize;
         s.reserved += cost;
-        Ok(GovGuard { cost, giant, urgent, available_at_idle_break, _running: crate::progress::DRIVER.begin(), _large: giant.then(|| crate::progress::LARGE_DRIVER.begin()) })
+        Ok(GovGuard { cost, giant, urgent, available_at_idle_break, started: s.started, already_overlapping, commit_measure: None, _running: crate::progress::DRIVER.begin(), _large: giant.then(|| crate::progress::LARGE_DRIVER.begin()) })
     }
 
-    fn release(&self, g: &GovGuard) {
+    fn release(&self, g: &GovGuard) -> bool {
         let mut s = self.state.lock().unwrap();
         s.running -= 1;
         s.urgent -= g.urgent as usize;
         s.giants -= g.giant as usize;
         s.reserved -= g.cost;
         self.cv.notify_all();
+        g.already_overlapping || g.started != s.started
     }
 
     /// (compiles running, giants among them, urgent ones among them)
@@ -4374,7 +4506,19 @@ pub fn driver_compiles_summary() -> String {
 
 impl Drop for GovGuard {
     fn drop(&mut self) {
-        DRIVER_COMPILES.release(self);
+        let measure = self.commit_measure.take().map(|measure| {
+            let elapsed = measure.began.elapsed();
+            let peak = GiantCommitMeasure::finish(self.started);
+            (measure, elapsed, peak)
+        });
+        let overlapping = DRIVER_COMPILES.release(self);
+        if let Some((measure, elapsed, peak)) = measure {
+            let measured = peak.growth(measure.baseline).map_or_else(|| "unavailable".into(), |bytes| format!("+{} MiB", bytes >> 20));
+            crate::xlog_info!(
+                "D3D12.X: giant driver commit {} ({} B DXIL): estimated {} MiB, process private commit peak {measured} ({} samples over {} ms; other driver permits overlapped: {overlapping})",
+                measure.shader, measure.dxil_len, self.cost >> 20, peak.samples, elapsed.as_millis()
+            );
+        }
     }
 }
 
@@ -4419,7 +4563,7 @@ pub(super) fn background_room(least: usize) -> ParkedRoom {
 }
 
 static DRIVER_COMPILES: Governor = Governor {
-    state: Mutex::new(GovState { running: 0, giants: 0, urgent: 0, starving: 0, reserved: 0, idle_breaker: super::pso_sched::IdleBreaker::new() }),
+    state: Mutex::new(GovState { running: 0, started: 0, giants: 0, urgent: 0, starving: 0, reserved: 0, idle_breaker: super::pso_sched::IdleBreaker::new() }),
     cv: std::sync::Condvar::new(),
     #[cfg(test)]
     test_ram: None,
@@ -4594,7 +4738,7 @@ fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Re
         peer.set(urgent > 0 && super::pso_async::title_held() && super::pso_async::assisting_bind());
         background_floor_when(peer.get())
     });
-    let r = DRIVER_COMPILES.acquire_within(dxil_len, most, cap, warming.is_some(), floor, wait, || {
+    let mut r = DRIVER_COMPILES.acquire_within(dxil_len, most, cap, warming.is_some(), floor, wait, || {
         if run && (!background || super::pso_async::blocking_waiter()) {
             DriverDemand::Blocking
         } else if !background || super::pso_async::waited_on() {
@@ -4609,7 +4753,7 @@ fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Re
     if let Err(e) = &r {
         REFUSED.with(|c| c.set(Some(*e)));
     }
-    match r {
+    match &mut r {
         Err(Refused::NoRoom) => {
             if !crate::gpu::recomp::dxc::defer() {
                 super::pso_async::put_off(dxil_len);
@@ -4631,12 +4775,18 @@ fn driver_slot(dxil_len: usize, warm: bool, what: impl FnOnce() -> String) -> Re
             // (why its pipeline has no translated shader: `why_untranslated`, for the skipped dispatch)
             LAST_NOTE.with(|n| *n.borrow_mut() = Some(why));
         }
-        Ok(ref slot) => {
-            if let Some(available) = slot.available_at_idle_break {
-                crate::xlog_warn!(
-                    "D3D12.X: no driver compile in flight for {} ms; starting oldest blocked compile {} ({dxil_len} B DXIL, estimated peak {} MiB, {} MiB physical RAM available, {} MiB floor); this may page",
-                    super::pso_sched::IDLE_BREAK_GRACE.as_millis(), what(), slot.cost >> 20, available >> 20, URGENT_FLOOR >> 20
-                );
+        Ok(slot) => {
+            if (run && slot.giant) || slot.available_at_idle_break.is_some() {
+                let shader = what();
+                if let Some(available) = slot.available_at_idle_break {
+                    crate::xlog_warn!(
+                        "D3D12.X: no driver compile in flight for {} ms; starting oldest blocked compile {} ({dxil_len} B DXIL, estimated peak {} MiB, {} MiB physical RAM available, {} MiB floor); this may page",
+                        super::pso_sched::IDLE_BREAK_GRACE.as_millis(), shader, slot.cost >> 20, available >> 20, URGENT_FLOOR >> 20
+                    );
+                }
+                if run && slot.giant {
+                    slot.commit_measure = Some(GiantCommitMeasure::start(slot.started, shader, dxil_len));
+                }
             }
         }
     }
@@ -6223,9 +6373,15 @@ unsafe fn translated_graphics_pso(this: *mut c_void, f: PsoFn, desc: *const c_vo
     let n = note_translated_graphics(*ppv, rs);
     note_rect_list_gs(*ppv as usize, &copy, rect_gs.is_some());
     super::markers::note_graphics(*ppv as usize, crate::gpu::shader::fnv64(vs), shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64));
-    if super::present::trace_frame() {
+    let trace_frame = super::present::trace_frame();
+    let ps = if trace_frame || super::gpu_timing::enabled() {
         let ps = shader_bytes(&d.PS).map_or(0, crate::gpu::shader::fnv64);
         PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, (crate::gpu::shader::fnv64(vs), ps));
+        ps
+    } else {
+        0
+    };
+    if trace_frame {
         // the input layout (semantic index, format, slot, offset) – what the vertices are read as
         let il = &d.InputLayout;
         let elems: Vec<String> = if il.NumElements > 0 && !il.pInputElementDescs.is_null() {
@@ -6818,6 +6974,11 @@ unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const
     let hr = if console.is_some() { E_INVALIDARG } else { finish_pso(this, f, desc, riid, ppv) };
     if hr >= 0 && !ppv.is_null() {
         note_untranslated(*ppv as usize, "a PC compute shader (no console code to translate)".into());
+        if super::gpu_timing::enabled() && !(*ppv).is_null() && crate::gpu::shader::readable(desc as usize, size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
+            if let Some(cs) = shader_bytes(&(*(desc as *const D3D12_COMPUTE_PIPELINE_STATE_DESC)).CS) {
+                super::dispatch_timing::note(*ppv as usize, cs);
+            }
+        }
     }
     if hr >= 0 || !crate::gpu::shader::readable(desc as usize, std::mem::size_of::<D3D12_COMPUTE_PIPELINE_STATE_DESC>()) {
         return hr;
@@ -7104,7 +7265,7 @@ unsafe fn translated_vertex_stream(this: *mut c_void, f: PsoFn, subs: &[(u32, &[
         if kept_gs {
             RECT_LIST_GS.lock().unwrap().get_or_insert_with(HashSet::new).insert(*ppv as usize);
         }
-        if super::present::trace_frame() {
+        if super::present::trace_frame() || super::gpu_timing::enabled() {
             PSO_SHADERS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, hashes);
         }
         super::markers::note_graphics(*ppv as usize, hashes.0, hashes.1);
@@ -8127,6 +8288,11 @@ unsafe extern "system" fn dev_create_rtv(this: *mut c_void, res: *mut c_void, de
 unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *const [f32; 4], n: u32, rects: *const c_void) {
     type F = unsafe extern "system" fn(*mut c_void, usize, *const [f32; 4], u32, *const c_void);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ClearRenderTargetView")));
+    if super::present::writer_trace_active() {
+        if let Some(r) = super::present::rtv_resource(rtv) {
+            super::present::record_plane_write(this as usize, r, "RTV clear", 0, vec![format!("colour {:?}, {n} rects", color.as_ref())]);
+        }
+    }
     if super::present::trace_frame() {
         static N: AtomicU64 = AtomicU64::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -8136,7 +8302,7 @@ unsafe extern "system" fn cl_clear_rtv(this: *mut c_void, rtv: usize, color: *co
             super::present::note_use(r, super::present::USE_CLEAR);
         }
     }
-    f(this, rtv, color, n, rects)
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, rtv, color, n, rects))
 }
 
 unsafe extern "system" fn cl_om_set_render_targets(this: *mut c_void, n: u32, rtvs: *const usize, single: i32, dsv: *const usize) {
@@ -8175,6 +8341,7 @@ unsafe extern "system" fn cl_set_pipeline_state(this: *mut c_void, pso: *mut c_v
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "SetPipelineState")));
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_set_pipeline_state(this, pso as usize);
+    super::gpu_timing::pipeline(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
@@ -8183,6 +8350,7 @@ unsafe extern "system" fn cl_clear_state(this: *mut c_void, pso: *mut c_void) {
     f(this, super::pso_async::resolve_for_bind(pso as usize) as *mut c_void);
     super::list_x::on_clear_state(this, pso as usize);
     super::bind::clear_state(this, pso as usize);
+    super::gpu_timing::pipeline(this, pso as usize);
 }
 
 unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icount: u32, sv: u32, si: u32) {
@@ -8190,7 +8358,7 @@ unsafe extern "system" fn cl_draw_instanced(this: *mut c_void, vcount: u32, icou
     super::depth_uav::note_op(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawInstanced")));
-    f(this, vcount, icount, sv, si);
+    super::gpu_timing::op(this, super::gpu_timing::Kind::Draw, || 0, || f(this, vcount, icount, sv, si));
 }
 
 unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u32, inst: u32, si: u32, bv: i32, sinst: u32) {
@@ -8198,7 +8366,7 @@ unsafe extern "system" fn cl_draw_indexed_instanced(this: *mut c_void, icount: u
     super::depth_uav::note_op(this);
     type F = unsafe extern "system" fn(*mut c_void, u32, u32, u32, i32, u32);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "DrawIndexedInstanced")));
-    f(this, icount, inst, si, bv, sinst);
+    super::gpu_timing::op(this, super::gpu_timing::Kind::Draw, || 0, || f(this, icount, inst, si, bv, sinst));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8216,13 +8384,53 @@ unsafe extern "system" fn cl_execute_indirect(
     super::depth_uav::note_op(this);
     type F = unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut c_void, u64, *mut c_void, u64);
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "ExecuteIndirect")));
-    f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off);
+    super::gpu_timing::op(this, super::gpu_timing::Kind::Indirect, || 0, || f(this, sig, max_count, arg_buf, arg_off, cnt_buf, cnt_off));
+}
+
+unsafe extern "system" fn cl_timed_begin_render_pass(
+    this: *mut c_void,
+    count: u32,
+    targets: *const D3D12_RENDER_PASS_RENDER_TARGET_DESC,
+    depth: *const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC,
+    flags: D3D12_RENDER_PASS_FLAGS,
+) {
+    let slot = std::mem::offset_of!(ID3D12GraphicsCommandList4_Vtbl, BeginRenderPass) / size_of::<usize>();
+    let (target, adopted) = original_or_native(this, slot);
+    let f: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RENDER_PASS_RENDER_TARGET_DESC, *const D3D12_RENDER_PASS_DEPTH_STENCIL_DESC, D3D12_RENDER_PASS_FLAGS) =
+        std::mem::transmute(target);
+    f(this, count, targets, depth, flags);
+    if adopted {
+        super::gpu_timing::render_pass(this, Some(flags));
+    }
+}
+
+unsafe extern "system" fn cl_timed_end_render_pass(this: *mut c_void) {
+    let slot = std::mem::offset_of!(ID3D12GraphicsCommandList4_Vtbl, EndRenderPass) / size_of::<usize>();
+    let (target, adopted) = original_or_native(this, slot);
+    let f: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(target);
+    f(this);
+    if adopted {
+        super::gpu_timing::render_pass(this, None);
+    }
+}
+
+unsafe extern "system" fn cl_timed_dispatch_mesh(this: *mut c_void, x: u32, y: u32, z: u32) {
+    let slot = std::mem::offset_of!(ID3D12GraphicsCommandList6_Vtbl, DispatchMesh) / size_of::<usize>();
+    let (target, adopted) = original_or_native(this, slot);
+    let f: unsafe extern "system" fn(*mut c_void, u32, u32, u32) =
+        std::mem::transmute(target);
+    if !adopted {
+        return f(this, x, y, z);
+    }
+    super::gpu_timing::op_grid(this, super::gpu_timing::Kind::Draw, || 0, [x, y, z], || f(this, x, y, z));
 }
 
 unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
+    let timing = super::gpu_timing::list_token(this);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::gpu_timing::list_released(timing);
         super::residency::list_reset(this as usize);
         super::depth_uav::list_reset(this as usize);
         super::list_x::on_release(this as usize);
@@ -8232,9 +8440,11 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
 }
 
 unsafe extern "system" fn q_release(this: *mut c_void) -> u32 {
+    let timing = super::gpu_timing::queue_token(this);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
     let n = f(this);
     if n == 0 {
+        super::gpu_timing::queue_released(timing);
         super::residency::queue_released(this as usize);
         super::list_x::on_queue_release(this as usize);
         super::cpu_writes::forget_queue(this as usize);
@@ -8401,9 +8611,11 @@ unsafe fn queue_dispatch(slot: usize, this: *mut c_void, a1: usize, a2: usize, a
                     super::fence_x::note_queue_signal(a1, a2 as u64);
                     super::list_x::note_title_queue_signal(this as usize, a1, a2 as u64);
                     super::wait_trace::signal(a1, a2 as u64, "queue Signal");
+                    note_profiled_gpu_signal(this, a1, a2 as u64);
                 } else {
                     super::fence_x::note_queue_wait(a1, a2 as u64);
                     super::list_x::note_title_queue_wait(this as usize, a1, a2 as u64);
+                    note_profiled_gpu_wait(this, a1, a2 as u64);
                 }
             }
             hr as u32 as usize
@@ -8496,6 +8708,7 @@ unsafe extern "system" fn q_signal_x(this: *mut c_void, fence: *mut c_void, valu
         super::fence_x::note_queue_signal(fence as usize, value);
         super::list_x::note_title_queue_signal(this as usize, fence as usize, value);
         super::wait_trace::signal(fence as usize, value, "queue SignalX");
+        note_profiled_gpu_signal(this, fence as usize, value);
     }
     hr
 }
@@ -8506,8 +8719,26 @@ unsafe extern "system" fn fence_signal(this: *mut c_void, value: u64) -> HRESULT
     let hr = f(this, value);
     super::fence_x::note_cpu_signal(this as usize);
     super::wait_trace::signal(this as usize, value, "CPU Signal");
+    if hr >= 0 && super::gpu_timing::enabled() {
+        super::gpu_timing_waits::signal(None, super::gpu_timing::epoch(), this as usize, value);
+    }
     super::single::poke();
     hr
+}
+
+unsafe extern "system" fn timing_fence_release(this: *mut c_void) -> u32 {
+    let (target, adopted) = original_or_native(this, 2);
+    let cookie = (adopted && super::gpu_timing::enabled())
+        .then(|| super::gpu_timing_waits::fence_cookie(this as usize))
+        .flatten();
+    let f: RefFn = std::mem::transmute(target);
+    let refs = f(this);
+    if refs == 0 {
+        if let Some(cookie) = cookie {
+            super::gpu_timing_waits::forget_fence_if(this as usize, cookie);
+        }
+    }
+    refs
 }
 
 /// Fence::SetEventOnCompletion (`XCL_TRACE_WAITS`: followed; without an event it blocks, timed)
@@ -8536,7 +8767,7 @@ unsafe extern "system" fn q_update_tile_mappings(
     let this = super::single::host_after_held(this, "UpdateTileMappings");
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "UpdateTileMappings")));
     super::residency::link(resource as usize, heap as usize);
-    f(this, resource, n, coordinates, regions, heap, ranges, range_flags, offsets, counts, flags);
+    note_profiled_queue_hole(this, || f(this, resource, n, coordinates, regions, heap, ranges, range_flags, offsets, counts, flags));
 }
 
 unsafe extern "system" fn q_copy_tile_mappings(
@@ -8549,7 +8780,48 @@ unsafe extern "system" fn q_copy_tile_mappings(
     let this = super::single::host_after_held(this, "CopyTileMappings");
     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "CopyTileMappings")));
     super::residency::copy_links(dst as usize, src as usize);
-    f(this, dst, dst_coord, src, src_coord, region, flags);
+    note_profiled_queue_hole(this, || f(this, dst, dst_coord, src, src_coord, region, flags));
+}
+
+unsafe fn note_profiled_queue_hole(queue: *mut c_void, f: impl FnOnce()) {
+    let token = super::gpu_timing::queue_stamp(queue)
+        .map(|(epoch, id)| (id, super::gpu_timing_waits::submitted(id, epoch)));
+    f();
+    if let Some((id, seq)) = token {
+        super::gpu_timing_waits::returned(id, seq);
+    }
+}
+
+pub(super) unsafe fn note_profiled_gpu_wait(queue: *mut c_void, fence: usize, value: u64) {
+    if let Some((epoch, id)) = super::gpu_timing::wait(queue) {
+        super::gpu_timing_waits::wait(id, epoch, fence, value);
+    }
+}
+
+unsafe fn note_profiled_gpu_signal(queue: *mut c_void, fence: usize, value: u64) {
+    if let Some((epoch, id)) = super::gpu_timing::queue_stamp(queue) {
+        super::gpu_timing_waits::signal(Some(id), epoch, fence, value);
+    }
+}
+
+unsafe extern "system" fn q_timed_wait(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let (target, adopted) = original_or_native(this, 15);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(target);
+    let hr = f(this, fence, value);
+    if adopted && hr >= 0 {
+        note_profiled_gpu_wait(this, fence as usize, value);
+    }
+    hr
+}
+
+unsafe extern "system" fn q_timed_signal(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+    let (target, adopted) = original_or_native(this, 14);
+    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(target);
+    let hr = f(this, fence, value);
+    if adopted && hr >= 0 {
+        note_profiled_gpu_signal(this, fence as usize, value);
+    }
+    hr
 }
 
 unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
@@ -8588,7 +8860,8 @@ pub(super) unsafe fn execute_mapped(this: *mut c_void, mapped: &[*mut c_void]) {
     let submission = super::residency::before_submit(this, mapped);
     super::list_x::execute_with_waits_on(this, mapped, |chunk| {
         super::markers::submitted(this as usize, chunk);
-        f(this, chunk.len() as u32, chunk.as_ptr());
+        super::gpu_timing::submit(this, chunk, || f(this, chunk.len() as u32, chunk.as_ptr()));
+        super::present::submit_plane_writes(this, chunk);
         super::list_x::signal_write64_fences(this, chunk);
         super::list_x::readback_sparse_writes(this, chunk);
         super::list_x::cpu_writes_after(this, chunk);
@@ -8790,11 +9063,11 @@ mod pipeline_state_console_tests {
     }
 
     #[test]
-    fn an_unmeasured_giant_is_expected_to_need_3_3_gb_for_each_mb() {
-        // (the measured sizes: `pso_sched::peak`'s own tests)
+    fn the_compile_budget_uses_the_calibrated_curve_and_keeps_the_unmeasured_bound() {
+        use super::super::pso_sched::{peak_at, SMALL_PEAK_PER_BYTE};
         assert_eq!(peak(6 << 20), 6 * 3380 << 20);
-        assert_eq!(peak(GIANT_DXIL), 2 << 30);
-        assert_eq!(super::super::pso_sched::peak_at(1000, super::super::pso_sched::SMALL_PEAK_PER_BYTE), 128 << 20);
+        assert_eq!(peak_at(GIANT_DXIL, SMALL_PEAK_PER_BYTE), 911 << 20);
+        assert_eq!(peak_at(1000, SMALL_PEAK_PER_BYTE), 128 << 20);
     }
 }
 
@@ -9034,10 +9307,14 @@ mod device_abi_tests {
             let view = buffer_view(resource.as_raw() as usize, Default::default(), 0, bytes / 4, 0, true);
             assert_eq!(view[2], bytes);
 
-            let mut overlapping = std::ptr::null_mut();
+            // a second buffer over the same memory: the same memory on the console, the same
+            // video memory here (it was refused)
+            let mut second = std::ptr::null_mut();
             assert_eq!(super::super::device_x::create_placed_resource_layout_x(raw, title as u64, desc.as_ptr(),
-                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut overlapping), crate::util::E_INVALIDARG);
-            assert!(overlapping.is_null());
+                D3D12_BARRIER_LAYOUT_UNDEFINED, std::ptr::null(), &iid, &mut second), S_OK);
+            let second = ID3D12Resource::from_raw(second);
+            assert_eq!(console_buffer(second.as_raw() as usize), Some((mirror, bytes as usize)));
+            assert_eq!(res_gpu_va_x(second.as_raw()), mirror as u64);
 
             let queue: ID3D12CommandQueue = ID3D12Device::from_raw_borrowed(&raw).unwrap()
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).unwrap();
@@ -9050,9 +9327,23 @@ mod device_abi_tests {
             super::super::sparse::readback_after_execute(&queue, &[(mirror + offset, 1)]);
             assert_eq!(mirrored.read(), 0xc3, "the updated byte reached video memory");
 
+            // the first goes: the mirror and its video memory stay, in step, for the second
             drop(resource);
+            title.byte_add(offset).cast::<u8>().write(0x3c);
+            super::super::title_textures::refresh(queue.as_raw());
+            assert_eq!(mirrored.read(), 0x3c);
+            mirrored.write(0);
+            super::super::sparse::readback_after_execute(&queue, &[(mirror + offset, 1)]);
+            assert_eq!(mirrored.read(), 0x3c, "the mirror outlives the buffer it was made for");
+            let mut mapped = std::ptr::null_mut();
+            second.Map(0, Some(&D3D12_RANGE { Begin: offset, End: offset + 1 }), Some(&mut mapped)).unwrap();
+            assert_eq!(mapped, title);
+            assert_eq!(title.byte_add(offset).cast::<u8>().read(), 0x3c);
+            second.Unmap(0, None);
+
+            drop(second);
             assert_eq!(crate::hle::kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
-            assert!(!crate::hle::kernelx::in_graphics_reservation(title as usize));
+            crate::hle::kernelx::in_released_memory(allocation as usize, 0x100000, || assert!(!crate::hle::kernelx::in_graphics_reservation(title as usize)));
         }
     }
 
@@ -9105,7 +9396,7 @@ mod device_abi_tests {
 
             drop(resource);
             assert_eq!(kernelx::VirtualFree(allocation, 0, MEM_RELEASE), 1);
-            assert!(!kernelx::in_graphics_reservation(title as usize));
+            kernelx::in_released_memory(allocation as usize, uma::MAX_WINDOWS * uma::WINDOW + uma::GRAIN, || assert!(!kernelx::in_graphics_reservation(title as usize)));
             assert_eq!(kernelx::XMemFreePhysicalPages(count, pages.as_mut_ptr()), 1);
         }
     }
@@ -10476,7 +10767,37 @@ mod governor_tests {
     use super::*;
 
     fn governor() -> Governor {
-        Governor { state: Mutex::new(GovState { running: 0, giants: 0, urgent: 0, starving: 0, reserved: 0, idle_breaker: super::super::pso_sched::IdleBreaker::new() }), cv: std::sync::Condvar::new(), test_ram: None }
+        Governor { state: Mutex::new(GovState { running: 0, started: 0, giants: 0, urgent: 0, starving: 0, reserved: 0, idle_breaker: super::super::pso_sched::IdleBreaker::new() }), cv: std::sync::Condvar::new(), test_ram: None }
+    }
+
+    #[test]
+    fn giant_commit_keeps_the_peak_and_reports_missing_samples() {
+        let mut peak = CommitPeak::default();
+        peak.record(0);
+        assert_eq!(peak.growth(1000), None);
+        for bytes in [1300, 1700, 0, 900] {
+            peak.record(bytes);
+        }
+        assert_eq!(peak.samples, 3);
+        assert_eq!(peak.growth(1000), Some(700));
+        assert_eq!(peak.growth(1800), Some(0));
+        assert_eq!(peak.growth(0), None);
+    }
+
+    #[test]
+    fn compile_permits_report_overlap_even_after_the_other_releases() {
+        let g = Governor { test_ram: Some((AtomicU64::new(16 << 30), 32 << 30)), ..governor() };
+        let first = g.acquire(GIANT_DXIL, 4, None, false, || true).unwrap();
+        let second = g.acquire(1 << 10, 4, None, false, || true).unwrap();
+        let second_overlapped = g.release(&second);
+        let first_overlapped = g.release(&first);
+        std::mem::forget(second);
+        std::mem::forget(first);
+        assert!(second_overlapped && first_overlapped);
+        let alone = g.acquire(GIANT_DXIL, 4, None, false, || true).unwrap();
+        let alone_overlapped = g.release(&alone);
+        std::mem::forget(alone);
+        assert!(!alone_overlapped);
     }
 
     #[test]
@@ -10517,9 +10838,9 @@ mod governor_tests {
 
     #[test]
     fn an_idle_governor_grants_one_over_budget_compile_to_unblock_a_bind() {
-        let available = 4_608 << 20;
-        let g = Governor { test_ram: Some((AtomicU64::new(available), 32 << 30)), ..governor() };
         let giant = 3_241_524;
+        let available = URGENT_FLOOR + peak(giant) - (256 << 20);
+        let g = Governor { test_ram: Some((AtomicU64::new(available), 32 << 30)), ..governor() };
         let test_ram = &g.test_ram.as_ref().unwrap().0;
         let (send, receive) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {

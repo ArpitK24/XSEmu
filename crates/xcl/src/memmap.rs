@@ -15,6 +15,7 @@
 //! free: a reservation recorded there went back without XCL seeing it).
 
 use std::collections::BTreeMap;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
@@ -126,6 +127,33 @@ pub fn released(start: usize) {
     }
 }
 
+/// What `take` forgot of a reservation: its span and what was committed in it.
+pub struct Taken {
+    start: usize,
+    end: usize,
+    committed: Vec<(usize, usize, Access)>,
+}
+
+/// `released`, keeping what is forgotten so that `restore` can put it back – for a release
+/// that Windows may still refuse (None: no reservation was recorded at `start`).
+pub fn take(start: usize) -> Option<Taken> {
+    let mut g = write();
+    let end = g.known.remove(&start)?;
+    let committed = g.committed.range(..end).rev().take_while(|(_, &(e, _))| e > start).map(|(&s, &(e, acc))| (s.max(start), e.min(end), acc)).collect();
+    g.cut(start, end);
+    Some(Taken { start, end, committed })
+}
+
+/// The reservation `take` forgot is there after all, with what was committed in it.
+pub fn restore(t: Taken) {
+    let mut g = write();
+    g.cut(t.start, t.end);
+    g.known.insert(t.start, t.end);
+    for (a, b, acc) in t.committed {
+        g.put(a, b, acc);
+    }
+}
+
 /// The reservation holding `at` (start, end), if XCL made it.
 pub fn reservation(at: usize) -> Option<(usize, usize)> {
     read().known.range(..=at).next_back().filter(|(_, &e)| at < e).map(|(&s, &e)| (s, e))
@@ -229,9 +257,174 @@ pub fn counts() -> (u64, u64) {
     (ANSWERED.load(Ordering::Relaxed), ASKED.load(Ordering::Relaxed))
 }
 
+// --- XCL's own reads and writes of the title's memory --------------------------------------
+
+/// Copy `[src, src + len)` into `dst` without faulting if another thread unmaps or
+/// decommits a page concurrently: `ReadProcessMemory` catches the fault in kernel mode and returns
+/// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
+/// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
+/// calls and only unreadable pages are zeroed.
+pub(crate) unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    const PAGE: usize = 0x1000;
+
+    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let mut read = 0usize;
+        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
+            return;
+        }
+        let read = read.min(len);
+        let src = src + read;
+        let dst = dst.add(read);
+        let len = len - read;
+        let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
+        if page_end == src + len {
+            std::ptr::write_bytes(dst, 0, len);
+            return;
+        }
+        let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
+        let left = mid - src;
+        copy_rec(proc, src, dst, left);
+        copy_rec(proc, mid, dst.add(left), len - left);
+    }
+
+    copy_rec(GetCurrentProcess(), src, dst, len);
+}
+
+/// The committed, readable runs (start, end) of `len` bytes at `at`.
+pub(crate) unsafe fn committed_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+    let Some(limit) = at.checked_add(len) else { return Vec::new() };
+    // (the coherent window is committed as a whole, and what XCL recorded needs no
+    // `VirtualQuery`, which sizes a region by walking it)
+    if let Some(runs) = readable_runs(at, len) {
+        return runs;
+    }
+    let mut out = Vec::new();
+    let mut p = at;
+    while p < limit {
+        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
+            break;
+        }
+        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
+        if end <= p {
+            break;
+        }
+        // R / RW / WC / X-R…, no guard
+        if m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0 {
+            out.push((p, end));
+        }
+        p = end;
+    }
+    out
+}
+
+/// The title's `out.len()` bytes at `at` into `out`, as far as they are there: what the title
+/// unmaps, decommits or frees meanwhile – and what was never committed – is zeros. Windows makes
+/// the copy and answers for memory that is gone; "readable" a moment ago is not readable now.
+/// Every read XCL makes of the title's memory on its own schedule goes through here or through
+/// `title_bytes` (a fault-safe copy, not one moment's picture of a batch of mappings).
+pub fn copy_title(at: usize, out: &mut [u8]) {
+    // SAFETY: Windows writes `out` only, and reads the title's memory for itself
+    unsafe { copy_title_now(at, out) }
+}
+
+unsafe fn copy_title_now(at: usize, out: &mut [u8]) {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    let len = out.len();
+    if len == 0 {
+        return;
+    }
+    if at.checked_add(len).is_none() {
+        out.fill(0);
+        return;
+    }
+    let mut read = 0;
+    if ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr().cast(), len, &mut read) != 0 && read == len {
+        return;
+    }
+    let mut pos = 0;
+    for (lo, hi) in committed_runs(at, len) {
+        out[pos..lo - at].fill(0);
+        copy_committed_region(lo, out.as_mut_ptr().add(lo - at), hi - lo);
+        pos = hi - at;
+    }
+    out[pos..].fill(0);
+}
+
+/// `len` bytes of the title's at `at`, all of them or none (None: some are not there – now).
+pub fn title_bytes(at: usize, len: usize) -> Option<Vec<u8>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    at.checked_add(len)?;
+    let mut out = vec![0u8; len];
+    let mut read = 0;
+    // SAFETY: Windows writes `out` only, and reads the title's memory for itself
+    let ok = len == 0 || unsafe { ReadProcessMemory(GetCurrentProcess(), at as *const c_void, out.as_mut_ptr().cast(), len, &mut read) } != 0 && read == len;
+    ok.then_some(out)
+}
+
+/// `n` 32-bit words of the title's at `at` (`title_bytes`).
+pub fn title_words(at: usize, n: usize) -> Option<Vec<u32>> {
+    let bytes = title_bytes(at, n.checked_mul(4)?)?;
+    Some(bytes.chunks_exact(4).map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]])).collect())
+}
+
+#[link(name = "ntdll", kind = "raw-dylib")]
+extern "system" {
+    fn NtWriteVirtualMemory(process: *mut c_void, base: *mut c_void, buffer: *const c_void, len: usize, written: *mut usize) -> i32;
+}
+
+/// `bytes` into the title's memory at `at`, written by Windows: false – and nothing more
+/// written – where the title has unmapped, decommitted or freed it meanwhile. (Pages committed
+/// on first use are committed first: Windows does not come by XCL's handler for them.)
+///
+/// # Safety
+/// `[at, at + bytes.len())` is the title's memory, which XCL may write.
+pub unsafe fn write_title(at: usize, bytes: &[u8]) -> bool {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    if bytes.is_empty() {
+        return true;
+    }
+    crate::hle::kernelx::lazy::ensure(at, bytes.len());
+    let mut written = 0;
+    NtWriteVirtualMemory(GetCurrentProcess(), at as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut written) >= 0 && written == bytes.len()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reservation taken out for a release and put back (Windows refused) is as it was: its
+    /// span and what is committed in it, a run shared with the reservation before it included.
+    #[test]
+    fn a_reservation_taken_and_restored_keeps_what_is_committed() {
+        let (a, b) = (0x7E10_0000_0000usize, 0x7E10_0001_0000usize);
+        reserved(a, 0x1_0000);
+        reserved(b, 0x1_0000);
+        committed(a + 0xF000, 0x1000, PAGE_READWRITE);
+        committed(b, 0x3000, PAGE_READWRITE);
+        committed(b + 0x8000, 0x1000, PAGE_READWRITE);
+        let before = (access(b, 0x3000), access(b + 0x3000, 0x1000), access(b + 0x8000, 0x1000), readable_runs(a, 0x2_0000));
+        assert_eq!(before.0, Some(Access::Write));
+        assert_eq!(before.1, Some(Access::None));
+        let taken = take(b).unwrap();
+        assert_eq!(reservation(b), None);
+        assert_eq!(access(b, 0x1000), None, "forgotten: Windows is asked");
+        assert_eq!(access(a + 0xF000, 0x1000), Some(Access::Write), "the reservation before it keeps its part of the run");
+        restore(taken);
+        assert_eq!(reservation(b), Some((b, b + 0x1_0000)));
+        assert_eq!((access(b, 0x3000), access(b + 0x3000, 0x1000), access(b + 0x8000, 0x1000), readable_runs(a, 0x2_0000)), before);
+        assert!(take(b + 0x1000).is_none(), "only a reservation's start");
+        released(a);
+        released(b);
+    }
 
     #[test]
     fn commits_merge_split_and_answer() {

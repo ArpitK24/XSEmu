@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::Duration;
 
 use windows::core::{Interface, Owned};
@@ -46,6 +46,7 @@ struct Job {
     value: u64,
     writes: Vec<Write>,
     timestamp_hz: u64,
+    calibration: Option<(u64, u64, i64)>,
 }
 
 struct QueueFence {
@@ -80,7 +81,7 @@ fn spawn_queue_worker(dev: ID3D12Device, fence: ID3D12Fence) -> std::io::Result<
                 }
             }
             for w in job.writes {
-                write_now(w, job.timestamp_hz);
+                write_now(w, job.timestamp_hz, job.calibration);
             }
         }
     })?;
@@ -108,7 +109,7 @@ fn access(va: usize, bytes: usize) -> Access {
 }
 
 /// `w`, if its memory is still there.
-unsafe fn write_now(w: Write, timestamp_hz: u64) {
+unsafe fn write_now(w: Write, timestamp_hz: u64, calibration: Option<(u64, u64, i64)>) {
     match w {
         Write::Immediate(va, words) => {
             if access(va, 4 * words.len()) != Access::Write {
@@ -157,6 +158,9 @@ unsafe fn write_now(w: Write, timestamp_hz: u64) {
             let ms = (end - start) as f64 * 1000.0 / timestamp_hz as f64;
             let at = at.map_or(String::new(), |(slot, generation, op)| format!(" slot {slot}/{generation} op {}", op + 1));
             crate::xlog_info!("GPU dispatch timing: CS {shader:016x}{at} groups {x}x{y}x{z}: {ms:.3} ms");
+            if let Some((gpu, qpc, qpc_hz)) = calibration {
+                crate::xlog_info!("GPU dispatch clock: CS {shader:016x}{at} groups {x}x{y}x{z}: gpu_start={start} gpu_end={end} gpu_ref={gpu} qpc_ref={qpc} gpu_hz={timestamp_hz} qpc_hz={qpc_hz}");
+            }
         }
     }
 }
@@ -184,6 +188,17 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
     } else {
         0
     };
+    static QPC_TRACE: OnceLock<bool> = OnceLock::new();
+    let calibration = if timestamp_hz != 0 && *QPC_TRACE.get_or_init(|| {
+        std::env::var("XCL_GPU_DISPATCH_QPC").is_ok_and(|s| s.trim() == "1")
+    }) {
+        let (mut gpu, mut qpc, mut qpc_hz) = (0, 0, 0);
+        (windows_sys::Win32::System::Performance::QueryPerformanceFrequency(&mut qpc_hz) != 0
+            && qpc_hz > 0 && q.GetClockCalibration(&mut gpu, &mut qpc).is_ok())
+            .then_some((gpu, qpc, qpc_hz))
+    } else {
+        None
+    };
     let mut g = FENCES.lock().unwrap();
     let m = g.get_or_insert_with(HashMap::new);
     let entry = match m.entry(queue as usize) {
@@ -207,7 +222,7 @@ pub(super) unsafe fn after(queue: *mut c_void, writes: Vec<Write>) {
     };
     entry.value += 1;
     if q.Signal(&entry.fence, entry.value).is_ok() {
-        let _ = entry.tx.send(Job { value: entry.value, writes, timestamp_hz });
+        let _ = entry.tx.send(Job { value: entry.value, writes, timestamp_hz, calibration });
     }
 }
 
@@ -234,7 +249,7 @@ mod tests {
             assert!(writable(va, 8));
             after(q.as_raw(), vec![Write::Immediate(va, vec![7, 9])]);
             let t = std::time::Instant::now();
-            while (*(va as *const AtomicU32)).load(Ordering::Acquire) != 7 {
+            while (*((va + 4) as *const AtomicU32)).load(Ordering::Acquire) != 9 {
                 assert!(t.elapsed().as_secs() < 5, "never written");
                 std::thread::yield_now();
             }

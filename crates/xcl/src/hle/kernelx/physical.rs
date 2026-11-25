@@ -1359,10 +1359,11 @@ mod tests {
             assert!(super::super::in_graphics_reservation(fill), "memory committed beside the pages is write-watched");
             std::ptr::write_volatile((fill + 0x1000) as *mut u32, 1);
             assert_eq!(written_pages(fill, PHYS_PAGE), vec![fill + 0x1000]);
+            // (released memory is the next allocation's, of any test: looked at while nobody has it)
             assert_eq!(free_in_reservation(fill, 0, mem::MEM_RELEASE), Some(1));
-            assert!(!super::super::in_graphics_reservation(fill));
+            super::super::in_released_memory(fill, 4 * PHYS_PAGE, || assert!(!super::super::in_graphics_reservation(fill) && !in_reservation(fill)));
             assert_eq!(free_in_reservation(pool, 0, mem::MEM_RELEASE), Some(1));
-            assert!(!in_reservation(pool));
+            super::super::in_released_memory(pool, 4 * PHYS_PAGE, || assert!(!in_reservation(pool)));
             assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
             assert!(!pages_allocated(&pages));
             validate_physical().unwrap();

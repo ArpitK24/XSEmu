@@ -302,6 +302,9 @@ fn pipeline() -> Option<(usize, usize)> {
                     ..Default::default()
                 };
                 let pso: ID3D12PipelineState = dev.CreateComputePipelineState(&desc).map_err(|e| format!("pipeline: {e}"))?;
+                if super::gpu_timing::enabled() {
+                    super::dispatch_timing::note(pso.as_raw() as usize, &code);
+                }
                 Ok((rs.into_raw() as usize, pso.into_raw() as usize))
             })
         })();

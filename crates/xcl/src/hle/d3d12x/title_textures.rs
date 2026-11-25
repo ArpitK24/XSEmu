@@ -77,6 +77,8 @@ struct CpuColorView {
     state: D3D12_RESOURCE_STATES,
 }
 
+use crate::memmap::{committed_runs, copy_title};
+
 static CPU_COLOR_VIEWS: Mutex<BTreeMap<usize, CpuColorView>> = Mutex::new(BTreeMap::new());
 
 /// textures waiting for their first upload
@@ -837,8 +839,7 @@ unsafe fn refresh_once(queue: *mut c_void) {
                 let size = e.tex.size() as usize;
                 (0..16usize)
                     .map(|k| e.src + (size.saturating_sub(4096)) * k / 15)
-                    .filter(|&a| crate::gpu::shader::readable(a, 4096))
-                    .map(|a| std::slice::from_raw_parts(a as *const u8, 4096).iter().filter(|&&b| b != 0).count())
+                    .map(|a| with_title_bytes(a, 4096, |bytes| bytes.iter().filter(|&&b| b != 0).count()))
                     .sum()
             };
             let (mut with, mut without) = (0, 0);
@@ -981,7 +982,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
             // retail title's video planes and UI targets went up again for every submit, ~25 MB
             // a presented frame where ~3 MB had changed, and the submits waited here.
             if unchanged_skip() {
-                let h = content_hash(&title_bytes(va, tex.size() as usize));
+                let h = with_title_bytes(va, tex.size() as usize, content_hash);
                 if same_as_last_upload(r.as_raw() as usize, h) {
                     let n = UNCHANGED.fetch_add(1, Ordering::Relaxed) + 1;
                     if n == 1 || (n.is_power_of_two() && n >= 1024) {
@@ -1189,81 +1190,12 @@ fn watch_ranges(regions: &[(usize, usize)], mut wanted: Vec<(usize, usize)>) -> 
     out
 }
 
-/// Copy `[src, src + len)` into `dst` (pre-zeroed) without faulting if another thread unmaps or
-/// decommits a page concurrently: `ReadProcessMemory` catches the fault in kernel mode and returns
-/// `0`. Because Windows may return `read == 0` when a fault occurs later in the span, binary-split
-/// failed multi-page ranges at 4 KiB boundaries so all still-committed pages are copied in O(log N)
-/// calls and only unreadable pages stay zeroed.
-unsafe fn copy_committed_region(src: usize, dst: *mut u8, len: usize) {
-    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    const PAGE: usize = 0x1000;
-
-    unsafe fn copy_rec(proc: *mut c_void, src: usize, dst: *mut u8, len: usize) {
-        if len == 0 {
-            return;
-        }
-        let mut read = 0usize;
-        if ReadProcessMemory(proc, src as *const c_void, dst as *mut c_void, len, &mut read) != 0 {
-            return;
-        }
-        let read = read.min(len);
-        let src = src + read;
-        let dst = dst.add(read);
-        let len = len - read;
-        let page_end = (src & !(PAGE - 1)).saturating_add(PAGE).min(src + len);
-        if page_end == src + len {
-            return;
-        }
-        let mid = ((src + len / 2) & !(PAGE - 1)).max(page_end);
-        let left = mid - src;
-        copy_rec(proc, src, dst, left);
-        copy_rec(proc, mid, dst.add(left), len - left);
-    }
-
-    copy_rec(GetCurrentProcess(), src, dst, len);
-}
-
-/// The committed, readable runs (start, end) of `len` bytes at `at`.
-unsafe fn committed_runs(at: usize, len: usize) -> Vec<(usize, usize)> {
-    use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
-    let Some(limit) = at.checked_add(len) else { return Vec::new() };
-    // (the coherent window is committed as a whole, and what XCL recorded needs no
-    // `VirtualQuery`, which sizes a region by walking it)
-    if let Some(runs) = crate::memmap::readable_runs(at, len) {
-        return runs;
-    }
-    let mut out = Vec::new();
-    let mut p = at;
-    while p < limit {
-        let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
-        if VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.RegionSize == 0 {
-            break;
-        }
-        let end = (m.BaseAddress as usize).saturating_add(m.RegionSize).min(limit);
-        if end <= p {
-            break;
-        }
-        // R / RW / WC / X-R…, no guard
-        if m.State == MEM_COMMIT && m.Protect & 0xEE != 0 && m.Protect & 0x100 == 0 {
-            out.push((p, end));
-        }
-        p = end;
-    }
-    out
-}
-
 /// `len` bytes at `at`: the committed, readable pages copied, the rest zero (a streaming pool
 /// has only some of its pages mapped).
+#[cfg(test)]
 unsafe fn read_committed(at: usize, len: usize) -> Vec<u8> {
     let mut out = vec![0u8; len];
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(at, len)) {
-        std::ptr::copy_nonoverlapping(at as *const u8, out.as_mut_ptr(), len);
-        return out;
-    }
-    for (lo, hi) in committed_runs(at, len) {
-        copy_committed_region(lo, out.as_mut_ptr().add(lo - at), hi - lo);
-    }
+    copy_title(at, &mut out);
     out
 }
 
@@ -1337,14 +1269,33 @@ unsafe fn subresources_on(picked: &[(usize, &xg::Texture)], threads: usize) -> V
     out
 }
 
-/// The title's bytes at `at`: where they are when all of them are readable (a copy first cost
-/// as much as the detile of a video frame), else read page run by page run.
-unsafe fn title_bytes(at: usize, len: usize) -> std::borrow::Cow<'static, [u8]> {
-    if crate::gpu::shader::readable(at, len) {
-        std::borrow::Cow::Borrowed(std::slice::from_raw_parts(at as *const u8, len))
-    } else {
-        std::borrow::Cow::Owned(read_committed(at, len))
-    }
+thread_local! {
+    static TITLE_BYTES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `f` with the title's `len` bytes at `at` as a copy of XCL's own, read so that memory the
+/// title unmaps, decommits or frees meanwhile reads as zeros (`memmap::copy_title`): every bulk
+/// read of the title's memory that XCL makes on its own schedule goes through here – its
+/// textures (detile, content hash, frame sample) and the buffers it placed outside unified
+/// memory (`external_buffers`). "Readable" a moment ago is not readable now.
+pub(crate) unsafe fn with_title_bytes<R>(at: usize, len: usize, f: impl FnOnce(&[u8]) -> R) -> R {
+    const MAX_RETAINED_BYTES: usize = 32 << 20;
+    TITLE_BYTES.with(|scratch| {
+        if len <= MAX_RETAINED_BYTES {
+            if let Ok(mut bytes) = scratch.try_borrow_mut() {
+                if bytes.len() < len {
+                    let additional = len - bytes.len();
+                    bytes.reserve_exact(additional);
+                    bytes.resize(len, 0);
+                }
+                copy_title(at, &mut bytes[..len]);
+                return f(&bytes[..len]);
+            }
+        }
+        let mut bytes = vec![0; len];
+        copy_title(at, &mut bytes);
+        f(&bytes)
+    })
 }
 
 /// Every subresource (D3D12 order) of a texture from the title's memory at `va`.
@@ -1353,15 +1304,17 @@ unsafe fn subresources(va: usize, tex: &xg::Texture) -> Vec<Subresource> {
     let c = &tex.chain;
     let bpe = tex.bpe as usize;
     if tex.depth > 0 {
-        let mem = title_bytes(va, tex.size() as usize);
-        return c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(&mem, i) }).collect();
+        return with_title_bytes(va, tex.size() as usize, |mem| {
+            c.levels.iter().enumerate().map(|(i, l)| Subresource { depth: l.depth, rows: l.height, row_bytes: l.width * bpe, data: c.detile_volume(mem, i) }).collect()
+        });
     }
     let mut out = Vec::with_capacity(tex.array as usize * c.levels.len());
     for s in 0..tex.array as usize {
-        let slice = title_bytes(va + s * c.slice_bytes, c.slice_bytes);
-        for (i, l) in c.levels.iter().enumerate() {
-            out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(&slice, i, s) });
-        }
+        with_title_bytes(va + s * c.slice_bytes, c.slice_bytes, |slice| {
+            for (i, l) in c.levels.iter().enumerate() {
+                out.push(Subresource { depth: 1, rows: l.height, row_bytes: l.width * bpe, data: c.detile_level(slice, i, s) });
+            }
+        });
     }
     out
 }
@@ -1636,7 +1589,7 @@ mod tests {
             base.add(2 * PAGE).write_bytes(0x72, PAGE);
             assert_ne!(VirtualFree(base.add(PAGE).cast(), PAGE, MEM_DECOMMIT), 0);
             let mut out = [0; 2 * PAGE + 17];
-            copy_committed_region(base as usize + 23, out.as_mut_ptr(), out.len());
+            crate::memmap::copy_committed_region(base as usize + 23, out.as_mut_ptr(), out.len());
             assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
             assert!(out[..PAGE - 23].iter().all(|&b| b == 0x35));
             assert!(out[PAGE - 23..2 * PAGE - 23].iter().all(|&b| b == 0));
@@ -1899,26 +1852,24 @@ mod tests {
         assert_eq!(alive.references.load(Ordering::SeqCst), 1);
     }
 
-    /// The title's bytes are used where they are when all of them are readable, and read with the
-    /// pages that are not committed as zeros otherwise – the same bytes either way.
     #[test]
-    fn title_bytes_are_used_in_place_when_all_are_readable() {
-        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+    fn title_bytes_snapshot_survives_source_decommit_and_zeros_reused_holes() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_DECOMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
         unsafe {
             let base = VirtualAlloc(std::ptr::null(), 3 << 12, MEM_RESERVE, PAGE_READWRITE) as usize;
             assert_ne!(base, 0);
-            for page in [0usize, 2] {
-                VirtualAlloc((base + (page << 12)) as *const c_void, 1 << 12, MEM_COMMIT, PAGE_READWRITE);
+            assert!(!VirtualAlloc(base as *const c_void, 3 << 12, MEM_COMMIT, PAGE_READWRITE).is_null());
+            for page in 0..3usize {
                 std::ptr::write_bytes((base + (page << 12)) as *mut u8, 0xA0 + page as u8, 1 << 12);
             }
-            let whole = title_bytes(base, 1 << 12);
-            assert!(matches!(whole, std::borrow::Cow::Borrowed(_)), "a committed page is not copied");
-            assert_eq!(whole.as_ptr() as usize, base);
-            assert!(whole.iter().all(|&b| b == 0xA0));
-            let holed = title_bytes(base, 3 << 12);
-            assert!(matches!(holed, std::borrow::Cow::Owned(_)), "a range with a reserved page is read");
-            assert_eq!(&holed[..], &read_committed(base, 3 << 12)[..]);
-            assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            with_title_bytes(base, 3 << 12, |whole| {
+                assert_eq!(VirtualFree((base + (1 << 12)) as *mut c_void, 1 << 12, MEM_DECOMMIT), 1);
+                assert!(whole[1 << 12..2 << 12].iter().all(|&b| b == 0xA1));
+            });
+            with_title_bytes(base, 3 << 12, |holed| {
+                assert_eq!(holed, &read_committed(base, 3 << 12)[..]);
+                assert!(holed[..1 << 12].iter().all(|&b| b == 0xA0) && holed[1 << 12..2 << 12].iter().all(|&b| b == 0) && holed[2 << 12..].iter().all(|&b| b == 0xA2));
+            });
             VirtualFree(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
@@ -2169,6 +2120,10 @@ mod tests {
             let dev_key = dev.as_raw() as usize;
             let dev_pages = || super::super::vram::page_bytes_for(dev_key).0;
             let stream_desc = console_desc(3, 512, 512, 1, 1, 28, 0x109); // 64KB_S, 1 MiB
+            // (counted from the pages in use: those earlier tests left idle on this device go
+            // back while this one runs, and the count fell below its start – a subtraction
+            // overflow in a run one test at a time)
+            super::super::vram::sweep_idle_now(dev_key);
             let (pages0, vram0, kept0) = (dev_pages(), local_vram(), counts().0);
             let mut leaked_refs = Vec::with_capacity(512);
             for k in 0..16usize {

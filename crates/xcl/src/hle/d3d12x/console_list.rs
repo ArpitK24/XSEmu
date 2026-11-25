@@ -417,8 +417,10 @@ unsafe extern "system" fn cl_release(this: *mut c_void) -> u32 {
         if let Some(st) = LISTS.lock().unwrap().as_mut().and_then(|m| m.remove(&obj)) {
             free_uma(&st.uma);
             super::markers::recording_ended(st.pc);
+            let timing = super::gpu_timing::list_token(st.pc as *mut c_void);
             let release: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(pc_vtable_call(st.pc, 2));
             if release(st.pc) == 0 {
+                super::gpu_timing::list_released(timing);
                 super::residency::list_reset(st.pc);
             }
         }
@@ -465,6 +467,9 @@ unsafe extern "system" fn cl_reset(this: *mut c_void, allocator: *mut c_void, ps
     let f: unsafe extern "system" fn(usize, *mut c_void, *mut c_void) -> HRESULT = std::mem::transmute(pc_vtable_call(pc, 10));
     let hr = f(pc, allocator, pc_pso(pso));
     if hr >= 0 {
+        if super::gpu_timing::enabled() && !super::real::is_adopted(pc as *mut c_void) {
+            super::gpu_timing::opened(pc as *mut c_void, pc_pso(pso) as usize);
+        }
         super::residency::list_reset(pc);
         super::markers::recording_ended(pc);
     }
@@ -912,7 +917,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
                         let pc = ID3D12PipelineState::from_raw_borrowed(&raw).ok_or("PSO")?;
                         list.SetPipelineState(pc);
                         super::residency::note_list_untracked(st.pc);
-                        list.Dispatch(x, y, z);
+                        super::gpu_timing::op_grid(raw_list, super::gpu_timing::Kind::Dispatch, || title_pso, [x, y, z], || list.Dispatch(x, y, z));
                         super::markers::after_op(raw_list, "dispatch", title_pso);
                         if super::markers::enabled() {
                             if let Some(layout) = layout.clone() {
@@ -978,6 +983,7 @@ pub unsafe fn close(obj: *mut c_void) -> Result<Translation, String> {
     if let Some((w, at)) = out.unknown {
         crate::xlog_warn!("console list: unknown record {w:#010x} (word {at}) – rest skipped");
     }
+    super::gpu_timing::before_close(list.as_raw());
     list.Close().map_err(|e| format!("Close: {e}"))?;
     Ok(out)
 }

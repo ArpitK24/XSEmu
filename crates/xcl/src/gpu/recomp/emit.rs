@@ -74,7 +74,7 @@ pub(super) struct Em {
     dynamic_f16_rm: bool,
     /// Multi-wave code with a barrier not proven convergent uses an LDS arrival count.
     safe_barrier: bool,
-    coherent_mem: bool,
+    mem_coherence: MemCoherence,
     mesh_export_barriers: bool,
     group_sync_edges: Vec<(u64, u64)>,
     group_sync_end: Option<u64>,
@@ -95,6 +95,67 @@ const NOOPS: &[&str] = &[
     "s_ttracedata_imm", "v_nop", "s_denorm_mode", "s_sendmsg", "s_sendmsghalt",
     "s_set_gpr_idx_off", "s_version", "buffer_gl0_inv", "buffer_gl1_inv", "ds_nop",
 ];
+
+#[derive(Clone, Copy)]
+enum MemCoherence {
+    Plain,
+    Coherent,
+    CachedBefore(u64),
+}
+
+fn has_mem_coherence_bits(d: &Decoded) -> bool {
+    matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
+        && ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1))
+}
+
+fn mem_coherence(insts: &[Decoded], input_sgprs: Option<u32>) -> MemCoherence {
+    let coherent = insts.iter().any(|d| {
+        let name = d.inst.name;
+        has_mem_coherence_bits(d)
+            || matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV")
+            || ["BUFFER_ATOMIC_", "GLOBAL_ATOMIC_", "FLAT_ATOMIC_"].iter().any(|p| name.starts_with(p))
+    });
+    if !coherent {
+        return MemCoherence::Plain;
+    }
+    input_sgprs.and_then(|n| pre_acquire_read_limit(insts, n))
+        .map_or(MemCoherence::Coherent, MemCoherence::CachedBefore)
+}
+
+fn pre_acquire_read_limit(insts: &[Decoded], input_sgprs: u32) -> Option<u64> {
+    let (end, body) = insts.split_last()?;
+    if end.inst.name != "S_ENDPGM" {
+        return None;
+    }
+    let mut untouched = (1u128 << input_sgprs.min(106)) - 1;
+    let mut saw_plain = false;
+    let mut first_flagged = None;
+    for d in body {
+        match d.inst.name {
+            "S_NOP" | "V_NOP" | "S_WAITCNT" | "S_WAITCNT_VSCNT"
+            | "S_WAITCNT_VMCNT" | "S_WAITCNT_EXPCNT" | "S_WAITCNT_LGKMCNT" | "S_WAITCNT_DEPCTR" => continue,
+            "S_LOAD_DWORD" | "S_LOAD_DWORDX2" | "S_LOAD_DWORDX4" | "S_LOAD_DWORDX8" | "S_LOAD_DWORDX16"
+                if d.enc.name == "ENC_SMEM" && rdna2::field_value(d.enc, &d.words, "SOFFSET") == Some(125) => {}
+            _ => return None,
+        }
+        let pair = 3u128 << Em::field(d, "SBASE");
+        if untouched & pair != pair {
+            return None;
+        }
+        for reg in rdna2::sgpr_uses(d).1 {
+            untouched &= !(1u128 << reg);
+        }
+        if has_mem_coherence_bits(d) {
+            if !saw_plain {
+                return None;
+            }
+            first_flagged.get_or_insert(d.pc);
+        } else {
+            saw_plain = true;
+        }
+    }
+    first_flagged
+}
 
 fn is_lds(name: &str) -> bool {
     name.starts_with("ds_") && !matches!(name, "ds_swizzle_b32" | "ds_bpermute_b32" | "ds_permute_b32" | "ds_nop")
@@ -645,7 +706,7 @@ impl Em {
             has_f64_round_op: false,
             dynamic_f16_rm: false,
             safe_barrier: false,
-            coherent_mem: false,
+            mem_coherence: MemCoherence::Plain,
             mesh_export_barriers: false,
             group_sync_edges: Vec::new(),
             group_sync_end: None,
@@ -677,7 +738,10 @@ impl Em {
         let mut reads_dp = false;
         let mesh = matches!(self.opt.mode, Mode::Mesh(_));
         let compute = matches!(self.opt.mode, Mode::Compute(_));
-        self.coherent_mem = compute && super::needs_coherent_mem(insts);
+        if let Mode::Compute(cs) = &self.opt.mode {
+            let inputs = self.opt.compute_per_access_coherence.then_some(cs.user_sgprs);
+            self.mem_coherence = mem_coherence(insts, inputs);
+        }
         let mut has_s_barrier = false;
         let mut barriers = Vec::new();
         let mut branches = Vec::new();
@@ -1927,18 +1991,23 @@ impl Em {
                 self.check_carry(&hi, &format!("((((uint64_t){hi}) << 32) | (uint64_t){b}) + (uint64_t)(int64_t)(int){} + (uint64_t){soff}", hex(imm)));
             }
             self.line(&format!("uint {t}_a = ({b} + {} + {soff}) & ~3u;", hex(imm)));
+            let load = if matches!(self.mem_coherence, MemCoherence::CachedBefore(pc) if d.pc < pc) {
+                "xcl_m_cachedLoad"
+            } else {
+                "mem.Load"
+            };
             match count {
                 1 => {
-                    self.line(&format!("uint {t}_0 = mem.Load({t}_a);"));
+                    self.line(&format!("uint {t}_0 = {load}({t}_a);"));
                     vals.push(format!("{t}_0"));
                 }
                 2 => {
-                    self.line(&format!("uint2 {t}_g0 = mem.Load2({t}_a);"));
+                    self.line(&format!("uint2 {t}_g0 = {load}2({t}_a);"));
                     vals.extend([format!("{t}_g0.x"), format!("{t}_g0.y")]);
                 }
                 _ => {
                     for g in 0..count / 4 {
-                        self.line(&format!("uint4 {t}_g{g} = mem.Load4({t}_a + {}u);", 16 * g));
+                        self.line(&format!("uint4 {t}_g{g} = {load}4({t}_a + {}u);", 16 * g));
                         vals.extend(["x", "y", "z", "w"].iter().map(|c| format!("{t}_g{g}.{c}")));
                     }
                 }
@@ -5021,7 +5090,6 @@ impl Em {
             h.push_str("#define XCL_PIXEL 1\n");
         }
         h.push_str("RWByteAddressBuffer io : register(u0);\nRWByteAddressBuffer res : register(u1);\n");
-        let coherent = if self.coherent_mem { "globallycoherent " } else { "" };
         let windows = self.opt.mem_windows.clamp(1, 4);
         h.push_str("static uint xcl_mem_views = 0u;\n");
         if windows > 1 {
@@ -5616,7 +5684,7 @@ impl Em {
                 h.push_str("    return xo;\n}\n");
             }
         }
-        windowed(&h, windows, coherent)
+        windowed(&h, windows, self.mem_coherence)
     }
 }
 
@@ -6055,7 +6123,7 @@ const MEM_ACCESSORS_HERE: &str = "//XCL_MEM_ACCESSORS\n";
 /// Every `mem.Method(` of the program (and of the preludes) becomes an accessor
 /// `xcl_mMethod(` on the memory window `xcl_w` selects, and every `memv.Method(` one
 /// `xcl_vMethod(` on the per-lane window `xcl_wv`; their definitions replace the placeholder.
-fn windowed(h: &str, windows: u32, coherent: &str) -> String {
+fn windowed(h: &str, windows: u32, coherence: MemCoherence) -> String {
     let mut out = String::with_capacity(h.len() + 8192);
     let mut rest = h;
     while let Some(i) = rest.find("mem") {
@@ -6078,7 +6146,7 @@ fn windowed(h: &str, windows: u32, coherent: &str) -> String {
         }
     }
     out.push_str(rest);
-    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherent), 1)
+    out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, coherence), 1)
 }
 
 /// The accessor functions: one per `mem` method (and overload) the translator emits, each on
@@ -6090,7 +6158,7 @@ fn windowed(h: &str, windows: u32, coherent: &str) -> String {
 /// out-of-UMA pointers never wrap onto live memory windows – with no branch per access.
 /// `xcl_m` accessors index with the wave's window (`xcl_w`, from scalar registers: a uniform
 /// index), `xcl_v` ones with a lane's (`xcl_wv`, `NonUniformResourceIndex`).
-fn mem_accessors(windows: u32, coherent: &str) -> String {
+fn mem_accessors(windows: u32, coherence: MemCoherence) -> String {
     let mut sigs: Vec<(&str, String, &str, &str)> = vec![
         ("uint", "Load".into(), "uint a", "a"),
         ("uint2", "Load2".into(), "uint a", "a"),
@@ -6120,6 +6188,7 @@ fn mem_accessors(windows: u32, coherent: &str) -> String {
         &[("xcl_m", "xcl_mem_views")]
     };
     let mut s = String::new();
+    let coherent = if matches!(coherence, MemCoherence::Plain) { "" } else { "globallycoherent " };
     for &(prefix, view) in families {
         let get = format!("{coherent}RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}];");
         if prefix == "xcl_m" {
@@ -6128,6 +6197,12 @@ fn mem_accessors(windows: u32, coherent: &str) -> String {
         for (ret, name, params, args) in &sigs {
             let ret_kw = if *ret == "void" { "" } else { "return " };
             let _ = writeln!(s, "{ret} {prefix}{name}({params}) {{ {get} {ret_kw}xcl_mb.{name}({args}); }}");
+        }
+    }
+    if matches!(coherence, MemCoherence::CachedBefore(_)) {
+        let view = families[0].1;
+        for (name, ret) in [("Load", "uint"), ("Load2", "uint2"), ("Load4", "uint4")] {
+            let _ = writeln!(s, "{ret} xcl_m_cached{name}(uint a) {{ RWByteAddressBuffer xcl_mb = ResourceDescriptorHeap[{view}]; return xcl_mb.{name}(a); }}");
         }
     }
     s

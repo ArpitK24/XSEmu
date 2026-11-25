@@ -68,6 +68,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
         let rec = &*(*info).ExceptionRecord;
         let addr = rec.ExceptionAddress as usize;
         let mut extra = String::new();
+        let ctx = (*info).ContextRecord;
         if rec.ExceptionCode as u32 == 0xC000_0005 && rec.NumberParameters >= 2 {
             let op = match rec.ExceptionInformation[0] {
                 0 => "read",
@@ -75,12 +76,20 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
                 8 => "execute",
                 _ => "?",
             };
-            extra = format!(" ({op} at address {:#x}; {})", rec.ExceptionInformation[1], crate::hle::kernelx::lazy::describe(rec.ExceptionInformation[1] as usize));
+            // what was executed (which register the address was made from), and for an address
+            // given as all ones – one no pointer can hold; Windows does not report the real one –
+            // the registers that hold such a value
+            let wild = if rec.ExceptionInformation[1] == usize::MAX && !ctx.is_null() { not_addresses(&*ctx) } else { String::new() };
+            extra = format!(
+                " ({op} at address {:#x}; {}; code bytes: {}{wild})",
+                rec.ExceptionInformation[1],
+                crate::hle::kernelx::lazy::describe(rec.ExceptionInformation[1] as usize),
+                code_at(addr)
+            );
         }
         if rec.ExceptionCode as u32 == ILLEGAL_INSTRUCTION {
             extra = format!(" (code bytes: {})", code_at(addr));
         }
-        let ctx = (*info).ContextRecord;
         let regs = if ctx.is_null() {
             String::new()
         } else {
@@ -300,6 +309,33 @@ fn is_writable(va: usize, bytes: usize) -> bool {
 }
 
 const ILLEGAL_INSTRUCTION: u32 = 0xC000_001D;
+
+/// (crash record) The registers whose value no pointer can hold (bits 47 to 63 not all alike):
+/// an instruction that made its address from one faults with no address reported.
+fn not_addresses(c: &windows_sys::Win32::System::Diagnostics::Debug::CONTEXT) -> String {
+    let regs = [
+        ("rax", c.Rax), ("rbx", c.Rbx), ("rcx", c.Rcx), ("rdx", c.Rdx), ("rsi", c.Rsi), ("rdi", c.Rdi), ("rbp", c.Rbp), ("r8", c.R8),
+        ("r9", c.R9), ("r10", c.R10), ("r11", c.R11), ("r12", c.R12), ("r13", c.R13), ("r14", c.R14), ("r15", c.R15),
+    ];
+    let wild: Vec<&str> = regs.iter().filter(|(_, v)| !matches!(*v >> 47, 0 | 0x1_FFFF)).map(|(n, _)| *n).collect();
+    if wild.is_empty() { String::new() } else { format!("; not an address: the real one is not reported – no pointer can hold what is in {}", wild.join(", ")) }
+}
+
+#[cfg(test)]
+mod not_addresses_tests {
+    /// A register with a value no pointer can hold is named; pointers of both halves and small
+    /// numbers are not.
+    #[test]
+    fn registers_no_pointer_can_hold_are_named() {
+        let mut c: windows_sys::Win32::System::Diagnostics::Debug::CONTEXT = unsafe { std::mem::zeroed() };
+        (c.Rax, c.Rbx, c.Rcx, c.R12, c.R15) = (0, 0x7FFF_1234_5678, 0xFFFF_8000_0000_1000, 0x7FFF_FFFF_7FFF_FFFF, 0x8000_0000_0000);
+        let s = super::not_addresses(&c);
+        assert!(s.ends_with("in r12, r15"), "{s}");
+        c.R12 = 1;
+        c.R15 = u64::MAX;
+        assert!(super::not_addresses(&c).is_empty());
+    }
+}
 
 /// The first 16 code bytes at `rip`, as hex (as far as they are readable).
 unsafe fn code_at(rip: usize) -> String {

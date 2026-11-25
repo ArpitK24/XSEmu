@@ -95,9 +95,16 @@ fn readable(a: usize) -> bool {
     crate::gpu::shader::readable(a, PAGE)
 }
 
-/// A hash of the 64 KiB at `a` (readable).
+/// Whether the 64 KiB at `a` and at `b` hold the same, read as copies (None: one of them is
+/// not there any more – a page compared where it is can be unmapped under the comparison).
+fn same(a: usize, b: usize) -> Option<bool> {
+    Some(crate::memmap::title_bytes(a, PAGE)? == crate::memmap::title_bytes(b, PAGE)?)
+}
+
+/// A hash of the 64 KiB at `a` (readable; read as a copy, what goes meanwhile as zeros).
 unsafe fn hash(a: usize) -> u64 {
-    let words = std::slice::from_raw_parts(a as *const u64, PAGE / 8);
+    let mut words = vec![0u64; PAGE / 8];
+    crate::memmap::copy_title(a, std::slice::from_raw_parts_mut(words.as_mut_ptr().cast::<u8>(), PAGE));
     let mut h = [0x243F_6A88_85A3_08D3u64, 0x1319_8A2E_0370_7344, 0xA409_3822_299F_31D0, 0x082E_FA98_EC4E_6C89];
     for c in words.chunks_exact(4) {
         for i in 0..4 {
@@ -127,10 +134,17 @@ unsafe fn copy_to(at: usize, from: Option<usize>) {
         crate::alias::mapping_changed("a copied GPU page view is overwritten with what it shows", "CopyPageMappingsBatchX / a submit's look", at, PAGE);
         crate::eh::note_guest_write("copied GPU page view overwritten with what it shows", at, PAGE);
     }
+    // (read as a copy and written by Windows: the title can unmap either page meanwhile)
     match from.filter(|&a| readable(a)) {
-        Some(a) if a != at => std::ptr::copy_nonoverlapping(a as *const u8, at as *mut u8, PAGE),
+        Some(a) if a != at => {
+            let mut page = vec![0u8; PAGE];
+            crate::memmap::copy_title(a, &mut page);
+            crate::memmap::write_title(at, &page);
+        }
         Some(_) => {}
-        None => std::ptr::write_bytes(at as *mut u8, 0, PAGE),
+        None => {
+            crate::memmap::write_title(at, &ZERO);
+        }
     }
 }
 
@@ -347,7 +361,7 @@ pub(crate) fn alias_facts(va: usize, page: Option<usize>) -> AliasFacts {
 /// physical page model's account of it.
 pub(super) fn describe(va: usize) -> String {
     let at = va & !(PAGE - 1);
-    let nonzero = |a: usize| if readable(a) { unsafe { std::slice::from_raw_parts(a as *const u8, PAGE) }.iter().filter(|&&b| b != 0).count().to_string() } else { "not committed".into() };
+    let nonzero = |a: usize| crate::memmap::title_bytes(a, PAGE).map_or("not committed".into(), |page| page.iter().filter(|&&b| b != 0).count().to_string());
     if let Some(p) = GPU.lock().unwrap().as_ref().and_then(|g| g.at.get(&at).copied()) {
         return format!("GPU view of page {p:#x} (the page itself): {} non-zero bytes", nonzero(at));
     }
@@ -455,11 +469,11 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
                         match (now, s.views.iter().next()) {
                             (Some(a), Some(&first)) if readable(a) && readable(first) => {
                                 compared += 1;
-                                std::slice::from_raw_parts(a as *const u8, PAGE) != std::slice::from_raw_parts(first as *const u8, PAGE)
+                                same(a, first) != Some(true)
                             }
                             (None, Some(&first)) if readable(first) => {
                                 compared += 1;
-                                std::slice::from_raw_parts(first as *const u8, PAGE) != &ZERO[..]
+                                crate::memmap::title_bytes(first, PAGE).is_none_or(|page| page[..] != ZERO[..])
                             }
                             _ => true,
                         }
@@ -468,7 +482,7 @@ pub(super) unsafe fn after_look(dirty: &mut Vec<usize>, watched: &[(usize, usize
                     Some(a) => {
                         // a place outside the watched memory: compared with its first view
                         compared += 1;
-                        s.views.iter().next().is_some_and(|&first| readable(a) && readable(first) && std::slice::from_raw_parts(a as *const u8, PAGE) != std::slice::from_raw_parts(first as *const u8, PAGE))
+                        s.views.iter().next().is_some_and(|&first| readable(a) && readable(first) && same(a, first) == Some(false))
                     }
                     None => false,
                 };

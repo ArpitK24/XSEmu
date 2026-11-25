@@ -114,6 +114,7 @@ unsafe extern "system" fn record(this: *mut c_void, slot: u32) {
 /// the last methods called (`XCL_LIST_TRACE`). Prior split segments were closed on split.
 unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
     let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+    super::gpu_timing::before_close(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> HRESULT = std::mem::transmute(pc_slot(pc, 9));
     let hr = f(pc);
     let n = *((this as usize + F_RING_AT) as *const usize);
@@ -142,7 +143,11 @@ unsafe extern "system" fn reset(this: *mut c_void, alloc: usize, pso: usize) -> 
         super::list_x::reset_x(primary, alloc, pso)
     } else {
         let f: unsafe extern "system" fn(*mut c_void, usize, usize) -> HRESULT = std::mem::transmute(pc_slot(primary, 10));
-        f(primary, alloc, pso)
+        let hr = f(primary, alloc, pso);
+        if hr >= 0 {
+            super::gpu_timing::opened(primary, pso);
+        }
+        hr
     };
     if hr >= 0 {
         *((this as usize + F_BACKING) as *mut usize) = primary as usize;
@@ -344,9 +349,11 @@ unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
 /// list's last reference.
 unsafe extern "system" fn release(this: *mut c_void) -> u32 {
     let pc = *((this as usize + F_PRIMARY) as *const *mut c_void);
+    let timing = super::gpu_timing::list_token(pc);
     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
     let n = f(pc);
     if n == 0 {
+        super::gpu_timing::list_released(timing);
         let book = SEGMENTS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
         {
             let mut wg = WRAPPER_OF.lock().unwrap();
@@ -363,8 +370,11 @@ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
             for seg in b.extra_active.into_iter().chain(b.spares.into_iter()) {
                 let raw = seg as *mut c_void;
                 super::bind::forget(raw);
+                let timing = super::gpu_timing::list_token(raw);
                 let rel: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(raw, 2));
-                rel(raw);
+                if rel(raw) == 0 {
+                    super::gpu_timing::list_released(timing);
+                }
             }
         }
         super::bind::forget(pc);

@@ -110,27 +110,6 @@ pub fn subresources(t: &Image, mem: &[u8], cfg: PipeConfig) -> Result<Vec<Subres
     Ok(out)
 }
 
-/// The console memory a T#'s texture occupies, when it lies in the unified memory (UMA).
-fn checked_span(start: u64, bytes: usize) -> Result<(usize, usize), String> {
-    if bytes == 0 {
-        return Err("empty texture memory span".into());
-    }
-    let start = usize::try_from(start).map_err(|_| "texture address does not fit the host address space")?;
-    let end = start.checked_add(bytes).ok_or("texture memory span overflows the host address space")?;
-    Ok((start, end))
-}
-
-pub fn uma_bytes(t: &Image, cfg: PipeConfig) -> Result<&'static [u8], String> {
-    let p = placement(t, cfg)?;
-    let u = super::uma::get().ok_or("no UMA")?;
-    let (a, end) = checked_span(p.start, p.bytes)?;
-    if !u.contains(a) || !u.contains(end - 1) {
-        return Err(format!("texture {a:#x}+{:#x} outside UMA", p.bytes));
-    }
-    // SAFETY: inside the UMA reservation, which lives for the whole process
-    Ok(unsafe { std::slice::from_raw_parts(a as *const u8, p.bytes) })
-}
-
 fn err(x: windows::core::Error) -> String {
     format!("{x}")
 }
@@ -546,15 +525,6 @@ mod tests {
         assert_eq!([0, 1, 4 * MIB, 4 * MIB + 1, 9 * MIB, 16 * MIB].map(staging_capacity), [4 * MIB, 4 * MIB, 4 * MIB, 8 * MIB, 16 * MIB, 16 * MIB]);
         assert_eq!([16 * MIB + 1, 32 * MIB, 33 * MIB, 129 * MIB, 256 * MIB].map(staging_capacity), [32 * MIB, 32 * MIB, 48 * MIB, 144 * MIB, 256 * MIB]);
         assert!(staging_capacity(STAGING_KEEP) <= STAGING_KEEP && staging_capacity(STAGING_KEEP + 1) > STAGING_KEEP);
-    }
-
-    #[test]
-    fn texture_memory_spans_reject_empty_truncated_and_wrapping_addresses() {
-        assert_eq!(checked_span(0x1000, 0x200).unwrap(), (0x1000, 0x1200));
-        assert!(checked_span(0x1000, 0).unwrap_err().contains("empty"));
-        assert!(checked_span(u64::MAX, 2).unwrap_err().contains("address"));
-        assert!(checked_span((usize::MAX - 1) as u64, 2).unwrap_err().contains("overflows"));
-        assert_eq!(checked_span((usize::MAX - 1) as u64, 1).unwrap(), (usize::MAX - 1, usize::MAX));
     }
 
     #[test]

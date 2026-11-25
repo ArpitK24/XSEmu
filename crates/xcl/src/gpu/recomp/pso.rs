@@ -191,6 +191,11 @@ mod translated {
         if base == 0 {
             return 0;
         }
+        let base = if super::super::compute_per_access_coherence() {
+            identity_for(&format!("{base:016x}"), "compute-per-access-coherence")
+        } else {
+            base
+        };
         let nan = if super::nan_guards() { "nan-guards" } else { "" };
         let guard = super::super::loop_guard();
         let trip_counters = crate::config::gpu_markers_enabled();

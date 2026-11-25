@@ -62,6 +62,8 @@ pub use emit::mesh_passthrough;
 pub mod runner;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod coherence_tests;
 pub mod upper_lanes;
 mod loop_profile;
 pub use loop_profile::{loop_profile_enabled, LOOP_PROFILE_SITES, LOOP_PROFILE_WORDS};
@@ -511,6 +513,7 @@ pub struct Options {
     /// them (`upper_lanes`). No effect on wave32 programs.
     pub split_wave64: bool,
     pub legacy_compute_wave64: bool,
+    pub compute_per_access_coherence: bool,
     pub loop_profile: bool,
     pub guard_trip_counters: bool,
     /// first register (space 1) of the program's static samplers (another stage of the same
@@ -533,13 +536,18 @@ pub struct Options {
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, legacy_compute_wave64: legacy_compute_wave64(), compute_per_access_coherence: compute_per_access_coherence(), loop_profile: false, guard_trip_counters: true, static_sampler_base: 0, mem_windows: 1, structured: true, nan_guards: true, mesh_native: None }
     }
 }
 
 pub(super) fn legacy_compute_wave64() -> bool {
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *LEGACY.get_or_init(|| std::env::var("XCL_COMPUTE_WAVE64_LEGACY").is_ok_and(|v| v.trim() == "1"))
+}
+
+pub(super) fn compute_per_access_coherence() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("XCL_COMPUTE_PER_ACCESS_COHERENCE").is_ok_and(|v| v.trim() == "1"))
 }
 
 pub(super) fn compute_wave64_pack_max_insts() -> usize {
@@ -1527,16 +1535,6 @@ fn decode_program<'a>(code: &'a [u8], opt: &Options) -> Result<DecodedProgram<'a
     }).max().unwrap_or(0);
     let long_loops = long_loops(&insts, loop_guard());
     Ok(DecodedProgram { code, insts, starts, leaders, branches, gs_jump, static_samplers, fmt_regs, max_vgpr, long_loops })
-}
-
-fn needs_coherent_mem(insts: &[Decoded]) -> bool {
-    insts.iter().any(|d| {
-        let name = d.inst.name;
-        matches!(name, "S_DCACHE_INV" | "S_GL1_INV" | "BUFFER_GL0_INV" | "BUFFER_GL1_INV")
-            || ["BUFFER_ATOMIC_", "GLOBAL_ATOMIC_", "FLAT_ATOMIC_"].iter().any(|prefix| name.starts_with(prefix))
-            || (matches!(d.enc.name, "ENC_SMEM" | "ENC_MUBUF" | "ENC_MTBUF" | "ENC_FLAT" | "ENC_FLAT_GLBL")
-                && ["GLC", "DLC", "SLC"].iter().any(|f| rdna2::field_value(d.enc, &d.words, f) == Some(1)))
-    })
 }
 
 pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {

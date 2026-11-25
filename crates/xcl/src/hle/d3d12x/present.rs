@@ -18,7 +18,8 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
-use std::sync::{Mutex, Once};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::sync::{Mutex, Once, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use windows::core::{Interface, HSTRING, PCWSTR};
@@ -62,6 +63,10 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
 }
 
 unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+    super::gpu_timing::boundary();
+    if super::gpu_timing::enabled() {
+        super::gpu_timing_waits::boundary(super::gpu_timing::epoch());
+    }
     let frames = BOUNDARIES.fetch_add(1, Ordering::Relaxed) + 1;
     if frames % 300 == 0 {
         // the title's frame rate, for comparing runs (every 300 frames)
@@ -213,6 +218,140 @@ static PRESENTED: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
 pub fn is_presented(res: usize) -> bool {
     PRESENTED.lock().unwrap().contains(&res)
+}
+
+fn writer_frames() -> &'static [u64] {
+    static FRAMES: OnceLock<Vec<u64>> = OnceLock::new();
+    FRAMES.get_or_init(|| std::env::var("XCL_PRESENT_WRITERS_AT").unwrap_or_default()
+        .split(',').filter_map(|v| v.trim().parse().ok()).take(16).collect())
+}
+
+pub(super) fn writer_trace_configured() -> bool {
+    !writer_frames().is_empty() || plane_schedule().is_some()
+}
+
+pub(super) fn writer_trace_active() -> bool {
+    let frame = PRESENTS.load(Ordering::Relaxed);
+    writer_frames().iter().any(|&target| (target.saturating_sub(3)..=target).contains(&frame))
+        || plane_schedule().is_some_and(|schedule| {
+            let next = NEXT_PLANE_CAPTURE.load(Ordering::Relaxed);
+            schedule.due(crate::log::uptime() as u64 + 12, next).is_some()
+        })
+}
+
+#[derive(Clone)]
+struct PlaneWriter {
+    resource: usize,
+    kind: &'static str,
+    shaders: Option<(u64, u64)>,
+    pso: usize,
+    inputs: Vec<String>,
+    read_resources: Vec<usize>,
+}
+
+type SubmittedPlaneWriter = (u64, usize, Option<usize>, PlaneWriter);
+static PLANE_WRITES: Mutex<Option<HashMap<usize, Vec<PlaneWriter>>>> = Mutex::new(None);
+static PLANE_SUBMITS: Mutex<std::collections::VecDeque<SubmittedPlaneWriter>> = Mutex::new(std::collections::VecDeque::new());
+static PLANE_INPUTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+pub(super) fn watch_plane_input(res: usize) {
+    let mut resources = PLANE_INPUTS.lock().unwrap();
+    if !resources.contains(&res) {
+        if resources.len() == 32 {
+            resources.remove(0);
+        }
+        resources.push(res);
+    }
+}
+
+pub(super) fn is_writer_target(res: usize) -> bool {
+    res != 0 && (is_presented(res) || PLANE_INPUTS.lock().unwrap().contains(&res))
+}
+
+pub(super) fn record_plane_write(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>) {
+    record_plane_write_with_reads(list, resource, kind, pso, inputs, Vec::new());
+}
+
+pub(super) fn record_plane_write_with_reads(list: usize, resource: usize, kind: &'static str, pso: usize, inputs: Vec<String>, read_resources: Vec<usize>) {
+    if !writer_trace_active() || !is_writer_target(resource) {
+        return;
+    }
+    let shaders = if pso == 0 { None } else { super::gpu_timing_stats::shaders(pso) };
+    let mut records = PLANE_WRITES.lock().unwrap();
+    let lists = records.get_or_insert_with(HashMap::new);
+    if lists.len() >= 1024 && !lists.contains_key(&list) {
+        return;
+    }
+    let writes = lists.entry(list).or_default();
+    if writes.len() == 32 {
+        writes.remove(0);
+    }
+    writes.push(PlaneWriter { resource, kind, shaders, pso, inputs, read_resources });
+}
+
+pub(super) fn reset_plane_writes(list: usize) {
+    if writer_trace_configured() {
+        if let Some(lists) = PLANE_WRITES.lock().unwrap().as_mut() {
+            lists.remove(&list);
+        }
+    }
+}
+
+pub(super) unsafe fn submit_plane_writes(queue: *mut c_void, lists: &[*mut c_void]) {
+    if !writer_trace_active() {
+        return;
+    }
+    let queue_id = super::list_x::queue_id(queue as usize);
+    let timing_id = super::gpu_timing::queue_stamp(queue).map(|(_, id)| id);
+    let frame = PRESENTS.load(Ordering::Relaxed);
+    let recorded = PLANE_WRITES.lock().unwrap();
+    let Some(recorded) = recorded.as_ref() else { return };
+    let mut submits = PLANE_SUBMITS.lock().unwrap();
+    for write in lists.iter().filter_map(|list| recorded.get(&(*list as usize))).flatten() {
+        if submits.len() == 2048 {
+            submits.pop_front();
+        }
+        submits.push_back((frame, queue_id, timing_id, write.clone()));
+    }
+}
+
+unsafe fn log_plane_writers(queue: *mut c_void, shown: &[usize], timed: bool) {
+    let frame = PRESENTS.load(Ordering::Relaxed);
+    if !timed && !writer_frames().contains(&frame) {
+        return;
+    }
+    let present_q = super::list_x::queue_id(queue as usize);
+    let timing_q = super::gpu_timing::queue_stamp(queue).map(|(_, id)| id);
+    let submits = PLANE_SUBMITS.lock().unwrap();
+    for (i, &resource) in shown.iter().enumerate() {
+        crate::xlog_info!("present writer: frame {frame} p{i} resource {resource:#x}, present q{present_q}, timing q{timing_q:?}");
+        let mut queues = Vec::new();
+        for (at, (recorded_frame, q, timing, w)) in submits.iter().enumerate().rev().filter(|(_, (seen, _, _, w))| *seen >= frame.saturating_sub(3) && w.resource == resource) {
+            if queues.contains(&(q, w.kind)) || queues.len() >= 8 {
+                continue;
+            }
+            queues.push((q, w.kind));
+            crate::xlog_info!("present writer: p{i}, submitted at frame {recorded_frame}, q{q} timing q{timing:?}: {} PSO {:#x} shader hashes {:x?}, candidates [{}]", w.kind, w.pso, w.shaders, w.inputs.join("; "));
+            for &input in &w.read_resources {
+                let mut logged = [false; 2];
+                for (input_frame, q, timing, producer) in submits.range(..at).rev().filter(|(seen, _, _, producer)| *seen >= frame.saturating_sub(4) && producer.resource == input) {
+                    let kind = usize::from(producer.kind == "compute binding candidate");
+                    if !std::mem::replace(&mut logged[kind], true) {
+                        crate::xlog_info!("present input producer: p{i} input {input:#x}, submitted at frame {input_frame}, q{q} timing q{timing:?}: {} PSO {:#x} shader hashes {:x?}", producer.kind, producer.pso, producer.shaders);
+                    }
+                    if logged == [true; 2] {
+                        break;
+                    }
+                }
+                if logged == [false; 2] {
+                    crate::xlog_info!("present input producer: p{i} input {input:#x}, no prior matching CPU submission in the trace");
+                }
+            }
+        }
+        if queues.is_empty() {
+            crate::xlog_info!("present writer: p{i}, no matching submitted writer in the capture window");
+        }
+    }
 }
 
 /// the resource an RTV handle names (render-target binds)
@@ -371,6 +510,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_CLOSE => {
             crate::xlog_info!("XCL window closed – ending the game process");
+            flush_frame_dumps();
             crate::report::write_final(None);
             crate::log::flush();
             windows::Win32::System::Threading::ExitProcess(0);
@@ -635,8 +775,9 @@ struct Presenter {
     alloc: ID3D12CommandAllocator,
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
-    copy_source: Option<ID3D12Resource>,
+    copy_sources: Vec<ID3D12Resource>,
     dumps: Vec<FrameDump>,
+    dump_frame: Option<u64>,
     disabled: bool,
     value: u64,
     event: HANDLE,
@@ -776,11 +917,148 @@ unsafe fn compose(p: &mut Presenter, bb: &ID3D12Resource, planes: &[ID3D12Resour
 }
 
 struct FrameDump {
-    _source: ID3D12Resource,
+    source: Option<ID3D12Resource>,
     buffer: ID3D12Resource,
     footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     format: DXGI_FORMAT,
     tag: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DumpAction {
+    NoCapture,
+    Keep,
+    Collect(u64),
+}
+
+fn dump_action(frame: Option<u64>, completed: bool) -> DumpAction {
+    match frame {
+        None => DumpAction::NoCapture,
+        Some(frame) if completed => DumpAction::Collect(frame),
+        Some(_) => DumpAction::Keep,
+    }
+}
+
+type DumpBatch = (u64, Vec<FrameDump>);
+
+enum DumpJob {
+    Write(DumpBatch),
+    Flush(Option<DumpBatch>, SyncSender<()>),
+}
+
+static DUMP_WRITER: OnceLock<Option<SyncSender<DumpJob>>> = OnceLock::new();
+static DUMP_SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn take_frame_dumps(p: &mut Presenter, completed: bool) -> Option<DumpBatch> {
+    let DumpAction::Collect(frame) = dump_action(p.dump_frame, completed) else { return None };
+    let mut dumps = std::mem::take(&mut p.dumps);
+    p.dump_frame = None;
+    for dump in &mut dumps {
+        dump.source = None;
+    }
+    Some((frame, dumps))
+}
+
+fn frame_dump_writer() -> Option<&'static SyncSender<DumpJob>> {
+    DUMP_WRITER.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel(1);
+        match std::thread::Builder::new().name("xcl-frame-dump".into()).spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let (batch, done) = match job {
+                    DumpJob::Write(batch) => (Some(batch), None),
+                    DumpJob::Flush(batch, done) => (batch, Some(done)),
+                };
+                if let Some((frame, dumps)) = batch {
+                    for dump in dumps {
+                        unsafe { write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag, frame) };
+                    }
+                }
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
+        }) {
+            Ok(_) => Some(tx),
+            Err(e) => {
+                crate::xlog_error!("present: cannot start frame dump writer: {e}");
+                None
+            }
+        }
+    }).as_ref()
+}
+
+fn queue_frame_dumps(p: &mut Presenter, completed: bool) -> bool {
+    let Some(batch) = take_frame_dumps(p, completed) else { return true };
+    let Some(writer) = frame_dump_writer() else { return true };
+    match writer.try_send(DumpJob::Write(batch)) {
+        Ok(()) => true,
+        Err(TrySendError::Full(DumpJob::Write((frame, dumps)))) => {
+            p.dump_frame = Some(frame);
+            p.dumps = dumps;
+            false
+        }
+        Err(_) => {
+            crate::xlog_warn!("present: frame dump writer disconnected");
+            true
+        }
+    }
+}
+
+unsafe fn frame_dump_ready(p: &Presenter, wait_ms: u32) -> Result<bool, FenceError> {
+    if wait_ms == 0 {
+        fence::completed_value(&p.fence, &p.dev).map(|completed| completed >= p.value)
+    } else {
+        fence::wait(&p.fence, p.value, &p.dev, Some(p.event), wait_ms).map(|()| true)
+    }
+}
+
+pub(crate) fn flush_frame_dumps() {
+    DUMP_SHUTDOWN.store(true, Ordering::Release);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let remaining = || deadline.saturating_duration_since(Instant::now());
+    let mut guard = loop {
+        match PRESENTER.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::WouldBlock) if !remaining().is_zero() => {
+                std::thread::sleep(Duration::from_millis(10).min(remaining()));
+            }
+            Err(_) => {
+                crate::xlog_warn!("present: shutdown could not lock the presenter to collect its last dump");
+                return;
+            }
+        }
+    };
+    let batch = guard.as_mut().filter(|p| p.dump_frame.is_some()).and_then(|p| {
+        match unsafe { frame_dump_ready(p, remaining().as_millis() as u32) } {
+            Ok(ready) => take_frame_dumps(p, ready),
+            Err(e) => {
+                crate::xlog_warn!("present: shutdown frame dump copy: {e}");
+                None
+            }
+        }
+    });
+    let writer = if batch.is_some() { frame_dump_writer() } else { DUMP_WRITER.get().and_then(Option::as_ref) };
+    let Some(writer) = writer else { return };
+    let (done, finished) = mpsc::sync_channel(1);
+    let mut job = DumpJob::Flush(batch, done);
+    loop {
+        match writer.try_send(job) {
+            Ok(()) => {
+                if finished.recv_timeout(remaining()).is_err() {
+                    crate::xlog_warn!("present: shutdown timed out waiting for the frame dump writer");
+                }
+                return;
+            }
+            Err(TrySendError::Full(pending)) if !remaining().is_zero() => {
+                job = pending;
+                std::thread::sleep(Duration::from_millis(10).min(remaining()));
+            }
+            Err(_) => {
+                crate::xlog_warn!("present: shutdown could not flush the frame dump writer");
+                return;
+            }
+        }
+    }
 }
 
 unsafe impl Send for Presenter {}
@@ -812,7 +1090,7 @@ unsafe fn new_presenter(queue: usize) -> Option<Presenter> {
     let event = CreateEventW(None, false, false, None).ok()?;
     Some(Presenter {
         queue, dev: dev.clone(), sc: None, w: 0, h: 0, fmt: DXGI_FORMAT_UNKNOWN, alloc, list, fence,
-        copy_source: None, dumps: Vec::new(), disabled: false, value: 0, event,
+        copy_sources: Vec::new(), dumps: Vec::new(), dump_frame: None, disabled: false, value: 0, event,
         last: Instant::now() - Duration::from_secs(1), composer: None, bar_rtv: None,
     })
 }
@@ -894,12 +1172,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     // a queue before the title's first PresentX, issue #103): the swap chain belongs to a queue –
     // a new presenter for the title's present queue, after the old presentation completes
     if frame.is_some() && guard.as_ref().is_some_and(|p| p.queue != queue) {
-        if let Some(old) = guard.as_ref() {
-            if !matches!(
-                fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000),
-                Ok(()) | Err(FenceError::Removed(_))
-            ) {
-                return;
+        if let Some(old) = guard.as_mut() {
+            match fence::wait(&old.fence, old.value, &old.dev, Some(old.event), 1000) {
+                Ok(()) => {
+                    if !queue_frame_dumps(old, true) {
+                        return;
+                    }
+                }
+                Err(FenceError::Removed(_)) => {}
+                Err(_) => return,
             }
         }
         crate::xlog_info!("D3D12.X: PresentX from another queue ({queue:#x}) – the XCL window's swap chain moves to it");
@@ -926,8 +1207,8 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         }
         return;
     }
-    p.copy_source = None;
-    p.dumps.clear();
+    p.copy_sources.clear();
+    queue_frame_dumps(p, true);
     if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
         return;
     }
@@ -945,13 +1226,41 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         p.list.CopyResource(&bb, &src);
         p.list.ResourceBarrier(&[transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
     }
+    let index = PRESENTS.load(Ordering::Relaxed);
+    let timed_capture = if DUMP_SHUTDOWN.load(Ordering::Acquire) {
+        None
+    } else {
+        plane_schedule().and_then(|schedule| schedule.due(crate::log::uptime() as u64, NEXT_PLANE_CAPTURE.load(Ordering::Relaxed)))
+    };
+    let trace_planes = timed_capture.is_some() || trace_planes_at(index);
+    if let Some((_, shown)) = frame {
+        log_plane_writers(queue as *mut c_void, shown, timed_capture.is_some());
+    }
     let due = frame_dump_due();
     let mut dumps = Vec::new();
-    if due {
+    if due || trace_planes {
         // the back buffer the window shows, after the copy or the composition
         let (shown, d) = (bb.clone(), bb.GetDesc());
         if let Some((buffer, footprint)) = readback_copy(&p.list, &shown, &d) {
-            dumps.push(FrameDump { _source: shown, buffer, footprint, format: d.Format, tag: "frame".into() });
+            dumps.push(FrameDump { source: Some(shown), buffer, footprint, format: d.Format, tag: "frame".into() });
+        }
+    }
+    if trace_planes {
+        let queue = super::list_x::queue_id(queue);
+        crate::xlog_info!("present planes: frame {index}, {:.1} s, q{queue}, {} source(s), composed {composed}", crate::log::uptime(), planes.len());
+        for (k, plane) in planes.iter().take(COMPOSED_PLANES).enumerate() {
+            let res = plane.as_raw() as usize;
+            let d = plane.GetDesc();
+            let title = super::real::title_address(res).or_else(|| super::title_textures::address(res));
+            let backing = super::residency::describe_backing(res).unwrap_or_else(|| "not in residency registry".into());
+            crate::xlog_info!("present planes: p{k} resource {res:#x}, title {title:x?}, {}x{} format {} flags {:#x}, {backing}", d.Width, d.Height, d.Format.0, d.Flags.0);
+            if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 && d.DepthOrArraySize == 1 {
+                if let Some(format) = swap_format(d.Format).filter(|&f| f != DXGI_FORMAT_R16G16B16A16_FLOAT) {
+                    if let Some((buffer, footprint)) = readback_copy(&p.list, plane, &d) {
+                        dumps.push(FrameDump { source: Some(plane.clone()), buffer, footprint, format, tag: format!("plane{k}") });
+                    }
+                }
+            }
         }
     }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
@@ -974,7 +1283,7 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
             });
         for (k, (res, buffer, footprint, format)) in targets.enumerate() {
             let tag = if k == 0 { "rt".into() } else { format!("rt{k}") };
-            dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
+            dumps.push(FrameDump { source: Some(res), buffer, footprint, format, tag });
         }
     }
     // the bar comes after the frame dumps: they hold the title's frame as it is
@@ -989,7 +1298,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
     let Some(q) = ID3D12CommandQueue::from_raw_borrowed(&qraw) else { return };
     let Ok(cl) = p.list.cast::<ID3D12CommandList>() else { return };
     q.ExecuteCommandLists(&[Some(cl)]);
-    p.copy_source = Some(src);
+    p.copy_sources = planes;
+    if let Some(frame) = p.dump_frame {
+        crate::xlog_warn!("present: frame dump writer busy; skipped frame {frame}");
+    }
+    p.dump_frame = (!dumps.is_empty()).then(|| PRESENTS.load(Ordering::Relaxed));
     p.dumps = dumps;
     let present_result = sc.Present(0, DXGI_PRESENT(0)).ok();
     p.value += 1;
@@ -1002,31 +1315,43 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, &[usize])>) 
         return;
     }
     if let Err(e) = present_result {
+        if !p.dumps.is_empty() {
+            static FAILED_PRESENT_DUMPS: AtomicU64 = AtomicU64::new(0);
+            let failed = FAILED_PRESENT_DUMPS.fetch_add(1, Ordering::Relaxed);
+            for dump in &mut p.dumps {
+                dump.tag = format!("failed_present_{failed}_{}", dump.tag);
+            }
+        }
         let e = fence::api_error(&p.dev, "Present", e);
         p.disabled = matches!(&e, FenceError::Removed(_));
         crate::xlog_error!("present: {e}");
         return;
     }
+    if !PRESENTX.load(Ordering::Relaxed) {
+        super::gpu_timing::boundary();
+        if super::gpu_timing::enabled() {
+            super::gpu_timing_waits::boundary(super::gpu_timing::epoch());
+        }
+    }
     p.last = Instant::now();
-    if !p.dumps.is_empty() {
-        match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
-            Ok(()) => {
-                for dump in p.dumps.drain(..) {
-                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
-                }
+    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+    if let Some(slot) = timed_capture {
+        NEXT_PLANE_CAPTURE.store(slot + 1, Ordering::Relaxed);
+    }
+    if n == 0 {
+        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
+    }
+    if p.dump_frame.is_some() {
+        match frame_dump_ready(p, frame_dump_wait_ms()) {
+            Ok(ready) => { queue_frame_dumps(p, ready); }
+            Err(FenceError::Timeout(ms)) => {
+                crate::xlog_info!("present: frame dump copy: GPU fence still pending after {ms} ms; will collect at a later present");
             }
             Err(e) => {
                 p.disabled = matches!(&e, FenceError::Removed(_));
                 crate::xlog_error!("present: frame dump copy: {e}");
-                if p.disabled {
-                    return;
-                }
             }
         }
-    }
-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
-    if n == 0 {
-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
     }
 }
 
@@ -1056,7 +1381,13 @@ unsafe fn progress_bar(p: &mut Presenter, bb: &ID3D12Resource, fraction: f32) {
 /// `XCL_FRAME_DUMP=1`: every 120th shown frame is written to the logs folder (`XCL_FRAME_DUMP=n`,
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+/// `XCL_FRAME_DUMP_WAIT_MS` bounds the extra fence wait (default 2000; 0 polls only).
+/// If the copy is still pending, the next completed present collects it before reusing the allocator.
+/// Orderly shutdown gets a separate five-second budget to collect the last pending capture and finish writing.
 fn frame_dump_due() -> bool {
+    if DUMP_SHUTDOWN.load(Ordering::Acquire) {
+        return false;
+    }
     if LOOK.swap(false, Ordering::Relaxed) {
         return true;
     }
@@ -1066,6 +1397,49 @@ fn frame_dump_due() -> bool {
         Err(_) => 0,
     });
     every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+}
+
+fn trace_planes_at(index: u64) -> bool {
+    static FRAMES: OnceLock<Vec<u64>> = OnceLock::new();
+    !DUMP_SHUTDOWN.load(Ordering::Acquire)
+        && FRAMES.get_or_init(|| std::env::var("XCL_PRESENT_PLANES_AT").unwrap_or_default()
+            .split(',').filter_map(|v| v.trim().parse().ok()).take(16).collect()).contains(&index)
+}
+
+struct PlaneSchedule {
+    after: u64,
+    stride: u64,
+    count: u64,
+}
+
+impl PlaneSchedule {
+    fn due(&self, elapsed: u64, next: u64) -> Option<u64> {
+        let slot = (elapsed.checked_sub(self.after)? / self.stride).min(self.count - 1);
+        (slot >= next).then_some(slot)
+    }
+}
+
+static NEXT_PLANE_CAPTURE: AtomicU64 = AtomicU64::new(0);
+
+fn plane_schedule() -> Option<&'static PlaneSchedule> {
+    static SCHEDULE: OnceLock<Option<PlaneSchedule>> = OnceLock::new();
+    SCHEDULE.get_or_init(|| {
+        let integer = |key| std::env::var(key).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        Some(PlaneSchedule {
+            after: integer("XCL_PRESENT_PLANES_AFTER_S")?,
+            stride: integer("XCL_PRESENT_PLANES_STRIDE_S").unwrap_or(60).max(1),
+            count: integer("XCL_PRESENT_PLANES_COUNT").unwrap_or(3).clamp(1, 16),
+        })
+    }).as_ref()
+}
+
+fn frame_dump_wait_ms() -> u32 {
+    static WAIT_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *WAIT_MS.get_or_init(|| parse_frame_dump_wait_ms(std::env::var("XCL_FRAME_DUMP_WAIT_MS").ok().as_deref()))
+}
+
+fn parse_frame_dump_wait_ms(setting: Option<&str>) -> u32 {
+    setting.and_then(|ms| ms.trim().parse().ok()).filter(|&ms| ms != u32::MAX).unwrap_or(2000)
 }
 
 /// The next shown frame is dumped whatever `XCL_FRAME_DUMP` says (a live look, `XCL_INPUT_FILE`).
@@ -1207,7 +1581,7 @@ fn small_float(v: u32, mantissa_bits: u32) -> f32 {
     }
 }
 
-unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
+unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str, n: u64) {
     let mut p: *mut c_void = std::ptr::null_mut();
     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
         return;
@@ -1247,7 +1621,6 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
         bmp.resize(start + row, 0);
     }
     rb.Unmap(0, None);
-    let n = PRESENTS.load(Ordering::Relaxed);
     // `XCL_TRACE_FRAME` also dumps intermediate targets; only the presented image belongs here.
     if tag == "frame" {
         static BOOTED: std::sync::Once = std::sync::Once::new();
@@ -1292,6 +1665,34 @@ impl Drop for Presenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plane_capture_schedule_depends_on_time_and_does_not_repeat() {
+        let schedule = PlaneSchedule { after: 200, stride: 60, count: 3 };
+        assert_eq!(schedule.due(199, 0), None);
+        assert_eq!(schedule.due(203, 0), Some(0));
+        assert_eq!(schedule.due(250, 1), None);
+        assert_eq!(schedule.due(262, 1), Some(1));
+        assert_eq!(schedule.due(330, 0), Some(2));
+        assert_eq!(schedule.due(390, 3), None);
+    }
+
+    #[test]
+    fn frame_dump_keeps_pending_capture_until_its_fence_completes() {
+        assert_eq!(dump_action(None, false), DumpAction::NoCapture);
+        assert_eq!(dump_action(None, true), DumpAction::NoCapture);
+        assert_eq!(dump_action(Some(23), false), DumpAction::Keep);
+        assert_eq!(dump_action(Some(23), true), DumpAction::Collect(23));
+    }
+
+    #[test]
+    fn frame_dump_wait_is_configurable_and_finite() {
+        assert_eq!(parse_frame_dump_wait_ms(None), 2000);
+        assert_eq!(parse_frame_dump_wait_ms(Some(" 5500 ")), 5500);
+        assert_eq!(parse_frame_dump_wait_ms(Some("0")), 0);
+        assert_eq!(parse_frame_dump_wait_ms(Some("-1")), 2000);
+        assert_eq!(parse_frame_dump_wait_ms(Some("4294967295")), 2000);
+    }
 
     #[test]
     fn frame_rate_uses_frame_and_time_deltas() {
@@ -1426,19 +1827,21 @@ mod frame_dump_tests {
                 buffer.Unmap(0, None);
             };
             fill(30);
-            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame", 17);
             let dark = last_frame_dump().unwrap();
+            assert_eq!(dark.frame, 17);
             assert_eq!((dark.width, dark.height, dark.format), (8, 8, 28));
             assert_eq!(dark.sampled_pixels, (8 / dark.sample_step).pow(2) as u64);
             assert_eq!(dark.non_dark_samples, Some(0));
 
             fill(31);
-            write_frame(&buffer, &fp, fp.Footprint.Format, "rt");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "rt", 18);
             assert_eq!(last_frame_dump(), Some(dark), "intermediate targets must not replace frame content");
-            write_frame(&buffer, &fp, fp.Footprint.Format, "frame");
+            write_frame(&buffer, &fp, fp.Footprint.Format, "frame", 18);
             let bright = last_frame_dump().unwrap();
+            assert_eq!(bright.frame, 18);
             assert_eq!(bright.non_dark_samples, Some(bright.sampled_pixels));
-            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame");
+            write_frame(&buffer, &fp, DXGI_FORMAT_R32_FLOAT, "frame", 19);
             let json = serde_json::to_value(last_frame_dump().unwrap()).unwrap();
             assert!(json["non_dark_samples"].is_null(), "undecoded is different from dark");
         }

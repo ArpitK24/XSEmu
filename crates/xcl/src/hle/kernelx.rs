@@ -415,6 +415,33 @@ pub(crate) fn without_page_views() -> impl Drop {
     Guard
 }
 
+/// (tests) `check`, for memory a test has just released: run with `[base, base + len)` reserved
+/// again behind XCL, so that no other test's allocation is there. Tests run side by side, and
+/// Windows gives a released address to the next allocation of any of them – whose records are
+/// then rightly at that address ("nothing of XCL's is here any more" failed a run in a few).
+/// Not run when another thread has the address already: there is nothing of this test's to see.
+/// That is counted – a check that is never run would pass for ever: once six looks have been
+/// asked for, more than two skipped beyond those that were run fail the test (not before: the
+/// first few skipped in a run side by side are chance, and failed whichever test came by).
+#[cfg(test)]
+pub(crate) unsafe fn in_released_memory(base: usize, len: usize, check: impl FnOnce()) {
+    use std::sync::atomic::AtomicUsize;
+    static RUN: AtomicUsize = AtomicUsize::new(0);
+    static SKIPPED: AtomicUsize = AtomicUsize::new(0);
+    let held = mem::VirtualAlloc(base as *const c_void, len, mem::MEM_RESERVE, mem::PAGE_NOACCESS);
+    if held as usize == base {
+        check();
+        RUN.fetch_add(1, Ordering::Relaxed);
+    } else {
+        SKIPPED.fetch_add(1, Ordering::Relaxed);
+    }
+    if !held.is_null() {
+        mem::VirtualFree(held, 0, mem::MEM_RELEASE);
+    }
+    let (run, skipped) = (RUN.load(Ordering::Relaxed), SKIPPED.load(Ordering::Relaxed));
+    assert!(run + skipped < 6 || skipped <= run + 2, "{skipped} looks at released memory were skipped (the address was taken again), {run} run");
+}
+
 fn note_graphics_reservation(base: usize, size: usize) {
     GRAPHICS_RESERVATIONS.lock().unwrap().insert(base, size);
     GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
@@ -569,20 +596,48 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
         let len = if size != 0 { size } else { crate::memmap::reservation(addr as usize).filter(|&(start, _)| start == addr as usize).map_or(0, |(start, end)| end - start) };
         physical::title_freed(addr as usize, len, "VirtualFree");
     }
+    // A release gives the address back to Windows, and the next allocation of any thread may be
+    // there at once: XCL's records of the memory go first. Taken out after the call, they were
+    // those of an allocation another thread had made there in between – its reservation was
+    // forgotten, and with it that its memory is the GPU's to see. Only for the release Windows
+    // takes of a reservation (no size, no other flag): a call it refuses for its form changes
+    // nothing, and nothing of XCL's either. (Should it refuse this one, all is put back as it
+    // was, what is committed in the reservation included: nothing was released then.)
+    let records = (t == mem::MEM_RELEASE && size == 0).then(|| {
+        let graphics = GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize));
+        if graphics.is_some() {
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        }
+        (graphics, crate::memmap::take(addr as usize))
+    });
     let ok = mem::VirtualFree(addr, size, t);
-    if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
-        GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
-    }
-    if ok != 0 {
-        if t & mem::MEM_RELEASE != 0 {
+    match records {
+        Some((graphics, reservation)) if ok == 0 => {
+            let e = fnd::GetLastError();
+            if let Some(bytes) = graphics {
+                note_graphics_reservation(addr as usize, bytes);
+            }
+            if let Some(taken) = reservation {
+                crate::memmap::restore(taken);
+            }
+            fnd::SetLastError(e);
+        }
+        Some(_) => {}
+        // (a release in another form that Windows took – of a placeholder, whose address stays
+        // the title's: forgotten after it, as ever)
+        None if ok != 0 && release => {
+            if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
+                GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            }
             crate::memmap::released(addr as usize);
-        } else if size == 0 {
+        }
+        None if ok != 0 && size == 0 => {
             if let Some((_, end)) = crate::memmap::reservation(addr as usize) {
                 crate::memmap::decommitted(addr as usize, end - addr as usize);
             }
-        } else {
-            crate::memmap::decommitted(addr as usize, size);
         }
+        None if ok != 0 => crate::memmap::decommitted(addr as usize, size),
+        None => {}
     }
     ok
 }
@@ -725,11 +780,12 @@ pub unsafe extern "system" fn XMemFreeDefault(p: *mut c_void, attrs: u64) {
         .or_else(|| crate::memmap::reservation(a).filter(|&(start, _)| start == a).map(|(start, end)| end - start));
     physical::title_freed(a, len.unwrap_or(0), "XMemFree");
     if !crate::hle::d3d12x::sparse::free(p as usize) && !crate::gpu::uma::get().is_some_and(|u| u.free(p as usize)) {
-        mem::VirtualFree(p, 0, mem::MEM_RELEASE);
+        // (XCL's records first: once released, the address may be another thread's, `VirtualFree`)
         crate::memmap::released(p as usize);
         if GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(p as usize)).is_some() {
             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
         }
+        mem::VirtualFree(p, 0, mem::MEM_RELEASE);
     }
 }
 
@@ -1831,7 +1887,7 @@ mod tests {
                 assert_eq!(mem::GetWriteWatch(0, p, PHYS_PAGE_SIZE, dirty.as_mut_ptr(), &mut count, &mut granularity), 0);
                 assert_eq!((count, dirty[0]), (1, p));
                 assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
-                assert!(!in_graphics_reservation(p as usize));
+                in_released_memory(p as usize, PHYS_PAGE_SIZE, || assert!(!in_graphics_reservation(p as usize)));
             }
         }
     }
@@ -2104,7 +2160,7 @@ mod tests {
                 assert_eq!(mem::GetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
                 assert_eq!(&buf[..n], &[(a + 0x2_1000) as *mut c_void], "flags {t:#x}: the written page is reported");
                 assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
-                assert!(!in_graphics_reservation(a));
+                in_released_memory(q as usize, size, || assert!(!in_graphics_reservation(a)));
             }
         }
     }
@@ -2125,6 +2181,62 @@ mod tests {
                 assert_eq!(crate::memmap::access(p as usize + 0x2800, 4), None);
                 mem::VirtualFree(p, 0, mem::MEM_RELEASE);
             }
+        }
+    }
+
+    /// A release forgets XCL's records of the memory before the address goes back to Windows.
+    /// Forgotten after, they were the records of whoever had the address next: two threads take
+    /// turns at one address here (and at whatever Windows gives a watched reservation), and each
+    /// sees its own allocation recorded for as long as it has it.
+    #[test]
+    fn a_release_leaves_the_records_of_the_next_allocation_at_its_address() {
+        unsafe {
+            let at = mem::VirtualAlloc(std::ptr::null(), 0x1_0000, mem::MEM_RESERVE, mem::PAGE_NOACCESS) as usize;
+            assert_ne!(at, 0);
+            mem::VirtualFree(at as *mut c_void, 0, mem::MEM_RELEASE);
+            let turns = || {
+                for _ in 0..20_000 {
+                    let p = VirtualAlloc(at as *const c_void, 0x1_0000, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+                    if !p.is_null() {
+                        for _ in 0..16 {
+                            assert_eq!(crate::memmap::reservation(at), Some((at, at + 0x1_0000)), "the reservation of the thread that has the address");
+                        }
+                        assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
+                    }
+                    let q = reserve_watched(0x1_0000, mem::MEM_RESERVE, mem::PAGE_READWRITE);
+                    assert!(!q.is_null());
+                    crate::memmap::reserved(q as usize, 0x1_0000);
+                    for _ in 0..16 {
+                        assert!(in_graphics_reservation(q as usize), "the graphics reservation of the thread that has the address");
+                        assert_eq!(crate::memmap::reservation(q as usize), Some((q as usize, q as usize + 0x1_0000)));
+                    }
+                    assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
+                }
+            };
+            std::thread::scope(|s| {
+                s.spawn(turns);
+                turns();
+            });
+        }
+    }
+
+    /// A release Windows refuses (a size with it) leaves XCL's records as they were: the
+    /// reservation, what is committed in it, and that it is the GPU's to see.
+    #[test]
+    fn a_refused_release_changes_none_of_the_records() {
+        unsafe {
+            let p = VirtualAlloc(std::ptr::null(), 0x1_0000, mem::MEM_RESERVE | mem::MEM_COMMIT, mem::PAGE_READWRITE);
+            assert!(!p.is_null());
+            note_graphics_reservation(p as usize, 0x1_0000);
+            for t in [mem::MEM_RELEASE, mem::MEM_RELEASE | mem::MEM_DECOMMIT] {
+                let size = if t == mem::MEM_RELEASE { 0x1000 } else { 0 };
+                assert_eq!(VirtualFree(p, size, t), 0, "flags {t:#x}");
+                assert_eq!(crate::memmap::reservation(p as usize), Some((p as usize, p as usize + 0x1_0000)));
+                assert_eq!(crate::memmap::access(p as usize, 0x1_0000), Some(crate::memmap::Access::Write), "what is committed stays known");
+                assert!(in_graphics_reservation(p as usize));
+            }
+            assert_eq!(VirtualFree(p, 0, mem::MEM_RELEASE), 1);
+            in_released_memory(p as usize, 0x1_0000, || assert!(!in_graphics_reservation(p as usize) && crate::memmap::reservation(p as usize).is_none()));
         }
     }
 
@@ -2156,7 +2268,7 @@ mod tests {
             assert_eq!(VirtualFree(host, 0x1000, mem::MEM_RELEASE), 0);
             assert!(in_graphics_reservation(host as usize));
             assert_eq!(VirtualFreeEx(cur, host, 0, mem::MEM_RELEASE), 1);
-            assert!(!in_graphics_reservation(host as usize));
+            in_released_memory(host as usize, 0x10000, || assert!(!in_graphics_reservation(host as usize)));
 
             // Sparse UMA reservation: invalid flag combos / non-zero MEM_RELEASE fail without freeing;
             // VirtualFreeEx(GetCurrentProcess(), ...) releases cleanly.

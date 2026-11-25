@@ -470,7 +470,7 @@ static RES: Mutex<Option<ViewOwners>> = Mutex::new(None);
 
 /// The view in slot `s` names `res` (0: none).
 pub fn note_resource(s: &Slot, res: usize) {
-    if s.sampler || !(super::present::trace_frame() || super::markers::enabled()) {
+    if s.sampler || !(super::present::trace_frame() || super::markers::enabled() || super::present::writer_trace_configured()) {
         return;
     }
     RES.lock().unwrap().get_or_insert_with(Default::default).note(s, res);

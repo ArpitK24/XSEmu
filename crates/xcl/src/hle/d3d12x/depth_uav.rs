@@ -553,13 +553,15 @@ fn mark_in_step(list: *mut c_void, res: usize, sub: u32) {
 /// PC `Dispatch` of an adopted list (XCL's own calls of it for the title's dispatches).
 pub(super) unsafe extern "system" fn pc_dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
     note_op(this);
-    raw::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, DISPATCH)(this, x, y, z)
+    let f = raw::<unsafe extern "system" fn(*mut c_void, u32, u32, u32)>(this, DISPATCH);
+    super::gpu_timing::op_grid(this, super::gpu_timing::Kind::Dispatch, || 0, [x, y, z], || f(this, x, y, z))
 }
 
 /// PC `ClearDepthStencilView` of an adopted list.
 pub(super) unsafe extern "system" fn pc_clear_depth_stencil(this: *mut c_void, dsv: usize, flags: u32, depth: f32, stencil: u8, n: u32, rects: *const RECT) {
     note_op(this);
-    raw::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const RECT)>(this, CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    let f = raw::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const RECT)>(this, CLEAR_DEPTH_STENCIL_VIEW);
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || f(this, dsv, flags, depth, stencil, n, rects))
 }
 
 // ---------------------------------------------------------------------------------------

@@ -242,7 +242,9 @@ unsafe fn transition(list: *mut c_void, res: usize, before: D3D12_RESOURCE_STATE
             }),
         },
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+    super::gpu_timing::class(list, super::gpu_timing::Kind::Barrier, || {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(list, PC_RESOURCE_BARRIER)(list, 1, &b);
+    });
 }
 
 /// `op` with the window buffer `res` as a copy destination (back to COMMON after it)
@@ -253,7 +255,9 @@ unsafe fn as_copy_dest(list: *mut c_void, res: usize, op: impl FnOnce()) {
 }
 
 unsafe fn copy_buffer_region(list: *mut c_void, dst: usize, dst_off: u64, src: usize, src_off: u64, n: u64) {
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
+    super::gpu_timing::class(list, super::gpu_timing::Kind::Transfer, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(list, PC_COPY_BUFFER_REGION)(list, dst, dst_off, src, src_off, n);
+    });
 }
 
 fn warn(counter: &AtomicU64, what: &str, why: std::fmt::Arguments) {
@@ -343,13 +347,12 @@ fn compare_u64(op: u32, lhs: u64, rhs: u64) -> Option<bool> {
 
 impl PendingWait {
     unsafe fn read_value(&self) -> Option<u64> {
+        // (as a copy, `memmap::title_words`: the title can unmap the page between a look at
+        // it and the load)
         let addr = self.va as usize;
-        if !crate::gpu::shader::readable(addr, self.width as usize) {
-            return None;
-        }
         match self.width {
-            4 => Some((*(addr as *const AtomicU32)).load(Ordering::Acquire) as u64),
-            8 => Some((*(addr as *const AtomicU64)).load(Ordering::Acquire)),
+            4 => Some(crate::memmap::title_words(addr, 1)?[0] as u64),
+            8 => crate::memmap::title_words(addr, 2).map(|w| w[0] as u64 | (w[1] as u64) << 32),
             _ => None,
         }
     }
@@ -462,7 +465,7 @@ pub(super) unsafe fn geometry_summary(list: *mut c_void, draw: (bool, u32, u32, 
         out
     };
     let words = |a: u64, n: usize| -> Option<Vec<u32>> {
-        (a != 0 && crate::gpu::shader::readable(a as usize, 4 * n)).then(|| (0..n).map(|k| ((a as usize + 4 * k) as *const u32).read_unaligned()).collect())
+        (a != 0).then(|| crate::memmap::title_words(a as usize, n)).flatten()
     };
     let mut out = Vec::new();
     for (slot, (a, size, stride)) in vbs {
@@ -477,8 +480,8 @@ pub(super) unsafe fn geometry_summary(list: *mut c_void, draw: (bool, u32, u32, 
         ib.and_then(|(a, _, fmt)| {
             let w = if fmt == 57 { 2 } else { 4 };
             let at = a as usize + w * first as usize;
-            (a != 0 && crate::gpu::shader::readable(at, w * n)).then(|| {
-                (0..n).map(|k| if w == 2 { ((at + 2 * k) as *const u16).read_unaligned() as u64 } else { ((at + 4 * k) as *const u32).read_unaligned() as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
+            (a != 0).then(|| crate::memmap::title_bytes(at, w * n)).flatten().map(|b| {
+                b.chunks_exact(w).map(|c| if w == 2 { u16::from_le_bytes([c[0], c[1]]) as u64 } else { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
             })
         })
     } else {
@@ -508,10 +511,8 @@ pub(super) unsafe fn dump_pending_geometry() {
             (true, Some((ia, _, fmt))) => {
                 let w = if fmt == 57 { 2 } else { 4 };
                 let at = ia as usize + w * first as usize;
-                if !crate::gpu::shader::readable(at, w * n) {
-                    continue;
-                }
-                (0..n).map(|k| if w == 2 { ((at + 2 * k) as *const u16).read_unaligned() as u64 } else { ((at + 4 * k) as *const u32).read_unaligned() as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
+                let Some(b) = crate::memmap::title_bytes(at, w * n) else { continue };
+                b.chunks_exact(w).map(|c| if w == 2 { u16::from_le_bytes([c[0], c[1]]) as u64 } else { u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as u64 }).map(|i| (i as i64 + base as i64) as u64).collect()
             }
             _ => (0..n as u64).map(|k| first as u64 + k).collect(),
         };
@@ -524,7 +525,7 @@ pub(super) unsafe fn dump_pending_geometry() {
             .take(24)
             .map(|&i| {
                 let at = (a + i * stride as u64) as usize;
-                let w: Option<Vec<u32>> = crate::gpu::shader::readable(at, 4 * per).then(|| (0..per).map(|k| ((at + 4 * k) as *const u32).read_unaligned()).collect());
+                let w: Option<Vec<u32>> = crate::memmap::title_words(at, per);
                 format!("v{i}: {w:x?}")
             })
             .collect();
@@ -640,6 +641,16 @@ pub(super) unsafe fn note_render_targets(this: *mut c_void, n: u32, rtvs: *const
     let handles = if read_count == 0 { Vec::new() } else { std::slice::from_raw_parts(rtvs, read_count).to_vec() };
     let d = dsv.as_ref().copied();
     with_bindings(this, |b| b.render_targets = Some(RenderTargets { num_targets, handles, single, dsv: d }));
+}
+
+pub(super) fn bound_color_resources(list: *mut c_void) -> Vec<usize> {
+    let mut targets = None;
+    with_bindings(list, |b| targets = b.render_targets.clone());
+    let Some(targets) = targets else { return Vec::new() };
+    (0..targets.num_targets as usize).filter_map(|i| {
+        let handle = if targets.single != 0 { *targets.handles.first()? + i * 32 } else { *targets.handles.get(i)? };
+        super::present::rtv_resource(handle)
+    }).collect()
 }
 
 /// Set again what `b` holds (after KickoffX's Reset or a deferred mid-list split).
@@ -926,6 +937,7 @@ pub(super) fn on_release(list: usize) {
 
 /// Clear per-recording sync/write tracking on a split segment moved into `title_list`'s spare pool.
 pub(super) fn clear_segment_state(list: usize) {
+    super::gpu_timing::forget(list);
     super::title_textures::list_reset(list);
     if let Some(s) = LISTS.lock().unwrap().as_mut().and_then(|m| m.get_mut(&list)) {
         s.occlusion = Occlusion::default();
@@ -2037,6 +2049,9 @@ unsafe fn try_gpu_wait(queue: *mut c_void, w: &PendingWait, list_writes: &[(u64,
         return GpuWaitOutcome::FallbackCpu;
     }
 
+    if super::gpu_timing::enabled() && !real::is_adopted(queue) {
+        real::note_profiled_gpu_wait(queue, fence.as_raw() as usize, w.value);
+    }
     wake_sync_watchdog();
     if traced_queue(q_raw) || final_prod_q.is_some_and(traced_queue) {
         trace_queue(|| format!("q{} seq {wait_seq}: GPU Wait {:#x} >= {:#x} (producer q{:?}{})", queue_id(q_raw), w.va, w.value, final_prod_q.map(queue_id), if unsubmitted { ", its Signal not submitted yet" } else { "" }));
@@ -2238,7 +2253,8 @@ pub(super) unsafe fn first_unwritten_wait(lists: &[usize]) -> Option<(usize, u64
 /// (`single`) A queue has been given a write of `value` or more at `va`, or memory holds it.
 pub(super) unsafe fn cell_written(va: u64, value: u64) -> bool {
     let given = SYNC_GRAPH.lock().unwrap().as_ref().and_then(|g| g.cells.get(&va)).is_some_and(|c| c.submitted_max >= value || c.cpu_signaled_max >= value);
-    given || (crate::gpu::shader::readable(va as usize, 8) && (*(va as usize as *const AtomicU64)).load(Ordering::Acquire) >= value)
+    // (memory: as a copy, `memmap::title_words`)
+    given || crate::memmap::title_words(va as usize, 2).is_some_and(|w| (w[0] as u64 | (w[1] as u64) << 32) >= value)
 }
 
 /// (`single`) One of `lists` writes `value` or more at `va`.
@@ -2509,7 +2525,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
     if let Some((d, off)) = uma_dst {
         note_write(list as usize, va, 8);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        as_copy_dest(list, d, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off));
+        as_copy_dest(list, d, || super::gpu_timing::class(list, super::gpu_timing::Kind::Transfer, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, d, off)));
     } else if let Some((rb, base)) = readback {
         // Queue the CPU copy only if the list is tracked; otherwise avoid emitting an unused resolve.
         let mut g = LISTS.lock().unwrap();
@@ -2522,7 +2538,7 @@ unsafe fn timestamp(list: *mut c_void, va: u64, what: &str) {
         drop(g);
         super::residency::note_list_resources(list as usize, [rb_raw]);
         pc::<unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32)>(list, PC_END_QUERY)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i);
-        pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off);
+        super::gpu_timing::class(list, super::gpu_timing::Kind::Transfer, || pc::<Resolve>(list, PC_RESOLVE_QUERY_DATA)(list, heap, D3D12_QUERY_TYPE_TIMESTAMP, i, 1, rb_raw, off));
     }
 }
 
@@ -2603,6 +2619,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         }
     }
 
+    super::gpu_timing::before_close(list);
     let ext = *(list as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(list, PC_CLOSE)(list);
     real::preserve_vtable(list, ext);
@@ -2626,6 +2643,7 @@ unsafe fn try_split_for_wait(list: *mut c_void) -> Option<*mut c_void> {
         let reset_hr = pc::<unsafe extern "system" fn(*mut c_void, usize, usize) -> i32>(spare, PC_RESET)(spare, alloc, init_pso);
         real::preserve_vtable(spare, ext_spare);
         if reset_hr >= 0 {
+            super::gpu_timing::opened(spare, bound_pso);
             next_pc = Some(spare);
         }
     }
@@ -2846,7 +2864,9 @@ pub(super) unsafe extern "system" fn uav_barrier_x(this: *mut c_void, _n: u32, _
             UAV: ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER { pResource: ManuallyDrop::new(None) }),
         },
     };
-    pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Barrier, || {
+        pc::<unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER)>(this, PC_RESOURCE_BARRIER)(this, 1, &b);
+    });
 }
 
 /// command list #84 CopyResourceX(destination, source, flags); in place (the console's
@@ -3116,6 +3136,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
         }
     }
 
+    super::gpu_timing::before_close(this);
     let ext = *(this as *const usize);
     let close_hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, PC_CLOSE)(this);
     real::preserve_vtable(this, ext);
@@ -3145,7 +3166,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if let Some((_, ref prior, _)) = kickoff_split {
         if !prior.is_empty() {
             execute_with_waits_on(q_raw, prior, |chunk| {
-                exec(q_raw, chunk.len() as u32, chunk.as_ptr());
+                super::gpu_timing::submit(q_raw, chunk, || exec(q_raw, chunk.len() as u32, chunk.as_ptr()));
+                super::present::submit_plane_writes(q_raw, chunk);
                 signal_write64_fences(q_raw, chunk);
                 readback_sparse_writes(q_raw, chunk);
                 cpu_writes_after(q_raw, chunk);
@@ -3164,7 +3186,8 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if traced_queue(q_raw as usize) {
         trace_queue(|| format!("q{}: KickoffX of one list ({} waits, {} Write64 signals)", queue_id(q_raw as usize), waits.len(), write64_signals.len()));
     }
-    exec(q_raw, 1, one.as_ptr());
+    super::gpu_timing::submit(q_raw, &one, || exec(q_raw, 1, one.as_ptr()));
+    super::present::submit_plane_writes(q_raw, &one);
     super::residency::after_submit(q_raw, submission);
     signal_write64_pairs(q_raw, &write64_signals);
     // what ran is in the textures' states; the list records anew after its Reset below
@@ -3220,6 +3243,7 @@ pub unsafe extern "system" fn kickoff_x(this: *mut c_void) {
     if reset_hr < 0 {
         return warn(&ERR, "KickoffX", format_args!("Reset after kickoff failed ({reset_hr:#x})"));
     }
+    super::gpu_timing::opened(target, bound_pso);
     super::residency::list_reset(target as usize);
     super::depth_uav::list_reset(target as usize);
     let bindings = LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(target as usize))).map(|s| s.bindings.clone());
@@ -3556,7 +3580,8 @@ pub(super) unsafe fn sync_title_buffers(list: *mut c_void, indexed: Option<(u32,
         let from = from.min(bytes as u64);
         let len = len.min(bytes as u64 - from) as usize;
         if len > 0 && crate::gpu::shader::readable(va as usize + from as usize, len) {
-            std::ptr::copy_nonoverlapping((va + from) as *const u8, (mirror + from as usize) as *mut u8, len);
+            // (as a copy: another thread of the title's can unmap the buffer under the read)
+            super::title_textures::with_title_bytes(va as usize + from as usize, len, |now| std::ptr::copy_nonoverlapping(now.as_ptr(), (mirror + from as usize) as *mut u8, len));
         }
     };
     // the vertices read: [lo, hi)
@@ -3702,7 +3727,7 @@ pub(super) unsafe extern "system" fn ia_set_vertex_buffers_x(this: *mut c_void, 
                 let i = N.fetch_add(1, Ordering::Relaxed);
                 if i < 12 || (i.is_power_of_two() && i < 1 << 16) {
                     let n = (v.SizeInBytes as usize).min(256);
-                    let data = (title != 0 && crate::gpu::shader::readable(title as usize, n)).then(|| std::slice::from_raw_parts(title as *const u8, n).iter().filter(|&&b| b != 0).count());
+                    let data = (title != 0).then(|| crate::memmap::title_bytes(title as usize, n)).flatten().map(|b| b.iter().filter(|&&b| b != 0).count());
                     let win = crate::gpu::uma::get().and_then(|u| u.window_of(title as usize).map(|w| (w, u.window(w), u.is_sparse(title as usize))));
                     let mut mbi: windows_sys::Win32::System::Memory::MEMORY_BASIC_INFORMATION = std::mem::zeroed();
                     let q = windows_sys::Win32::System::Memory::VirtualQuery(title as *const c_void, &mut mbi, std::mem::size_of_val(&mbi));
@@ -3805,6 +3830,7 @@ pub unsafe extern "system" fn reset_x(this: *mut c_void, alloc: usize, pso: usiz
         return hr;
     }
 
+    super::gpu_timing::opened(this, pso);
     let is_bundle = {
         let mut g = LISTS.lock().unwrap();
         let s = g.get_or_insert_with(HashMap::new).entry(this as usize).or_default();
@@ -3952,7 +3978,9 @@ pub(super) unsafe extern "system" fn resource_barrier_x(this: *mut c_void, n: u3
         super::residency::note_list_untracked(this as usize);
     }
     if !out.is_empty() {
-        pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+        super::gpu_timing::class(this, super::gpu_timing::Kind::Barrier, || {
+            pc::<unsafe extern "system" fn(*mut c_void, u32, *const [u32; 8])>(this, PC_RESOURCE_BARRIER)(this, out.len() as u32, out.as_ptr());
+        });
     }
     if !depth_copies.is_empty() {
         super::depth_uav::after_barriers(this, depth_copies);
@@ -3973,6 +4001,7 @@ unsafe fn is_buffer(res: usize) -> bool {
 
 /// DMA list #9 Close: as on the PC; a failure is logged (the title stops on it)
 pub(super) unsafe extern "system" fn dma_close_x(this: *mut c_void) -> i32 {
+    super::gpu_timing::before_close(this);
     let ext = *(this as *const usize);
     let hr = pc::<unsafe extern "system" fn(*mut c_void) -> i32>(this, 9)(this);
     real::preserve_vtable(this, ext);
@@ -4017,7 +4046,7 @@ pub(super) unsafe extern "system" fn copy_buffer_region_x(this: *mut c_void, dst
             note_gpu_write("CopyBufferRegion", a + dst_off as usize, n);
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u64, usize, u64, u64)>(this, PC_COPY_BUFFER_REGION)(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
+    copy_buffer_region(this, dst, dst_off + real::buffer_delta(dst), src, src_off + real::buffer_delta(src), n)
 }
 
 /// `XCL_TRACE_FRAME` with a watched target (`present::watch_rt`): copies out of it – that
@@ -4050,6 +4079,10 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     if let Some(d) = dst.as_ref() {
         let r: usize = transmute_copy(&d.pResource);
         super::present::note_use(r, super::present::USE_COPY);
+        if super::present::writer_trace_active() && super::present::is_writer_target(r) {
+            let source = src.as_ref().map_or(0, |s| transmute_copy::<_, usize>(&s.pResource));
+            trace_plane_transfer(this, r, source, "texture copy");
+        }
         super::title_textures::note_gpu_write(r);
         super::vram::note_gpu_write(r);
         if super::present::trace_frame() {
@@ -4073,7 +4106,7 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
                             (Some(a), Some(f)) => {
                                 let at = a + f.Offset as usize;
                                 let n = (f.Footprint.RowPitch as usize * 4).min(4096);
-                                if crate::gpu::shader::readable(at, n) { Some(std::slice::from_raw_parts(at as *const u8, n).iter().filter(|&&b| b != 0).count()) } else { None }
+                                crate::memmap::title_bytes(at, n).map(|b| b.iter().filter(|&&b| b != 0).count())
                             }
                             _ => None,
                         };
@@ -4120,7 +4153,9 @@ pub(super) unsafe extern "system" fn copy_texture_region_x(this: *mut c_void, ds
     }
     let (Some(d), Some(s)) = (pc_location(dst), pc_location(src)) else { return };
     super::residency::note_list_resources(this as usize, [transmute_copy(&d.pResource), transmute_copy(&s.pResource)]);
-    pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Transfer, || {
+        pc::<unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX)>(this, PC_COPY_TEXTURE_REGION)(this, &d, x, y, z, &s, bx);
+    });
     std::mem::forget((d, s)); // borrowed resource pointers
 }
 
@@ -4148,11 +4183,20 @@ pub(super) unsafe extern "system" fn clear_depth_stencil_x(this: *mut c_void, ds
             );
         }
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Clear, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u32, f32, u8, u32, *const windows::Win32::Foundation::RECT)>(this, PC_CLEAR_DEPTH_STENCIL_VIEW)(this, dsv, flags, depth, stencil, n, rects)
+    })
 }
 
 const PC_RESOLVE_SUBRESOURCE: usize = 19;
 const PC_RESOLVE_SUBRESOURCE_REGION: usize = 64;
+
+fn trace_plane_transfer(list: *mut c_void, dst: usize, src: usize, op: &'static str) {
+    if super::present::writer_trace_active() && super::present::is_writer_target(dst) {
+        let backing = super::residency::describe_backing(src).unwrap_or_else(|| "untracked".into());
+        super::present::record_plane_write(list as usize, dst, op, 0, vec![format!("source {src:#x} {backing}")]);
+    }
+}
 
 /// `XCL_TRACE_FRAME`: a resolve (first 12 and powers of two) – what goes where
 unsafe fn trace_resolve(what: &str, dst: usize, src: usize, format: i32, extra: &str) {
@@ -4185,8 +4229,11 @@ pub(super) unsafe extern "system" fn resolve_subresource_x(this: *mut c_void, ds
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
     super::vram::note_gpu_write(dst);
+    trace_plane_transfer(this, dst, src, "resolve");
     trace_resolve("ResolveSubresource", dst, src, format, "");
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Transfer, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u32, usize, u32, i32)>(this, PC_RESOLVE_SUBRESOURCE)(this, dst, dst_sub, src, src_sub, format)
+    })
 }
 
 /// command list #108 ResolveSubresourceRegion(dst, dst sub, x, y, src, src sub, rect, format,
@@ -4197,10 +4244,13 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
     super::residency::note_list_resources(this as usize, [dst, src]);
     super::present::note_use(dst, super::present::USE_COPY);
     super::vram::note_gpu_write(dst);
+    trace_plane_transfer(this, dst, src, "region resolve");
     if super::present::trace_frame() {
         trace_resolve("ResolveSubresourceRegion", dst, src, format, &format!(" mode {mode} at ({x}, {y}) rect {:?}", rect.as_ref().map(|r| (r.left, r.top, r.right, r.bottom))));
     }
-    pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Transfer, || {
+        pc::<unsafe extern "system" fn(*mut c_void, usize, u32, u32, u32, usize, u32, *const windows::Win32::Foundation::RECT, i32, i32)>(this, PC_RESOLVE_SUBRESOURCE_REGION)(this, dst, dst_sub, x, y, src, src_sub, rect, format, mode)
+    })
 }
 
 /// CopyResource(dst, src) (PC #17; DMA list #13): buffers placed below their console address
@@ -4208,6 +4258,7 @@ pub(super) unsafe extern "system" fn resolve_subresource_region_x(this: *mut c_v
 pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usize, src: usize) {
     super::depth_uav::note_op(this);
     super::present::note_use(dst, super::present::USE_COPY);
+    trace_plane_transfer(this, dst, src, "resource copy");
     super::title_textures::note_gpu_write(dst);
     super::vram::note_gpu_write(dst);
     if super::present::trace_frame() {
@@ -4216,7 +4267,9 @@ pub(super) unsafe extern "system" fn copy_resource_x(this: *mut c_void, dst: usi
     let (dd, sd) = (real::buffer_delta(dst), real::buffer_delta(src));
     if dd == 0 && sd == 0 {
         super::residency::note_list_resources(this as usize, [dst, src]);
-        return pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src);
+        return super::gpu_timing::class(this, super::gpu_timing::Kind::Transfer, || {
+            pc::<unsafe extern "system" fn(*mut c_void, usize, usize)>(this, PC_COPY_RESOURCE)(this, dst, src)
+        });
     }
     let n = real::console_buffer(dst).or(real::console_buffer(src)).map_or(0, |b| b.1 as u64);
     copy_buffer_region_x(this, dst, 0, src, 0, n);
@@ -4275,7 +4328,7 @@ pub(super) unsafe extern "system" fn resolve_query_data_x(this: *mut c_void, hea
     super::residency::note_list_resources(this as usize, [dest]);
     let pc_offset = offset.saturating_add(real::buffer_delta(dest));
     type F = unsafe extern "system" fn(*mut c_void, usize, D3D12_QUERY_TYPE, u32, u32, usize, u64);
-    pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset);
+    super::gpu_timing::class(this, super::gpu_timing::Kind::Transfer, || pc::<F>(this, PC_RESOLVE_QUERY_DATA)(this, heap, ty, first, count, dest, pc_offset));
     if !is_occlusion(ty) {
         return;
     }
@@ -5469,13 +5522,8 @@ mod tests {
             let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).unwrap();
 
             let list_ptr = list.as_raw();
-            let orig_vt = *(list_ptr as *const *const usize);
-            let mut ext_vt = [0usize; 65];
-            ext_vt[0] = orig_vt as usize;
-            std::ptr::copy_nonoverlapping(orig_vt, ext_vt.as_mut_ptr().add(1), 64);
-
+            real::readopt(list_ptr, real::Kind::CommandList);
             on_create(list_ptr, alloc.as_raw() as usize, 0, D3D12_COMMAND_LIST_TYPE_DIRECT);
-            *(list_ptr as *mut *const usize) = ext_vt.as_ptr().add(1);
 
             let bottom_ts = Box::new(0u64);
             let top_ts = Box::new(0u64);
@@ -5498,11 +5546,11 @@ mod tests {
                 assert_eq!(g.as_ref().unwrap()[&(list_ptr as usize)].cpu_writes.len(), 2);
             }
 
-            // Restore the real vtable before closing and executing on the PC queue.
-            *(list_ptr as *mut *const usize) = orig_vt;
             list.Close().unwrap();
-            let cl: ID3D12CommandList = list.cast().unwrap();
-            q.ExecuteCommandLists(&[Some(cl)]);
+            type Execute = unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void);
+            let (target, _) = real::original_or_native(q.as_raw(), 10);
+            let execute: Execute = std::mem::transmute(target);
+            execute(q.as_raw(), 1, &list_ptr);
             cpu_writes_after(q.as_raw(), &[list_ptr]);
 
             let t = Instant::now();
@@ -5513,7 +5561,6 @@ mod tests {
             assert_ne!(*top_ts, 0);
             assert_ne!(*bottom_ts, 0);
 
-            on_release(list_ptr as usize);
         }
     }
 

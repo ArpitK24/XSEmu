@@ -5,7 +5,7 @@ use std::ffi::c_void;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
-use super::real::{orig_fn, slot_of};
+use super::real::original_or_native;
 use super::residency::{note_list_resources, note_list_untracked};
 
 pub(super) const OPAQUE_METHODS: &[&str] = &[
@@ -24,46 +24,69 @@ pub(super) const OPAQUE_METHODS: &[&str] = &[
 type Obj = *mut c_void;
 
 macro_rules! direct_uses {
-    ($($method:ident($this:ident $(, $arg:ident: $ty:ty)*) => $record:expr;)*) => {
+    ($($method:ident $vtbl:ident ($this:ident $(, $arg:ident: $ty:ty)*) $class:ident => $record:expr;)*) => {
         pub(super) fn overrides(v: &mut Vec<(&'static str, usize)>) {
-            v.extend_from_slice(&[$((stringify!($method), $method as usize)),*]);
+            let timing = cfg!(test) || super::gpu_timing::enabled();
+            v.extend([$((stringify!($method), $method as usize)),*].into_iter().filter(|&(name, _)| {
+                timing || !matches!(name, "Barrier" | "WriteBufferImmediate" | "ClearUnorderedAccessViewUint" | "ClearUnorderedAccessViewFloat")
+            }));
         }
 
         $(unsafe extern "system" fn $method($this: Obj $(, $arg: $ty)*) {
-            let f: unsafe extern "system" fn(Obj $(, $ty)*) =
-                std::mem::transmute(orig_fn($this, slot_of($this, stringify!($method))));
-            $record;
-            f($this $(, $arg)*);
+            let slot = std::mem::offset_of!($vtbl, $method) / size_of::<usize>();
+            let (target, adopted) = original_or_native($this, slot);
+            let f: unsafe extern "system" fn(Obj $(, $ty)*) = std::mem::transmute(target);
+            if !adopted {
+                return f($this $(, $arg)*);
+            }
+            if super::residency::eviction_enabled() {
+                $record;
+            }
+            direct_uses!(@emit $class, $this, || f($this $(, $arg)*));
         })*
+    };
+    (@emit Untimed, $list:ident, $call:expr) => { ($call)() };
+    (@emit $class:ident, $list:ident, $call:expr) => {
+        super::gpu_timing::class($list, super::gpu_timing::Kind::$class, $call)
     };
 }
 
 direct_uses! {
-    CopyBufferRegion(list, dst: Obj, dst_off: u64, src: Obj, src_off: u64, bytes: u64)
+    CopyBufferRegion ID3D12GraphicsCommandList_Vtbl(list, dst: Obj, dst_off: u64, src: Obj, src_off: u64, bytes: u64) Transfer
         => note_list_resources(list as usize, [dst as usize, src as usize]);
-    CopyTextureRegion(list, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32,
-                      src: *const D3D12_TEXTURE_COPY_LOCATION, box_: *const D3D12_BOX)
+    CopyTextureRegion ID3D12GraphicsCommandList_Vtbl(list, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32,
+                      src: *const D3D12_TEXTURE_COPY_LOCATION, box_: *const D3D12_BOX) Transfer
         => note_list_resources(list as usize, [dst, src].into_iter().filter_map(|p|
             p.as_ref()?.pResource.as_ref().map(|r| r.as_raw() as usize)));
-    CopyResource(list, dst: Obj, src: Obj)
+    CopyResource ID3D12GraphicsCommandList_Vtbl(list, dst: Obj, src: Obj) Transfer
         => note_list_resources(list as usize, [dst as usize, src as usize]);
-    CopyTiles(list, tiled: Obj, coord: *const D3D12_TILED_RESOURCE_COORDINATE,
-              region: *const D3D12_TILE_REGION_SIZE, buf: Obj, offset: u64, flags: D3D12_TILE_COPY_FLAGS)
+    CopyTiles ID3D12GraphicsCommandList_Vtbl(list, tiled: Obj, coord: *const D3D12_TILED_RESOURCE_COORDINATE,
+              region: *const D3D12_TILE_REGION_SIZE, buf: Obj, offset: u64, flags: D3D12_TILE_COPY_FLAGS) Transfer
         => note_list_resources(list as usize, [tiled as usize, buf as usize]);
-    ResolveSubresource(list, dst: Obj, dst_sub: u32, src: Obj, src_sub: u32, fmt: i32)
+    ResolveSubresource ID3D12GraphicsCommandList_Vtbl(list, dst: Obj, dst_sub: u32, src: Obj, src_sub: u32, fmt: i32) Transfer
         => note_list_resources(list as usize, [dst as usize, src as usize]);
-    ResourceBarrier(list, n: u32, barriers: *const D3D12_RESOURCE_BARRIER)
+    ResourceBarrier ID3D12GraphicsCommandList_Vtbl(list, n: u32, barriers: *const D3D12_RESOURCE_BARRIER) Barrier
         => note_barriers(list as usize, n, barriers);
-    DiscardResource(list, res: Obj, desc: *const D3D12_DISCARD_REGION)
+    DiscardResource ID3D12GraphicsCommandList_Vtbl(list, res: Obj, desc: *const D3D12_DISCARD_REGION) Barrier
         => note_list_resources(list as usize, [res as usize]);
-    ResolveQueryData(list, heap: Obj, ty: D3D12_QUERY_TYPE, first: u32, n: u32, dst: Obj, offset: u64)
+    ResolveQueryData ID3D12GraphicsCommandList_Vtbl(list, heap: Obj, ty: D3D12_QUERY_TYPE, first: u32, n: u32, dst: Obj, offset: u64) Transfer
         => note_list_resources(list as usize, [dst as usize]);
-    SetPredication(list, buf: Obj, offset: u64, op: D3D12_PREDICATION_OP)
+    SetPredication ID3D12GraphicsCommandList_Vtbl(list, buf: Obj, offset: u64, op: D3D12_PREDICATION_OP) Untimed
         => note_list_resources(list as usize, [buf as usize]);
-    ResolveSubresourceRegion(list, dst: Obj, dst_sub: u32, x: u32, y: u32, src: Obj, src_sub: u32,
-                             rect: *const windows::Win32::Foundation::RECT, fmt: i32, mode: D3D12_RESOLVE_MODE)
+    ResolveSubresourceRegion ID3D12GraphicsCommandList1_Vtbl(list, dst: Obj, dst_sub: u32, x: u32, y: u32, src: Obj, src_sub: u32,
+                             rect: *const windows::Win32::Foundation::RECT, fmt: i32, mode: D3D12_RESOLVE_MODE) Transfer
         => note_list_resources(list as usize, [dst as usize, src as usize]);
-    RSSetShadingRateImage(list, img: Obj) => note_list_resources(list as usize, [img as usize]);
+    RSSetShadingRateImage ID3D12GraphicsCommandList5_Vtbl(list, img: Obj) Untimed => note_list_resources(list as usize, [img as usize]);
+    Barrier ID3D12GraphicsCommandList7_Vtbl(list, n: u32, groups: *const D3D12_BARRIER_GROUP) Barrier
+        => note_list_untracked(list as usize);
+    WriteBufferImmediate ID3D12GraphicsCommandList2_Vtbl(list, n: u32, args: *const D3D12_WRITEBUFFERIMMEDIATE_PARAMETER, modes: *const D3D12_WRITEBUFFERIMMEDIATE_MODE) Transfer
+        => note_list_untracked(list as usize);
+    ClearUnorderedAccessViewUint ID3D12GraphicsCommandList_Vtbl(list, gpu: D3D12_GPU_DESCRIPTOR_HANDLE, cpu: D3D12_CPU_DESCRIPTOR_HANDLE, res: Obj,
+                                values: *const u32, n: u32, rect: *const windows::Win32::Foundation::RECT) Clear
+        => note_list_resources(list as usize, [res as usize]);
+    ClearUnorderedAccessViewFloat ID3D12GraphicsCommandList_Vtbl(list, gpu: D3D12_GPU_DESCRIPTOR_HANDLE, cpu: D3D12_CPU_DESCRIPTOR_HANDLE, res: Obj,
+                                 values: *const f32, n: u32, rect: *const windows::Win32::Foundation::RECT) Clear
+        => note_list_resources(list as usize, [res as usize]);
 }
 
 unsafe fn note_barriers(list: usize, n: u32, barriers: *const D3D12_RESOURCE_BARRIER) {
@@ -90,4 +113,27 @@ unsafe fn note_barriers(list: usize, n: u32, barriers: *const D3D12_RESOURCE_BAR
     if opaque {
         note_list_untracked(list);
     }
+}
+
+#[cfg(test)]
+#[test]
+fn native_timestamp_resolve_does_not_require_adoption() {
+    unsafe extern "system" fn resolve(
+        _: Obj, _: Obj, kind: D3D12_QUERY_TYPE, first: u32, count: u32, dst: Obj, offset: u64,
+    ) {
+        dst.cast::<(D3D12_QUERY_TYPE, u32, u32, u64)>().write((kind, first, count, offset));
+    }
+
+    let slot = std::mem::offset_of!(ID3D12GraphicsCommandList_Vtbl, ResolveQueryData) / size_of::<usize>();
+    let mut table = [0usize; 60];
+    table[slot] = resolve as usize;
+    let mut list = table.as_ptr();
+    let mut received = (D3D12_QUERY_TYPE(0), 0u32, 0u32, 0u64);
+    unsafe {
+        ResolveQueryData(
+            (&raw mut list).cast(), std::ptr::null_mut(), D3D12_QUERY_TYPE_TIMESTAMP,
+            3, 2, (&raw mut received).cast(), 64,
+        );
+    }
+    assert_eq!(received, (D3D12_QUERY_TYPE_TIMESTAMP, 3, 2, 64));
 }

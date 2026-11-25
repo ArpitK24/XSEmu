@@ -17,6 +17,7 @@ use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
 
 use super::console_list::{self, Layout, Param, UavBinding};
+use super::gpu_timing::{self, Kind as Timed};
 
 #[derive(Default)]
 struct State {
@@ -81,6 +82,7 @@ fn with<R>(list: *mut c_void, f: impl FnOnce(&mut State) -> R) -> R {
 /// recording's memory is the previous allocator's until that one is reset, and pipeline
 /// and root signature state reset per D3D12 `CreateCommandList` / `Reset` semantics.
 pub(super) fn reset(list: *mut c_void, allocator: usize, initial_pso: usize) {
+    super::present::reset_plane_writes(list as usize);
     let (old, blocks) = with(list, |s| {
         let old = std::mem::replace(&mut s.allocator, allocator);
         s.arena = Default::default();
@@ -116,6 +118,7 @@ pub(super) fn clear_state(list: *mut c_void, pso: usize) {
 /// deferred mid-list split (`to` records into `allocator` with its own fresh UMA arena while
 /// `from` retains its previously allocated blocks until `allocator` resets).
 pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: usize) {
+    super::present::reset_plane_writes(to as usize);
     let (layout, args, rs, layout_gfx, args_gfx, rs_gfx, pso) = with(from, |s| {
         (s.layout.clone(), s.args.clone(), s.rs, s.layout_gfx.clone(), s.args_gfx.clone(), s.rs_gfx, s.pso)
     });
@@ -138,6 +141,7 @@ pub(super) fn inherit_for_split(from: *mut c_void, to: *mut c_void, allocator: u
 
 /// The list is gone.
 pub(super) fn forget(list: *mut c_void) {
+    super::present::reset_plane_writes(list as usize);
     if let Some(s) = STATES.lock().unwrap().as_mut().and_then(|m| m.remove(&(list as usize))) {
         super::indirect::recording_done(list as usize, s.allocator);
         console_list::hold_until_reset(s.allocator, s.uma);
@@ -304,10 +308,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     let execute = |safe: Option<(usize, u64, u64)>| {
         super::residency::note_list_resources(this as usize, [args, count_buf]);
         super::residency::note_list_untracked(this as usize);
-        match safe {
+        gpu_timing::op(this, Timed::Indirect, || title_pso, || match safe {
             Some((scratch, records, n)) => pc(this, sig, max, scratch, records, scratch, n),
             None => pc(this, sig, max, args, args_off, count_buf, count_off),
-        }
+        })
     };
     if !gfx && !compute {
         // The stand-in computes and draws nothing, and the list may hold XCL's ABI root
@@ -458,17 +462,19 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     for &(slot, (va, bytes, stride), _) in &vbs {
         let (s, at) = (stride as usize, va as usize + first_vertex as usize * stride as usize);
         let len = rects * 3 * s;
-        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize || !crate::gpu::shader::readable(at, len) {
+        if va == 0 || s == 0 || s % 4 != 0 || first_vertex as usize * s + len > bytes as usize {
             return false;
         }
+        // (the vertices as a copy: the title can unmap them under the read, `memmap::title_bytes`)
+        let Some(vertices) = crate::memmap::title_bytes(at, len) else { return false };
         let p = allocate_upload_memory(this, rects * 6 * s, 16);
         if p.is_null() {
             return false;
         }
-        let word = |v: usize, w: usize| (at as *const u8).add(v * s + w * 4).cast::<u32>().read_unaligned();
+        let word = |v: usize, w: usize| vertices.as_ptr().add(v * s + w * 4).cast::<u32>().read_unaligned();
         for r in 0..rects {
             let out = p.add(r * 6 * s);
-            let src = (at as *const u8).add(r * 3 * s);
+            let src = vertices.as_ptr().add(r * 3 * s);
             // v0 v1 v2, then v0 v2 v3
             std::ptr::copy_nonoverlapping(src, out, 3 * s);
             std::ptr::copy_nonoverlapping(src, out.add(3 * s), s);
@@ -484,7 +490,7 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
     for (slot, v) in &views {
         list.IASetVertexBuffers(*slot, Some(&[*v]));
     }
-    list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance);
+    gpu_timing::op(this, Timed::Draw, || with(this, |s| s.pso), || list.DrawInstanced(rects as u32 * 6, instances, 0, first_instance));
     for &(slot, _, pc) in &vbs {
         if let Some(v) = pc {
             list.IASetVertexBuffers(slot, Some(&[v]));
@@ -512,7 +518,7 @@ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices:
         super::residency::note_list_untracked(this as usize);
         if !draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
             super::list_x::sync_title_buffers(this, None, first_vertex, vertices, if first_instance != 0 { instances.max(2) } else { instances });
-            list.DrawInstanced(vertices, instances, first_vertex, first_instance);
+            gpu_timing::op(this, Timed::Draw, || with(this, |s| s.pso), || list.DrawInstanced(vertices, instances, first_vertex, first_instance));
         }
         mark(this, "draw");
     }
@@ -528,6 +534,9 @@ fn reach(this: *mut c_void) {
 
 /// `XCL_GPU_MARKERS`: the op just recorded on `this`, with its bound pipeline.
 fn mark(this: *mut c_void, kind: &'static str) {
+    if super::present::writer_trace_active() {
+        trace_plane_write(this, kind);
+    }
     if super::markers::enabled() {
         unsafe { super::markers::after_op(this, kind, with(this, |s| s.pso)) }
         // (a dispatch's arguments are kept with what they bound: `note_dispatch_snapshot`)
@@ -537,6 +546,101 @@ fn mark(this: *mut c_void, kind: &'static str) {
             }
         }
     }
+}
+
+fn trace_plane_write(list: *mut c_void, kind: &'static str) {
+    let compute = matches!(kind, "dispatch" | "ExecuteIndirect(dispatch)");
+    let targets = if compute {
+        Vec::new()
+    } else {
+        super::list_x::bound_color_resources(list).into_iter().filter(|&res| super::present::is_writer_target(res)).collect::<Vec<_>>()
+    };
+    if !compute && targets.is_empty() {
+        return;
+    }
+    let (pso, layout, args) = with(list, |s| {
+        let (layout, args) = if compute { (&s.layout, &s.args) } else { (&s.layout_gfx, &s.args_gfx) };
+        (s.pso, layout.clone(), args.clone())
+    });
+    let mut images = Vec::new();
+    let mut selected = Vec::new();
+    let reads_present_plane = !compute && targets.iter().any(|&res| super::present::is_presented(res));
+    if let Some(layout) = layout.as_ref() {
+        if compute || reads_present_plane {
+            bound_resources(layout, &args, Some(&mut images));
+        }
+        if reads_present_plane {
+            selected = selected_present_inputs(pso, layout, &args);
+        }
+    }
+    let mut targets = targets;
+    if compute {
+        for image in &images {
+            if let Some(res) = image.resource {
+                if super::present::is_writer_target(res) && !targets.contains(&res) {
+                    targets.push(res);
+                }
+            }
+        }
+    }
+    if targets.is_empty() {
+        return;
+    }
+    let reads = selected.iter().filter_map(|(r, _)| *r).collect::<Vec<_>>();
+    let inputs = selected.into_iter().map(|(_, label)| label).chain(images.iter().take(12).map(|i| {
+        let backing = i.resource.and_then(super::residency::describe_backing).unwrap_or_else(|| "untracked/unresolved".into());
+        format!("p{} table {:#x}/{} idx {} {:?} {}x{} gfx10-fmt {} tile {} mirror {:x?} {backing}", i.param, i.table, i.slot, i.srv, i.view.ty, i.view.width, i.view.height, i.view.format, i.view.swizzle_mode, i.resource)
+    })).collect::<Vec<_>>();
+    for res in targets {
+        super::present::record_plane_write_with_reads(list as usize, res, if compute { "compute binding candidate" } else { kind }, pso, inputs.clone(), reads.clone());
+    }
+}
+
+fn parse_input_selector(selector: &str) -> Option<(usize, u32)> {
+    let (reg, offset) = selector.trim().strip_prefix('s')?.split_once('+')?;
+    let reg = reg.parse::<usize>().ok()?;
+    let offset = match offset.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => offset.parse().ok()?,
+    };
+    (reg < 32 && offset % 32 == 0).then_some((reg, offset))
+}
+
+fn selected_present_inputs(pso: usize, layout: &Layout, args: &[u8]) -> Vec<(Option<usize>, String)> {
+    type InputSelection = (Vec<(usize, u32)>, Option<u64>);
+    static SELECTORS: std::sync::OnceLock<InputSelection> = std::sync::OnceLock::new();
+    let (selectors, shader) = SELECTORS.get_or_init(|| {
+        let selectors = std::env::var("XCL_PRESENT_INPUT_DESCS").unwrap_or_default()
+            .split(',').filter_map(parse_input_selector).take(8).collect();
+        let shader = std::env::var("XCL_PRESENT_INPUT_PS").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok());
+        (selectors, shader)
+    });
+    if selectors.is_empty() || shader.is_some_and(|wanted| super::gpu_timing_stats::shaders(pso).map(|(_, ps)| ps) != Some(wanted)) {
+        return Vec::new();
+    }
+    let io = console_list::user_data_gfx(layout, args, 0);
+    selectors.iter().map(|&(reg, offset)| {
+        let label = format!("selected s{reg}+{offset:#x}");
+        let Some(base) = io.get(reg).copied().filter(|&v| v != 0) else { return (None, format!("{label}: unset graphics SGPR")); };
+        let Some(at) = base.checked_add(offset) else { return (None, format!("{label}: address overflow")); };
+        let Some(words) = super::console_heap::words_at(at) else { return (None, format!("{label}: {at:#x} is outside a tracked console heap")); };
+        let Some(view) = crate::gpu::desc::image(&words) else { return (None, format!("{label}: {at:#x} holds a null/nonimage descriptor")); };
+        let resource = super::console_heap::image_resource_at(at, words[0]);
+        let (title, tiles, backing) = resource.map_or((None, None, None), |r| {
+            super::present::watch_plane_input(r);
+            (super::real::title_address(r).or_else(|| super::title_textures::address(r)), super::vram::tile_backing(r), super::residency::describe_backing(r))
+        });
+        let dxgi = crate::gpu::desc::dxgi_format(view.format).map(|(fmt, _)| fmt.0);
+        (resource, format!("{label}: {at:#x} idx {} {:?} {}x{} gfx10-fmt {} mapped DXGI {dxgi:?} tile {} mip {} array {} mirror {resource:x?} title {title:x?} backing {backing:?} tiles {tiles:x?}", words[0], view.ty, view.width, view.height, view.format, view.swizzle_mode, view.base_level, view.base_array))
+    }).collect()
+}
+
+#[test]
+fn present_input_selector_checks_register_and_descriptor_alignment() {
+    assert_eq!(parse_input_selector("s6+0x20"), Some((6, 32)));
+    assert_eq!(parse_input_selector("s5+256"), Some((5, 256)));
+    assert_eq!(parse_input_selector("s32+0x20"), None);
+    assert_eq!(parse_input_selector("s8+0x1"), None);
 }
 
 thread_local! {
@@ -575,7 +679,8 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
     first_instance: u32,
 ) {
     super::residency::note_list_untracked(list.as_raw() as usize);
-    list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance);
+    let raw = list.as_raw();
+    gpu_timing::op(raw, Timed::Draw, || with(raw, |s| s.pso), || list.DrawIndexedInstanced(indices, instances, first_index, base_vertex, first_instance));
     mark(list.as_raw(), "indexed draw");
 }
 
@@ -828,7 +933,7 @@ unsafe fn root_args_summary(this: *mut c_void, buffer_words: usize) -> String {
             Param::Constants { at, count } => what.push(format!("p{i} constants {:x?}", (0..count.min(8) as usize).map(|k| word(at as usize + 4 * k)).collect::<Vec<_>>())),
             Param::Descriptor { at } => {
                 let va = (word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32) as usize;
-                let w: Vec<u32> = if va != 0 && crate::gpu::shader::readable(va, 4 * buffer_words) { (0..buffer_words).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect() } else { Vec::new() };
+                let w: Vec<u32> = (va != 0).then(|| crate::memmap::title_words(va, buffer_words)).flatten().unwrap_or_default();
                 what.push(format!("p{i} buffer {va:#x} {w:x?}"));
             }
             Param::Table { at } => {
@@ -1106,7 +1211,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             list.SetGraphicsRootSignature(r);
         }
         super::residency::note_list_untracked(this as usize);
-        pc(this, x, y, z);
+        gpu_timing::op(this, Timed::Draw, || title_pso, || pc(this, x, y, z));
         mark(this, "mesh dispatch with a PC pipeline");
         return;
     }
@@ -1126,7 +1231,7 @@ pub(super) unsafe extern "system" fn dispatch_mesh(this: *mut c_void, x: u32, y:
             count(DRAWS);
             mesh_ran(MESH_NATIVE);
             super::residency::note_list_untracked(this as usize);
-            pc(this, groups as u32, 1, 1);
+            gpu_timing::op(this, Timed::Draw, || title_pso, || pc(this, groups as u32, 1, 1));
             mark(this, "mesh dispatch");
         }
         Err(e) => {
@@ -1234,10 +1339,10 @@ unsafe fn two_pass_direct(this: *mut c_void, list: &ID3D12GraphicsCommandList, p
     let res = two_pass_records(this, bytes)?;
     bind_views(this, list, tp.compute_rs, tp.compute, [io, res], false)?;
     super::residency::note_list_untracked(this as usize);
-    list.Dispatch(groups as u32, 1, 1);
+    gpu_timing::op_grid(this, Timed::MeshCompute, || tp.compute, [groups as u32, 1, 1], || list.Dispatch(groups as u32, 1, 1));
     list.ResourceBarrier(&[uav_barrier_all()]);
     bind_views(this, list, tp.mesh_rs, real, [io, res], true)?;
-    pc(this, (groups * split) as u32, 1, 1);
+    gpu_timing::op_grid(this, Timed::MeshDraw, || pso, [(groups * split) as u32, 1, 1], || pc(this, (groups * split) as u32, 1, 1));
     Ok(())
 }
 
@@ -1286,10 +1391,10 @@ unsafe fn two_pass_indirect(
     for k in 0..max as u64 {
         let views = [io, res + k * per_command];
         bind_views(this, list, tp.compute_rs, tp.compute, views, false)?;
-        pc(this, dispatch_sig, 1, scratch, records + k * stride, 0, 0);
+        gpu_timing::op(this, Timed::MeshCompute, || tp.compute, || pc(this, dispatch_sig, 1, scratch, records + k * stride, 0, 0));
         list.ResourceBarrier(&[uav_barrier_all()]);
         bind_views(this, list, tp.mesh_rs, real, views, true)?;
-        pc(this, sig, 1, scratch, mesh_records + k * stride, 0, 0);
+        gpu_timing::op(this, Timed::MeshDraw, || pso, || pc(this, sig, 1, scratch, mesh_records + k * stride, 0, 0));
     }
     Ok(())
 }
@@ -1966,8 +2071,7 @@ unsafe fn trace_fullscreen(this: *mut c_void, pso: usize, groups: [u32; 3]) {
                 let hi = word(at as usize + 4).unwrap_or(0) as u64;
                 let va = (lo | hi << 32) as usize;
                 let n = 64usize;
-                if va != 0 && crate::gpu::shader::readable(va, 4 * n) {
-                    let w: Vec<u32> = (0..n).map(|k| ((va + 4 * k) as *const u32).read_unaligned()).collect();
+                if let Some(w) = (va != 0).then(|| crate::memmap::title_words(va, n)).flatten() {
                     what.push(format!("p{i} buffer {va:#x}: {w:x?}"));
                     values.extend(&w);
                 } else {
@@ -2044,7 +2148,7 @@ unsafe fn translated_dispatch(this: *mut c_void, list: &ID3D12GraphicsCommandLis
         capture_dispatch(this, pso, hash, index, [x, y, z]);
     }
     super::residency::note_list_untracked(this as usize);
-    super::dispatch_timing::dispatch(list, pso, [x, y, z]);
+    gpu_timing::op_grid(this, Timed::Dispatch, || with(this, |s| s.pso), [x, y, z], || super::dispatch_timing::dispatch(list, pso, [x, y, z]));
     Ok(())
 }
 
