@@ -1,0 +1,19 @@
+# A stand-in for XSEmu.exe with the command line and JSON lines of docs/launcher-protocol.md, so the
+# launcher can be developed and tested without the emulator or a game. Draws an original abstract
+# test scene; no game content.
+add_executable(fake-xsemu main.cpp FakeRun.cpp FakeRun.h FakeRunner.cpp FakeRunner.h FakeWarmup.cpp FakeWarmup.h Scene.cpp Scene.h)
+target_link_libraries(fake-xsemu PRIVATE Qt6::Gui Qt6::Network)
+set_target_properties(fake-xsemu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+xsemu_warnings(fake-xsemu)
+
+# On X11 the hosted scene follows the launcher's host window; Qt does not track a foreign window's size.
+if(UNIX AND NOT APPLE)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(XCB QUIET IMPORTED_TARGET xcb)
+        if(XCB_FOUND)
+            target_link_libraries(fake-xsemu PRIVATE PkgConfig::XCB)
+            target_compile_definitions(fake-xsemu PRIVATE FAKE_XSEMU_XCB)
+        endif()
+    endif()
+endif()

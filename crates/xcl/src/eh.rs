@@ -107,6 +107,7 @@ unsafe extern "system" fn unhandled_filter(info: *const EXCEPTION_POINTERS) -> i
             modules::describe_address(addr)
         );
         crate::xlog_error!("{msg}");
+        crate::control::exit_now(rec.ExceptionCode as u32, "crash", &format!("exception {:#010x} in {}", rec.ExceptionCode as u32, modules::describe_address(addr)));
         if !ctx.is_null() {
             log_register_memory(&*ctx);
         }
@@ -139,6 +140,7 @@ unsafe extern "system" fn hk_nt_terminate_process(h: isize, status: i32) -> i32 
         return orig(h, status);
     }
     if h == 0 || h == -1 {
+        crate::control::note_exit_status(status as u32);
         // (a full dump being written at a crash is finished first)
         drop(FULL_DUMP.lock());
         watch_report();
