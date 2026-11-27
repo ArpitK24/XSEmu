@@ -20,6 +20,8 @@ GAME_DATA = re.compile(
 GAME_FILES = re.compile(r"(^|/)(MicrosoftGame\.config|appxmanifest\.xml|resources\.pri)$", re.I)
 # where test data of XCL's own may live (synthetic, small)
 TEST_DATA = ("tests/data/",)
+# where non-game UI/branding binary assets (e.g. icons) may live
+REPO_ASSETS = ("assets/logo/", "launcher/resources/")
 MAX_BINARY = 1 << 20
 FRAMES_KEPT = 0.8   # the PR's frames at least this share of main's
 COMMIT_GROWTH = 1.25  # the PR's peak commit at most this times main's
@@ -67,12 +69,13 @@ def check(body, head, files, is_main_ancestor, *, test_only=False):
         if status == "removed":
             continue
         in_test_data = path.startswith(TEST_DATA) and size() <= MAX_BINARY
+        in_repo_assets = path.startswith(REPO_ASSETS) and size() <= MAX_BINARY
         if GAME_FILES.search(path) and path != "tests/data/testgame/MicrosoftGame.config":
             problems.append(f"`{path}` is a game package file: game files never go into the repository")
         elif GAME_DATA.search(path) and not in_test_data:
             problems.append(f"`{path}` looks like game data or a binary: game files never go into the repository")
-        elif binary and not in_test_data:
-            problems.append(f"`{path}` is a binary file outside tests/data/ or over 1 MB")
+        elif binary and not in_test_data and not in_repo_assets:
+            problems.append(f"`{path}` is a binary file outside tests/data/, assets/logo/, or launcher/resources/, or over 1 MB")
 
     if not test_only and any(runtime(p) for p, *_ in files):
         blocks = smoke_blocks(body)

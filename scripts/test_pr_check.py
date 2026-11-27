@@ -35,6 +35,21 @@ class TestOnlyApprovalTests(unittest.TestCase):
         files = [changed("crates/xcl/tests/integration.rs"), changed("crates/xcl/src/gpu/recomp/tests.rs")]
         self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
 
+    def test_repo_assets_allow_small_non_game_binaries(self):
+        files = [
+            changed("assets/logo/XSEmu.ico", binary=True),
+            changed("launcher/resources/icon.png", binary=True),
+        ]
+        self.assertEqual([], check(BODY, HEAD, files, lambda _: False))
+
+    def test_repo_assets_reject_oversized_or_game_data_binaries(self):
+        oversized = ("assets/logo/huge.ico", "modified", True, lambda: (1 << 20) + 1)
+        game_data = changed("assets/logo/content.rpf", binary=True)
+        problems = check(BODY, HEAD, [oversized, game_data], lambda _: False)
+        self.assertEqual(2, len(problems))
+        self.assertTrue(any("huge.ico" in p for p in problems), problems)
+        self.assertTrue(any("content.rpf" in p for p in problems), problems)
+
 
 if __name__ == "__main__":
     unittest.main()
