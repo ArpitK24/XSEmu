@@ -1,4 +1,4 @@
-# Regression run of a title for a pull request: runs it for a fixed time, reads XCL's log and
+﻿# Regression run of a title for a pull request: runs it for a fixed time, reads XCL's log and
 # prints an `xcl-smoke` block to paste into the PR's "Regression run" section – once built
 # from main, once from the PR's head commit (CONTRIBUTING.md, "What a PR needs to be merged").
 #
@@ -22,7 +22,8 @@ $dirty = [bool](git -C $root status --porcelain --untracked-files=no -- crates C
 # different casing (which is possible on Windows).
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $Xcl
-$psi.Arguments = 'run "' + $Game + '"'
+$escapedGame = ($Game -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1'
+$psi.Arguments = 'run "' + $escapedGame + '"'
 $psi.UseShellExecute = $false
 $psi.CreateNoWindow = $true
 $psi.RedirectStandardOutput = $true
