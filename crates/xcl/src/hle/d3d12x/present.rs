@@ -57,18 +57,23 @@ pub unsafe extern "system" fn present_x(queue: *mut c_void, plane_count: u32, pl
     if plane_count == 0 || planes.is_null() || !crate::gpu::shader::readable(planes as usize, 0x18) {
         return 0;
     }
-    let token = (planes as *const u64).read_unaligned();
+    let tokens: Vec<u64> = (0..plane_count as usize)
+        .map(|k| planes.add(PLANE_BYTES * k))
+        .take_while(|&plane| crate::gpu::shader::readable(plane as usize, 8))
+        .map(|plane| (plane as *const u64).read_unaligned())
+        .collect();
     crate::control::wait_while_paused();
     let _present = PRESENTX_LOCK.lock().unwrap();
     TITLE_PRESENT_CALLS.fetch_add(1, Ordering::Relaxed);
-    present_x_frame(queue, plane_count, planes);
     // The title can use flip statistics to decide when to reuse its buffer.
     // Queue our copy before reporting the flip.
-    super::frame::mark_flipped(token);
+    super::present_order::present(&tokens, |show| present_x_frame(queue, plane_count, planes, show));
     0
 }
 
-unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8) {
+/// `show`: false for a present older than the frame on screen (`present_order`), which is
+/// accounted for like any other but not composed.
+unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u8, show: bool) {
     super::gpu_timing::boundary();
     if super::gpu_timing::enabled() {
         super::gpu_timing_waits::boundary(super::gpu_timing::epoch());
@@ -85,7 +90,7 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
     }
     super::real::stop_if_device_removed();
     if !PRESENTX.swap(true, Ordering::Relaxed) {
-        crate::xlog_info!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
+        crate::xlog_console!("D3D12.X: PresentX – the title presents its own frames ({plane_count} plane(s))");
     }
     {
         // a change in the number of planes (the console's display composes them – a UI
@@ -149,7 +154,9 @@ unsafe fn present_x_frame(queue: *mut c_void, plane_count: u32, planes: *const u
             crate::xlog_info!("frame trace: PresentX #{n} of {res:#x} {:?} – rt binds {}, UAV views {}, copy destination {}, clears {}; most used: {}", d, u[0], u[1], u[2], u[3], busiest.join("; "));
         }
     }
-    present_now(Duration::ZERO, Some((queue as usize, &shown)));
+    if show {
+        present_now(Duration::ZERO, Some((queue as usize, &shown)));
+    }
 }
 
 /// `D3D12XBOX_PRESENT_PLANE_PARAMETERS`: token @0, resource count @8, resources @0x10, source

@@ -242,6 +242,9 @@ fn map_image_ex(path: &Path, is_main: bool, origin: LoadOrigin) -> Result<Arc<Ma
         let len = (s.mapped_size() as usize).min(size.saturating_sub(s.va as usize));
         unsafe { crate::eh::hook_gs_failure(base + s.va as usize, len, &name) };
     }
+    if is_main {
+        crate::hle::d3d12x::title_gta6::image_ready();
+    }
     Ok(module)
 }
 
@@ -379,7 +382,7 @@ pub fn run_main(m: &Arc<MappedModule>) -> u32 {
     READY.store(true, Ordering::Release);
     let stack = (m.stack_reserve as usize).max(1 << 20);
     let args = Box::into_raw(Box::new(EntryArgs { entry: m.base + m.entry_rva as usize }));
-    crate::xlog_info!(
+    crate::xlog_console!(
         "start {}: entry point {} , stack {:#x}",
         m.name,
         modules::describe_address(m.base + m.entry_rva as usize),

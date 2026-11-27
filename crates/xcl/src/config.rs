@@ -262,12 +262,24 @@ impl Config {
     }
 
     /// Configured `D3D12_RAYTRACING_TIER` override for `CheckFeatureSupport(D3D12_OPTIONS5)`:
-    /// `None` keeps the host GPU tier ("auto"), `Some(0 / 10 / 11)` forces NOT_SUPPORTED /
-    /// TIER_1_0 / TIER_1_1. `XCL_RAYTRACING` overrides `xcl.toml`.
+    /// `None` keeps the host GPU tier ("1" / "on"), `Some(0 / 10 / 11)` forces NOT_SUPPORTED /
+    /// TIER_1_0 / TIER_1_1; with ray tracing off (`raytracing_on`) always `Some(0)`.
     pub fn raytracing_tier_override(&self) -> Option<u32> {
-        let env = std::env::var("XCL_RAYTRACING").ok();
-        let mode = env.as_deref().unwrap_or(self.raytracing.as_str()).trim();
-        parse_raytracing_tier(mode)
+        if !self.raytracing_on() {
+            return Some(0);
+        }
+        parse_raytracing_tier(self.raytracing_mode().trim())
+    }
+
+    /// Ray tracing on (`hle::d3d12x::raytracing`): only when asked for, "1" / "on" or a tier, for
+    /// now (the user, 2026-11-26 21:43Z: "You should just turn off ray tracing for now"); "auto",
+    /// "off" and anything else leave it off. `XCL_RAYTRACING` overrides `xcl.toml`.
+    pub fn raytracing_on(&self) -> bool {
+        raytracing_mode_on(self.raytracing_mode().trim())
+    }
+
+    fn raytracing_mode(&self) -> String {
+        std::env::var("XCL_RAYTRACING").unwrap_or_else(|_| self.raytracing.clone())
     }
 }
 
@@ -300,6 +312,10 @@ impl DisplaySetting {
         }
         Some(Self::Fixed(DisplayMode { width, height, hz }))
     }
+}
+
+pub fn raytracing_mode_on(mode: &str) -> bool {
+    mode == "1" || mode.eq_ignore_ascii_case("on") || parse_raytracing_tier(mode).is_some_and(|tier| tier != 0)
 }
 
 pub fn parse_raytracing_tier(mode: &str) -> Option<u32> {
@@ -437,6 +453,16 @@ mod tests {
             let mut c = Config { title_memory: setting.into(), ..Config::default() };
             c.resolve(m);
             assert_eq!((c.title_memory.as_str(), c.uma_mb), ("advanced", 4095), "{setting}");
+        }
+    }
+
+    #[test]
+    fn ray_tracing_is_on_only_when_asked_for() {
+        for on in ["1", "on", "ON", "tier1_0", "tier1_1", "11"] {
+            assert!(raytracing_mode_on(on), "{on}");
+        }
+        for off in ["", "auto", "0", "off", "none", "2"] {
+            assert!(!raytracing_mode_on(off), "{off}");
         }
     }
 

@@ -15,6 +15,12 @@ struct Segment {
     start: usize,
 }
 
+impl Drop for Segment {
+    fn drop(&mut self) {
+        crate::memdiag::IMPORTED_SEGMENTS.sub(self.view.len() as u64);
+    }
+}
+
 pub(super) struct ImportedPage {
     resource: ID3D12Resource,
     _segment: Arc<Segment>,
@@ -78,6 +84,7 @@ impl Backend {
         if heap.GetDesc().SizeInBytes != view.len() as u64 {
             return None;
         }
+        crate::memdiag::IMPORTED_SEGMENTS.add(view.len() as u64);
         Some(Segment { heap, view, start })
     }
 

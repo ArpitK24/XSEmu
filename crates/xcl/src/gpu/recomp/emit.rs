@@ -1083,22 +1083,28 @@ impl Em {
             return;
         }
         let g = self.t();
-        let group = &mut self.groups[i];
-        let mut from = group.at;
-        for (method, addr) in std::mem::take(&mut group.calls) {
+        let at = self.groups[i].at;
+        let mut from = at;
+        for (method, addr) in std::mem::take(&mut self.groups[i].calls) {
             let call = format!("{method}({addr})");
             let Some(k) = self.out[from..].find(&call) else { continue };
             let new = format!("{method}G({addr}, {g}_g, {g}_r)");
-            self.out.replace_range(from + k..from + k + call.len(), &new);
+            self.splice_out(from + k..from + k + call.len(), &new);
             from += k + new.len();
         }
-        let decl = format!("{}uint64_t {g}_g = xcl_operand_va({}); uint4 {g}_r = xcl_group_pages({g}_g);\n", pad(group.indent), group.anchor_addr);
-        self.out.insert_str(group.at, &decl);
-        let shift = decl.len();
-        let at = group.at;
-        group.name = Some(g);
-        for other in self.groups.iter_mut().filter(|o| o.name.is_none() && o.at >= at) {
-            other.at += shift;
+        let decl = format!("{}uint64_t {g}_g = xcl_operand_va({}); uint4 {g}_r = xcl_group_pages({g}_g);\n", pad(self.groups[i].indent), self.groups[i].anchor_addr);
+        self.splice_out(at..at, &decl);
+        self.groups[i].name = Some(g);
+    }
+
+    /// Replace `range` of the output with `text`, moving the saved position of every group not
+    /// declared yet that lies at or after the end of the range by the change in length.
+    fn splice_out(&mut self, range: std::ops::Range<usize>, text: &str) {
+        let end = range.end;
+        let removed = range.len();
+        self.out.replace_range(range, text);
+        for g in self.groups.iter_mut().filter(|g| g.name.is_none() && g.at >= end) {
+            g.at = g.at - removed + text.len();
         }
     }
 

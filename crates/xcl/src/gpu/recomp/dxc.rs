@@ -661,6 +661,8 @@ fn submit(src: &str, entry: &str, profile: &str, extra: &[&str], dxc_only: bool)
         let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
         if crate::hle::d3d12x::pso_async::preparing() {
             q.background.push_back(job);
+        } else if crate::hle::d3d12x::pso_async::first_build() {
+            q.title.push_front(job);
         } else {
             q.title.push_back(job);
         }

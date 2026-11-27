@@ -108,6 +108,11 @@ thread_local! {
     static JOB: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
+/// The pipeline and shader key this thread works on (`with_job`; 0s: none).
+pub(crate) fn job() -> (u64, u64) {
+    JOB.with(Cell::get)
+}
+
 pub(crate) fn with_job<R>(pipeline: u64, shader: u64, f: impl FnOnce() -> R) -> R {
     if !enabled() {
         return f();

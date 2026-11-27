@@ -192,8 +192,9 @@ struct Uploader {
     list: ID3D12GraphicsCommandList,
     fence: ID3D12Fence,
     value: u64,
-    /// (buffer, its mapped bytes, capacity)
-    staging: Option<(ID3D12Resource, *mut u8, u64)>,
+    /// (buffer, its mapped bytes – written only –, capacity, its bytes in video memory when
+    /// `rebar` placed it there)
+    staging: Option<(ID3D12Resource, *mut u8, u64, super::rebar::Placed)>,
 }
 
 // D3D12 objects are free-threaded; the mapped pointer is only used by the holder of the uploader
@@ -232,7 +233,7 @@ impl Uploader {
 
     /// An upload buffer of at least `bytes`, mapped: the one kept, or a bigger one.
     unsafe fn staging(&mut self, dev: &ID3D12Device, bytes: u64) -> Result<(ID3D12Resource, *mut u8), String> {
-        if let Some((b, p, cap)) = &self.staging {
+        if let Some((b, p, cap, _)) = &self.staging {
             if *cap >= bytes {
                 return Ok((b.clone(), *p));
             }
@@ -240,10 +241,10 @@ impl Uploader {
         let cap = staging_capacity(bytes);
         // the old buffer goes first: both at once were the peak
         self.staging = None;
-        let b = buffer(dev, cap)?;
+        let (b, placed) = super::rebar::upload_buffer(dev, &buffer_desc(cap), super::rebar::Class::Textures).map_err(|x| format!("texture upload buffer: {x}"))?;
         let mut p = std::ptr::null_mut();
         b.Map(0, None, Some(&mut p)).map_err(err)?;
-        self.staging = Some((b.clone(), p as *mut u8, cap));
+        self.staging = Some((b.clone(), p as *mut u8, cap, placed));
         Ok((b, p as *mut u8))
     }
 }
@@ -460,8 +461,8 @@ pub unsafe fn wait(dev: &ID3D12Device, queue: &ID3D12CommandQueue) -> Result<(),
     fence::wait(&fence, 1, dev, None, 10_000).map_err(copy_error)
 }
 
-unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
-    let rd = D3D12_RESOURCE_DESC {
+fn buffer_desc(size: u64) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
         Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
         Width: size.max(256),
         Height: 1,
@@ -470,7 +471,12 @@ unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String
         SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
         ..Default::default()
-    };
+    }
+}
+
+/// An upload buffer of one call (`record_upload_states`): system memory, gone when its list ran.
+unsafe fn buffer(dev: &ID3D12Device, size: u64) -> Result<ID3D12Resource, String> {
+    let rd = buffer_desc(size);
     let mut r: Option<ID3D12Resource> = None;
     dev.CreateCommittedResource(&D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() }, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_GENERIC_READ, None, &mut r)
         .map_err(|x| format!("texture upload buffer: {x}"))?;

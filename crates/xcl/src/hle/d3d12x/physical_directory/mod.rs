@@ -26,6 +26,7 @@ impl Drop for Descriptor {
 struct ReadBuffer {
     view: Descriptor,
     resource: ID3D12Resource,
+    _placed: crate::gpu::rebar::Placed,
 }
 
 pub(super) struct PageBinding {
@@ -122,19 +123,7 @@ unsafe fn buffer(
                 ..Default::default()
             },
             D3D12_HEAP_FLAG_NONE,
-            &D3D12_RESOURCE_DESC {
-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: bytes as u64,
-                Height: 1,
-                DepthOrArraySize: 1,
-                MipLevels: 1,
-                SampleDesc: DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
-                ..Default::default()
-            },
+            &buffer_desc(bytes),
             if ty == D3D12_HEAP_TYPE_UPLOAD {
                 D3D12_RESOURCE_STATE_GENERIC_READ
             } else if ty == D3D12_HEAP_TYPE_READBACK {
@@ -149,7 +138,27 @@ unsafe fn buffer(
     out
 }
 
-unsafe fn view(device: &ID3D12Device, resource: ID3D12Resource) -> Option<ReadBuffer> {
+fn buffer_desc(bytes: usize) -> D3D12_RESOURCE_DESC {
+    D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes as u64,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    }
+}
+
+unsafe fn view(
+    device: &ID3D12Device,
+    resource: ID3D12Resource,
+    placed: crate::gpu::rebar::Placed,
+) -> Option<ReadBuffer> {
     let words = u32::try_from(resource.GetDesc().Width / 4).ok()?;
     let (index, cpu, _) = console_heap::reserve_own(1)?;
     let guard = Descriptor(index);
@@ -172,6 +181,7 @@ unsafe fn view(device: &ID3D12Device, resource: ID3D12Resource) -> Option<ReadBu
     Some(ReadBuffer {
         view: guard,
         resource,
+        _placed: placed,
     })
 }
 
@@ -182,7 +192,15 @@ struct PrivateUpload {
 }
 impl PrivateUpload {
     unsafe fn reserve(device: &ID3D12Device, words: usize) -> Option<Self> {
-        let b = view(device, buffer(device, words * 4, D3D12_HEAP_TYPE_UPLOAD)?)?;
+        // a root or a leaf: written once here, then only read, by every translated shader
+        // that takes an address through the directory
+        let (resource, placed) = crate::gpu::rebar::upload_buffer(
+            device,
+            &buffer_desc(words * 4),
+            crate::gpu::rebar::Class::Directory,
+        )
+        .ok()?;
+        let b = view(device, resource, placed)?;
         let mut p = std::ptr::null_mut();
         b.resource
             .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }), Some(&mut p))

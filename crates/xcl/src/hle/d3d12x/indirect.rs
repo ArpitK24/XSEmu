@@ -3,12 +3,17 @@
 //! the memory held, and an indirect call turns that into oversized work: a dispatch of millions
 //! of groups, or an argument the GPU reads past, until the PC removes the device. Two guards:
 //!
-//! - **Producers.** The buffers a skipped dispatch was bound to write (its descriptor tables'
-//!   buffer views and root descriptors, console addresses) are kept as unwritten until that
-//!   pipeline dispatches again with a translation. An indirect call whose arguments or count lie
-//!   in such a range is skipped (`check`). Descriptors do not say which views a shader writes,
-//!   so the views it only reads are kept too: such a call is skipped while its producer chain is
-//!   broken anyway.
+//! - **Producers** (`XCL_INDIRECT_GUARD`, default 1; 0: off). The buffers a skipped dispatch
+//!   could have written – the buffer views its root signature declares as UAVs (root UAVs, the
+//!   UAV ranges of its descriptor tables; console addresses) – are kept as unwritten until that
+//!   pipeline dispatches again with a translation, or a dispatch that runs has a UAV over them
+//!   (`written`). Views it only reads are not kept. A view larger than `MAX_TRACKED` spans the
+//!   title's memory rather than one buffer: a write through it cannot be placed, so it neither
+//!   marks nor clears. Nor does a view of a shared pool – the same view a UAV of
+//!   `SHARED_BINDERS` or more pipelines covers (a title's pool of indirect arguments, bound
+//!   through a global table): where one pass writes in it cannot be placed either. An indirect
+//!   call whose arguments or count lie in a kept range is skipped
+//!   (`check`); its own bindings are not kept, so a refusal does not spread.
 //! - **Sanitiser.** Before an indirect call with a translated pipeline runs, a compute pass of
 //!   XCL's copies its active records (`min(max count, the GPU's count)`) into a device-local
 //!   scratch buffer, the title's argument and count buffers untouched: each dispatch axis capped
@@ -19,9 +24,9 @@
 //! The budgets (`GROUP_BUDGET`, `DRAW_BUDGET`) are XCL's bounds on one indirect call, not
 //! hardware limits: legitimate work beyond them is cut.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D12::*;
@@ -370,27 +375,98 @@ pub(super) fn signature(sig: usize) -> Option<(u32, u32, bool)> {
     SIGNATURES.lock().unwrap().as_ref()?.get(&sig).copied()
 }
 
+/// The largest view kept as unwritten. The title's real buffers stay well below it (its shared
+/// indirect-argument buffer is 174 MiB); its views of all of its memory are larger (play-85w…93b:
+/// 0x3d000000..0xf665d000000, about 15 TiB).
+pub(super) const MAX_TRACKED: u64 = 1 << 30;
+
+/// Distinct pipelines with a UAV over one view that make it a shared pool. A pass's own output
+/// has one writer or a few (a culling chain's); a pool every pass takes its part of is bound by
+/// many (play-96: one 174 MiB view through slot 185 of a global table, at least 10 pipelines).
+pub(super) const SHARED_BINDERS: usize = 8;
+
 /// Console address ranges skipped dispatches were bound to write, by the title's pipeline.
 #[derive(Default)]
 pub(super) struct Unwritten {
     ranges: Vec<(u64, u64, usize)>,
+    /// views (start, bytes) and the distinct pipelines seen with a UAV over each, up to
+    /// `SHARED_BINDERS`
+    binders: BTreeMap<(u64, u64), Vec<usize>>,
 }
 
 impl Unwritten {
+    /// `producer` has UAVs over `ranges` (start, bytes). Returns the views this made shared
+    /// pools; what was kept as unwritten on them goes.
+    pub(super) fn bound(&mut self, producer: usize, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let mut pooled = Vec::new();
+        for &(start, bytes) in ranges.iter().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED).take(64) {
+            if self.binders.len() >= 4096 && !self.binders.contains_key(&(start, bytes)) {
+                continue;
+            }
+            let b = self.binders.entry((start, bytes)).or_default();
+            if b.len() < SHARED_BINDERS && !b.contains(&producer) {
+                b.push(producer);
+                if b.len() == SHARED_BINDERS {
+                    pooled.push((start, bytes));
+                }
+            }
+        }
+        if !pooled.is_empty() {
+            self.ranges.retain(|&(s, e, _)| !pooled.iter().any(|&(start, bytes)| s == start && e == start.saturating_add(bytes)));
+        }
+        pooled
+    }
+
+    /// Whether the view (start, bytes) is a shared pool.
+    fn shared(&self, start: u64, bytes: u64) -> bool {
+        self.binders.get(&(start, bytes)).is_some_and(|b| b.len() >= SHARED_BINDERS)
+    }
+
     /// `producer` was skipped while bound to `ranges` (start, bytes): they replace its earlier ones.
-    pub(super) fn mark(&mut self, producer: usize, ranges: &[(u64, u64)]) {
+    pub(super) fn mark(&mut self, producer: usize, ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
+        let pooled = self.bound(producer, ranges);
         self.ranges.retain(|r| r.2 != producer);
-        for &(start, bytes) in ranges.iter().filter(|r| r.1 > 0).take(64) {
+        for &(start, bytes) in ranges.iter().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED).take(64) {
+            if self.shared(start, bytes) {
+                continue;
+            }
             if self.ranges.len() >= 4096 {
                 break;
             }
             self.ranges.push((start, start.saturating_add(bytes), producer));
         }
+        pooled
     }
 
     /// `producer` ran with a translation: what it writes is written again.
     pub(super) fn written_by(&mut self, producer: usize) {
         self.ranges.retain(|r| r.2 != producer);
+    }
+
+    /// A dispatch ran with UAVs over `ranges` (start, bytes): what they cover is written, whoever
+    /// skipped it.
+    pub(super) fn written(&mut self, ranges: &[(u64, u64)]) {
+        let placed: Vec<_> = ranges.iter().copied().filter(|r| r.1 > 0 && r.1 <= MAX_TRACKED && !self.shared(r.0, r.1)).collect();
+        for (start, bytes) in placed {
+            let end = start.saturating_add(bytes);
+            if !self.ranges.iter().any(|&(s, e, _)| start < e && s < end) {
+                continue;
+            }
+            let mut kept = Vec::with_capacity(self.ranges.len() + 1);
+            for &(s, e, p) in &self.ranges {
+                if start >= e || s >= end {
+                    kept.push((s, e, p));
+                    continue;
+                }
+                if s < start {
+                    kept.push((s, start, p));
+                }
+                if end < e {
+                    kept.push((end, e, p));
+                }
+            }
+            self.ranges = kept;
+        }
     }
 
     /// The first unwritten range overlapping `[start, start + bytes)`: (start, end, producer).
@@ -404,11 +480,48 @@ impl Unwritten {
     }
 }
 
-static UNWRITTEN: Mutex<Unwritten> = Mutex::new(Unwritten { ranges: Vec::new() });
+static UNWRITTEN: Mutex<Unwritten> = Mutex::new(Unwritten { ranges: Vec::new(), binders: BTreeMap::new() });
 
-/// A dispatch of the title's `pso` was skipped while bound to `ranges` (console start, bytes).
+fn log_pooled(pooled: &[(u64, u64)]) {
+    for &(start, bytes) in pooled {
+        crate::xlog_info!("D3D12.X: indirect guard: {start:#x}..{:#x} is bound as a UAV by {SHARED_BINDERS} pipelines – a shared pool, neither kept as unwritten nor cleared", start.saturating_add(bytes));
+    }
+}
+
+fn guard_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XCL_INDIRECT_GUARD").map_or(true, |v| v.trim() != "0"))
+}
+
+/// A dispatch of the title's `pso` was skipped while its UAVs covered `ranges` (console start,
+/// bytes).
 pub(super) fn skipped_producer(pso: usize, ranges: &[(u64, u64)]) {
-    UNWRITTEN.lock().unwrap().mark(pso, ranges);
+    if guard_on() {
+        let pooled = UNWRITTEN.lock().unwrap().mark(pso, ranges);
+        log_pooled(&pooled);
+    }
+}
+
+/// A dispatch of the title's `pso` that ran had UAVs over `ranges` (console start, bytes): it
+/// counts towards their views being shared pools.
+pub(super) fn bound(pso: usize, ranges: &[(u64, u64)]) {
+    if guard_on() {
+        let pooled = UNWRITTEN.lock().unwrap().bound(pso, ranges);
+        log_pooled(&pooled);
+    }
+}
+
+/// Whether no range is kept as unwritten.
+pub(super) fn nothing_unwritten() -> bool {
+    UNWRITTEN.lock().unwrap().is_empty()
+}
+
+/// A dispatch that ran had UAVs over `ranges` (console start, bytes).
+pub(super) fn written(ranges: &[(u64, u64)]) {
+    let mut u = UNWRITTEN.lock().unwrap();
+    if !u.is_empty() {
+        u.written(ranges);
+    }
 }
 
 /// The unwritten range holding console address `va`, and the skipped pipeline it waits for.

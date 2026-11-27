@@ -201,6 +201,33 @@ fn entries(file: &[u8]) -> Vec<&[u8]> {
     out
 }
 
+/// The keys of the kept entries (`entries`, `key_of`), the file read an entry at a time: after a
+/// hundred runs it holds 954,785 entries in 718 MB, four fifths of it zeros, and read whole it was
+/// a game run's highest Rust heap (749 MB at its start, 134 MB live). `XCL_PSO_MANIFEST_STREAM=0`:
+/// read whole, as before.
+fn keys_in(path: &Path) -> HashSet<u64> {
+    use std::io::Read;
+    let mut keys = HashSet::new();
+    let Ok(file) = std::fs::File::open(path) else { return keys };
+    let mut left = file.metadata().map_or(0, |m| m.len());
+    let mut file = std::io::BufReader::with_capacity(1 << 20, file);
+    let (mut len, mut entry) = ([0u8; 4], Vec::new());
+    while left >= 4 && file.read_exact(&mut len).is_ok() {
+        let n = u32::from_le_bytes(len) as u64;
+        left -= 4;
+        if n > left {
+            break;
+        }
+        entry.resize(n as usize, 0);
+        if file.read_exact(&mut entry).is_err() {
+            break;
+        }
+        left -= n;
+        keys.insert(key_of(&entry));
+    }
+    keys
+}
+
 /// `Store::index`: the list's bytes and each key's first entry in them (offset, length).
 pub(super) struct Index {
     dir: PathBuf,
@@ -279,8 +306,12 @@ pub struct Loaded {
 
 impl Store {
     pub fn open(dir: PathBuf) -> Store {
-        let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
-        let seen = entries(&file).into_iter().map(key_of).collect();
+        let seen = if std::env::var("XCL_PSO_MANIFEST_STREAM").is_ok_and(|v| v.trim() == "0") {
+            let file = std::fs::read(dir.join("pipelines.bin")).unwrap_or_default();
+            entries(&file).into_iter().map(key_of).collect()
+        } else {
+            keys_in(&dir.join("pipelines.bin"))
+        };
         Store { dir, seen: Mutex::new(seen) }
     }
 
@@ -928,6 +959,29 @@ mod tests {
     }
 
     /// Pipelines are kept once each, with their shaders, and read back as they were made.
+    #[test]
+    fn the_keys_read_an_entry_at_a_time_are_the_whole_files() {
+        let dir = temp_dir("keys-in");
+        let path = dir.join("pipelines.bin");
+        assert!(keys_in(&path).is_empty(), "no file");
+        let mut file = Vec::new();
+        for (shader, name) in [(&b"one"[..], &b"A"[..]), (b"two", b"B"), (b"one", b"A")] {
+            let e = sample(Kind::Graphics, shader, name).encode();
+            file.extend_from_slice(&(e.len() as u32).to_le_bytes());
+            file.extend_from_slice(&e);
+        }
+        let whole = |file: &[u8]| entries(file).into_iter().map(key_of).collect::<HashSet<u64>>();
+        // (a torn last entry, one whose length runs past the end, and a torn length)
+        for tail in [&[][..], &[9, 0, 0, 0, 1, 2][..], &[0xff, 0xff, 0xff, 0xff, 1][..], &[7, 0][..]] {
+            let mut torn = file.clone();
+            torn.extend_from_slice(tail);
+            std::fs::write(&path, &torn).unwrap();
+            assert_eq!(keys_in(&path), whole(&torn));
+            assert_eq!(keys_in(&path).len(), 2);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn pipelines_are_kept_once_and_read_back_whole() {
         let dir = temp_dir("roundtrip");

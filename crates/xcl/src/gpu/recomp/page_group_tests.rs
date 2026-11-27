@@ -200,3 +200,44 @@ fn translated_loads_with_page_groups_compute_the_same() {
     assert!(new.contains("xcl_loadx4G(") && new.contains("xcl_mLoad4G(") && new.contains("xcl_mLoadG(") && new.contains("xcl_vLoadG("));
     assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
 }
+
+/// Two groups whose loads interleave: the first is declared (its earlier calls rewritten to
+/// longer text) after the second was opened, so the second's saved position must move with the
+/// rewrite, or its declaration lands inside an earlier line.
+fn interleaved_program() -> Vec<u8> {
+    let wait = || ("S_WAITCNT", "ENC_SOPP", vec![("SIMM16", 0)]);
+    let buf = |n: &'static str, d: u64, o: u64| -> Inst { (n, "ENC_MUBUF", vec![("VDATA", d), ("VADDR", 40), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", o), ("OFFEN", 1)]) };
+    let mut p: Vec<Inst> = vec![
+        ("S_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 16), ("SBASE", 0), ("OFFSET", 0x80)]),
+        wait(),
+        ("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 40), ("SRC0", 132), ("VSRC1", 0)]),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 8), ("SBASE", 0), ("OFFSET", 0)]),
+        buf("BUFFER_LOAD_DWORD", 1, 4),
+        ("S_LOAD_DWORDX4", "ENC_SMEM", vec![("SDATA", 12), ("SBASE", 0), ("OFFSET", 0x40)]),
+        buf("BUFFER_LOAD_DWORD", 2, 8),
+        buf("BUFFER_LOAD_DWORDX2", 3, 24),
+        ("S_LOAD_DWORD", "ENC_SMEM", vec![("SDATA", 20), ("SBASE", 0), ("OFFSET", 0x50)]),
+        wait(),
+    ];
+    for (k, s) in [8u64, 9, 12, 15, 20].into_iter().enumerate() {
+        p.push(("V_MOV_B32", "ENC_VOP1", vec![("VDST", 10 + k as u64), ("SRC0", s)]));
+    }
+    p.push(("V_LSHLREV_B32", "ENC_VOP2", vec![("VDST", 44), ("SRC0", 134), ("VSRC1", 0)]));
+    for r in 1..15u64 {
+        p.push(("BUFFER_STORE_DWORD", "ENC_MUBUF", vec![("VDATA", r), ("VADDR", 44), ("SRSRC", 4), ("SOFFSET", 128), ("OFFSET", 4 * r), ("OFFEN", 1)]));
+    }
+    p.push(("S_ENDPGM", "ENC_SOPP", vec![]));
+    code(&p)
+}
+
+#[test]
+fn interleaved_groups_declare_on_their_own_lines() {
+    let c = interleaved_program();
+    let (old, new) = (translate_cs(&c, false), translate_cs(&c, true));
+    let decls: Vec<&str> = new.lines().filter(|l| l.contains("= xcl_group_pages(t")).collect();
+    assert_eq!(decls.len(), 2, "{new}");
+    for l in &decls {
+        assert!(l.trim_start().starts_with("uint64_t t") && l.trim_end().ends_with("_g);"), "a declaration inside another line: {l}");
+    }
+    assert_eq!(interp::diff(&load(&old), &load(&new), 0..24, &Config::default()).0, Verdict::Equal);
+}

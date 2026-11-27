@@ -24,6 +24,23 @@ fn unwritten_ranges_follow_their_producer() {
     assert!(u.is_empty());
 }
 
+/// A dispatch that runs with a UAV over part of an unwritten range writes that part, whoever
+/// skipped it; a view larger than MAX_TRACKED neither marks nor clears.
+#[test]
+fn a_built_dispatch_writes_what_its_uavs_cover() {
+    let mut u = Unwritten::default();
+    u.mark(0xA, &[(0x1000, 0x1000), (0, MAX_TRACKED + 1)]);
+    assert_eq!(u.overlapping(0x1_0000, 4), None, "the view of all memory is not kept");
+    u.written(&[(0x1400, 0x100)]);
+    assert_eq!(u.overlapping(0x1400, 0x100), None);
+    assert_eq!(u.overlapping(0x1000, 0x800), Some((0x1000, 0x1400, 0xA)));
+    assert_eq!(u.overlapping(0x1500, 4), Some((0x1500, 0x2000, 0xA)));
+    u.written(&[(0, MAX_TRACKED + 1)]);
+    assert!(u.overlapping(0x1000, 4).is_some(), "a write through the view of all memory cannot be placed");
+    u.written(&[(0x0800, 0x2000)]);
+    assert!(u.is_empty());
+}
+
 /// An indirect call whose arguments or count lie in an unwritten range is refused, by its
 /// signature's stride and most commands; it runs again once the producer has run.
 #[test]

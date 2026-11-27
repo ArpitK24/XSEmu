@@ -29,6 +29,23 @@ pub const LIVE_QUIET: std::time::Duration = std::time::Duration::from_secs(30);
 /// times their estimate (play-89a: 1,592,684 B, +3.9 GB of commit over 76 s, about 51 MB/s);
 /// under this, a 5 s live compile sees at most 160 MB of growth, inside the 1 GB floor.
 pub const SETTLE_FALL: u64 = 32 << 20;
+
+/// A compile a bind waits for counts the compiles past their expected time as the memory available
+/// shows them whatever the trend (`XCL_SETTLE_OVERDUE=0`: only while it falls under `SETTLE_FALL`).
+/// Their memory is resident and already missing from the memory available; subtracting their
+/// estimates again counted it twice exactly while the title loaded: play-95 held four waited-for
+/// compiles 250 to 281 s with 5,059 MiB available falling ~70 MB/s and all 8,137 MiB of the
+/// reservation overdue. The RAM check keeps the 1 GB floor; the commit check keeps the trend rule.
+fn settle_overdue() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SETTLE_OVERDUE").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: compiles past their expected time keep their estimates while the memory falls (XCL_SETTLE_OVERDUE=0)");
+        }
+        on
+    })
+}
 /// The most of the memory available and of the commit room a background compile keeps free for
 /// the title's growth (`growth`): a loading burst holds background work back, never for good.
 pub const GROWTH_CAP: u64 = 2 << 30;
@@ -187,7 +204,9 @@ pub struct Load {
     /// (`compile_secs`): what they take shows in the memory available by now, unless it still
     /// falls (`Room::trend_fall`)
     pub settled: u64,
-    /// the reservations among `reserved` of cold giants (`Ask::small_lane` leaves them out)
+    /// the reservations among `reserved` of cold giants (`Ask::small_lane` leaves them out, and the
+    /// settled ones too while the memory does not fall `SETTLE_FALL`: play-92 held every small live
+    /// compile for minutes with 12,514 of 12,902 MiB of reservation settled and 2,737 MiB available)
     pub giant_reserved: u64,
 }
 
@@ -265,52 +284,89 @@ pub fn fits_on_machine(peak: u64, floor: u64, physical_total: u64) -> bool {
 /// compile gone: small compiles finishing and starting again would otherwise keep the memory
 /// below a giant's peak for the whole pass.
 pub fn admit(ask: &Ask, load: &Load, room: &Room) -> Verdict {
-    if short_of_memory(ask, load, room) {
-        return Verdict::Hold;
-    }
-    if ask.wanted {
-        return Verdict::Urgent;
-    }
-    let cost = ask.cost;
-    let floor = room.floor.max(room.urgent_floor);
-    let spare = room.available.saturating_sub(load.reserved).saturating_sub(growth(room, ask.dxil_len).0);
-    let held = load.starving > 0
-        || (ask.dxil_len >= GIANT_DXIL && (room.fall >= FAST_FALL || room.commit_fall >= FAST_FALL || load.live_recent))
-        || load.running.saturating_sub(load.urgent) >= ask.most
-        || (ask.dxil_len < GIANT_DXIL
-            && load.giant_waiting != 0
-            && room.available.saturating_add(load.reserved) >= floor + load.giant_waiting
-            && spare < floor + cost + load.giant_waiting)
-        || ask.cap.is_some_and(|c| room.commit + load.reserved + cost > c);
-    if held {
-        Verdict::Hold
-    } else {
-        Verdict::Background
-    }
+    admit_why(ask, load, room).0
 }
 
-/// The memory tests of `admit`, in each lane: the commit headroom less the reservations the
-/// lane counts and the title's commit growth does not hold this compile's `Ask::cost` and the
-/// urgent floor, or the memory available less those reservations and the title's growth does not
-/// hold its cost and its floor. A background compile counts every reservation and the title's
-/// growth, and keeps the background floor (at least the urgent one); a waited-for compile keeps
-/// no growth headroom and the urgent floor, and counts every reservation but the cold giants'
-/// (`Ask::small_lane`) or, while nothing falls `SETTLE_FALL` or faster, the settled ones.
-pub fn short_of_memory(ask: &Ask, load: &Load, room: &Room) -> bool {
+/// `admit`, and why a compile is held (empty when it starts).
+pub fn admit_why(ask: &Ask, load: &Load, room: &Room) -> (Verdict, &'static str) {
     let cost = ask.cost;
     let (growth, commit_growth) = if ask.wanted { (0, 0) } else { growth(room, ask.dxil_len) };
-    let reserved = if !ask.wanted {
-        load.reserved
-    } else if ask.small_lane {
-        load.reserved.saturating_sub(load.giant_reserved)
-    } else if room.trend_fall < SETTLE_FALL {
-        load.reserved.saturating_sub(load.settled)
-    } else {
-        load.reserved
+    let small_background = !ask.wanted && ask.dxil_len < GIANT_DXIL && settle_background();
+    let held_back = |settle: bool| {
+        if !ask.wanted {
+            if settle && small_background { load.reserved.saturating_sub(load.settled) } else { load.reserved }
+        } else if ask.small_lane {
+            load.reserved.saturating_sub(if settle { load.giant_reserved.max(load.settled) } else { load.giant_reserved })
+        } else if settle {
+            load.reserved.saturating_sub(load.settled)
+        } else {
+            load.reserved
+        }
     };
+    let steady = room.trend_fall < SETTLE_FALL;
+    let reserved = held_back(steady || settle_overdue() || small_background);
+    let commit_reserved = if ask.wanted { held_back(steady) } else { load.reserved };
     let spare = room.available.saturating_sub(reserved).saturating_sub(growth);
-    let floor = if ask.wanted { room.urgent_floor } else { room.floor.max(room.urgent_floor) };
-    room.commit_room.saturating_sub(reserved) < cost.saturating_add(room.urgent_floor).saturating_add(commit_growth) || spare < floor + cost
+    if room.commit_room.saturating_sub(commit_reserved) < cost.saturating_add(room.urgent_floor).saturating_add(commit_growth) {
+        return (Verdict::Hold, "commit room: the commit limit less the commit charge, the reservations and the title's commit growth is under its estimate and 1 GB");
+    }
+    if ask.wanted {
+        // (a live cold giant with no other cold giant running falls back to the curve when its
+        // corrected estimate does not fit: play-91b's two waited 250 s with 7.5 GB available)
+        let cost = if !ask.small_lane && load.giant_reserved == 0 && spare < cost + room.urgent_floor { cost.min(peak(ask.dxil_len)) } else { cost };
+        return if spare >= cost + room.urgent_floor {
+            (Verdict::Urgent, "")
+        } else {
+            (Verdict::Hold, "memory: the memory available less the reservations held is under its estimate and 1 GB")
+        };
+    }
+    let floor = room.floor.max(room.urgent_floor);
+    let giant = ask.dxil_len >= GIANT_DXIL;
+    let why = if load.starving > 0 {
+        "a compile a bind waits for waits for memory first"
+    } else if giant && (room.fall >= FAST_FALL || room.commit_fall >= FAST_FALL) {
+        "a background giant while the title's memory falls fast"
+    } else if giant && load.live_recent {
+        "a background giant within 30 s of live demand"
+    } else if load.running.saturating_sub(load.urgent) >= ask.most {
+        "every background slot is taken"
+    } else if spare < floor + cost {
+        "memory: the memory available less the reservations held and the title's growth is under its estimate and the floor"
+    } else if !giant && load.giant_waiting != 0 && room.available.saturating_add(load.reserved) >= floor + load.giant_waiting && spare < floor + cost + load.giant_waiting {
+        "room kept for a warm-up's giant"
+    } else if ask.cap.is_some_and(|c| room.commit + load.reserved + cost > c) {
+        "the private-memory cap"
+    } else {
+        return (Verdict::Background, "");
+    };
+    (Verdict::Hold, why)
+}
+
+/// Whether `admit` holds a background compile of `dxil_len` bytes at `cost` whatever the commit room
+/// and the title's growth are: its verdict on the memory sample alone, with unlimited commit room
+/// and nothing falling. The commit room, the growth and a fast fall only hold more, so what is
+/// held here is held there. The backlog asks this of every parked pipeline under its lock before
+/// the full verdict, which reads the system's memory each time (`real::ParkedRoom`): play-95 had
+/// 3,059 parked, and the title's binds queued on that lock until its watchdog ended the run.
+pub fn held_on_sample(dxil_len: usize, cost: u64, most: usize, load: &Load, available: u64, floor: u64, urgent_floor: u64) -> bool {
+    let room = Room { available, floor, urgent_floor, commit: 0, commit_room: u64::MAX, fall: 0, commit_fall: 0, trend_fall: 0 };
+    admit(&Ask { dxil_len, wanted: false, most, cap: None, cost, small_lane: false }, load, &room) == Verdict::Hold
+}
+
+/// A background compile under `GIANT_DXIL` counts the compiles past their expected time as the
+/// memory available shows them (`XCL_SETTLE_BACKGROUND=0`: by their whole estimates). Their
+/// memory is resident already; the title's growth is still kept (`growth`). play-95 ran no
+/// dispatch in 310 s: 2 KB loading passes never built while 2 giants held 8,137 MiB of overdue
+/// reservation against ~5 GB available, and 3,059 builds waited for memory.
+fn settle_background() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var("XCL_SETTLE_BACKGROUND").map_or(true, |v| v.trim() != "0");
+        if !on {
+            crate::xlog_info!("D3D12.X: small background compiles count compiles past their expected time by their whole estimates (XCL_SETTLE_BACKGROUND=0)");
+        }
+        on
+    })
 }
 
 pub const IDLE_BREAK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
@@ -506,7 +562,14 @@ impl<T> Backlog<T> {
     /// that long (`pso_manifest::slow_ms`).
     pub fn push(&mut self, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, item: T) -> u64 {
         let n = self.next;
-        self.next += 1;
+        self.push_as(n, shader_bytes, known, compute, group, slow_ms, item);
+        n
+    }
+
+    /// `push` as number `n`, which the caller gave out (from 1, never twice).
+    #[allow(clippy::too_many_arguments)]
+    pub fn push_as(&mut self, n: u64, shader_bytes: usize, known: bool, compute: bool, group: u64, slow_ms: Option<u64>, item: T) {
+        self.next = self.next.max(n + 1);
         let slow = slow_ms.is_some() || shader_bytes >= HEAVY_SHADER_BYTES;
         let quickest_last = usize::MAX - slow_ms.map_or(usize::MAX, |ms| ms as usize);
         let lane = if self.drawn_first && slow {
@@ -536,7 +599,6 @@ impl<T> Backlog<T> {
             self.groups.entry(group).or_default().push(n);
         }
         self.waiting.insert(n, (item, lane));
-        n
     }
 
     /// Graphics pipeline `n` has no colour targets (a shadow map's, a depth prepass's): what it
@@ -621,9 +683,14 @@ impl<T> Backlog<T> {
     /// The next pipeline for one of `workers` background workers, and the lane it came from
     /// (`done` is told when it is built). `recent`: the groups of the pipelines bound last, the
     /// last one first; `live`: it still wants building (parked ones that do not are dropped);
-    /// `fits`: a worker can start a parked compile of this DXIL size under the ordinary floor.
+    /// `fits`: a worker can start a parked compile of this DXIL size under the ordinary floor
+    /// (asked once for a size in a take, like `peer_fits`).
     pub fn pop(&mut self, workers: usize, recent: &[u64], live: impl Fn(&T) -> bool, fits: impl Fn(usize) -> bool, peer_fits: impl Fn(usize) -> bool) -> Option<(T, Lane)> {
         let recent = &recent[..recent.len().min(RECENT_GROUPS)];
+        // (one sample of the memory stands behind a take: a DXIL size is asked about once)
+        let (fit, peer_fit) = (std::cell::RefCell::new(HashMap::new()), std::cell::RefCell::new(HashMap::new()));
+        let fits = |len: usize| *fit.borrow_mut().entry(len).or_insert_with(|| fits(len));
+        let peer_fits = |len: usize| *peer_fit.borrow_mut().entry(len).or_insert_with(|| peer_fits(len));
         let list = &mut self.parked;
         list.retain(|(_, p)| live(&p.item));
         {
@@ -1110,6 +1177,105 @@ mod tests {
         assert!(breaker.hold(second, true, 0, 4 * GB, GB, stalled));
     }
 
+    /// play-92 at ~430 s: 5 live compiles running, 1 a cold giant, 12,902 MiB reserved, 12,514 MiB
+    /// of it settled, 2,737 MiB available. Small live compiles saw no spare and the bind queue
+    /// built ~0.6 pipelines a second; what the settled ones take shows in the memory available.
+    #[test]
+    fn the_small_lane_counts_settled_compiles_as_the_memory_shows_them() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 5, urgent: 5, giants: 1, reserved: 12_902 * MIB, settled: 12_514 * MIB, giant_reserved: 3_000 * MIB, ..Load::default() };
+        let small = Ask { small_lane: true, ..ask(200 << 10, true) };
+        assert_eq!(admit(&small, &load, &room(2_737 * MIB)), Verdict::Urgent);
+        let falling = Room { trend_fall: SETTLE_FALL, ..room(2_737 * MIB) };
+        assert_eq!(admit(&small, &load, &falling), Verdict::Urgent, "while the memory falls too (XCL_SETTLE_OVERDUE)");
+        assert_eq!(admit(&small, &load, &room(1_100 * MIB)), Verdict::Hold, "the floor stays");
+    }
+
+    /// play-95 at ~305 s: 2 driver compiles running on 3 slots (1 a giant), all 8,137 MiB of their
+    /// reservation past its expected time, 5,059 MiB available and falling ~70 MB/s as the title
+    /// loaded, 73.5 GB of commit room. Four waited-for compiles waited 250 to 281 s: the overdue
+    /// reservation, already missing from the memory available, was subtracted again.
+    #[test]
+    fn a_waited_for_compile_starts_while_the_title_drains_memory_behind_overdue_compiles() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 2, giants: 1, urgent: 2, starving: 4, reserved: 8_137 * MIB, settled: 8_137 * MIB, giant_reserved: 6_000 * MIB, live_recent: true, ..Load::default() };
+        let loading = Room { trend_fall: 70 * MIB, commit_room: 73_500 * MIB, ..room(5_059 * MIB) };
+        assert_eq!(admit(&ask(148_428, true), &load, &loading), Verdict::Urgent);
+        assert_eq!(admit(&Ask { small_lane: true, ..ask(148_428, true) }, &load, &loading), Verdict::Urgent);
+        assert_eq!(admit(&ask(148_428, false), &Load { starving: 0, ..load }, &loading), Verdict::Background, "small background work too (XCL_SETTLE_BACKGROUND)");
+        let fresh = Load { settled: 0, ..load };
+        assert_eq!(admit(&ask(148_428, true), &fresh, &loading), Verdict::Hold, "compiles within their expected time keep theirs");
+        assert_eq!(admit(&ask(148_428, true), &load, &Room { available: peak(148_428) + GB - 1, ..loading }), Verdict::Hold, "the 1 GB floor stays");
+        assert_eq!(admit(&ask(148_428, true), &load, &Room { commit_room: 8_137 * MIB + GB, ..loading }), Verdict::Hold, "and the commit check, by the trend rule");
+    }
+
+    /// play-95 again, the background side: no dispatch ran in 310 s. A 2 KB loading pass
+    /// (CS_DecorationDilate, CS_BakeLUT_2DBezier_3Segment_LinearShaper) never built while 2 giants
+    /// held 8,137 MiB of reservation, all past its expected time, with 5,059 MiB available.
+    #[test]
+    fn a_small_background_compile_starts_beside_overdue_giants() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 2, giants: 2, reserved: 8_137 * MIB, settled: 8_137 * MIB, giant_reserved: 8_137 * MIB, live_recent: true, ..Load::default() };
+        let loading = Room { fall: 70 * MIB, trend_fall: 70 * MIB, commit_room: 73_500 * MIB, ..room(5_059 * MIB) };
+        let small = ask(2 << 10, false);
+        assert_eq!(admit_why(&small, &load, &loading), (Verdict::Background, ""));
+        let fresh = Load { settled: 0, ..load };
+        assert!(admit_why(&small, &fresh, &loading).1.starts_with("memory"), "giants within their expected time keep their estimates");
+        assert_eq!(admit(&small, &load, &Room { available: peak(2 << 10) + GB + growth(&loading, 2 << 10).0 - 1, ..loading }), Verdict::Hold, "the floor and the title's growth stay");
+        assert!(admit_why(&small, &load, &Room { commit_room: 8_137 * MIB + GB, ..loading }).1.starts_with("commit room"), "the commit check counts every estimate");
+        assert_eq!(admit_why(&ask(GIANT_DXIL, false), &load, &loading).1, "a background giant within 30 s of live demand");
+        assert_eq!(admit_why(&small, &Load { starving: 1, ..load }, &loading).1, "a compile a bind waits for waits for memory first");
+    }
+
+    /// play-95 at `305 s as the backlog's sample saw it: 3,059 pipelines parked, 2 giants holding
+    /// 8,137 MiB of reservation, all past its expected time, 5,059 MiB available. The sample alone
+    /// holds nothing that `admit` starts (a small one starts beside the overdue giants), and what it
+    /// holds `admit` holds whatever the commit room and the title's growth are.
+    #[test]
+    fn the_sample_alone_holds_only_what_admit_holds() {
+        const MIB: u64 = 1 << 20;
+        let load = Load { running: 2, giants: 2, reserved: 8_137 * MIB, settled: 8_137 * MIB, giant_reserved: 8_137 * MIB, live_recent: true, ..Load::default() };
+        let loading = |available: u64| Room { fall: 70 * MIB, trend_fall: 70 * MIB, commit_room: 73_500 * MIB, ..room(available) };
+        let held = |dxil_len: usize, load: &Load, available: u64| {
+            let sample = room(available);
+            held_on_sample(dxil_len, peak(dxil_len), 20, load, available, sample.floor, sample.urgent_floor)
+        };
+        assert!(!held(2 << 10, &load, 5_059 * MIB), "a 2 KB loading pass goes on to the full verdict");
+        assert_eq!(admit(&ask(2 << 10, false), &load, &loading(5_059 * MIB)), Verdict::Background);
+        let loads = [load, Load { settled: 0, ..load }, Load { starving: 1, ..load }, Load { running: 22, ..load }, Load { live_recent: false, ..load }, Load::default()];
+        for load in loads {
+            for available in [GB, 5_059 * MIB, 16 * GB] {
+                for dxil_len in [2 << 10, 148_428, 1 << 20, GIANT_DXIL, 4 * GIANT_DXIL] {
+                    for room in [room(available), loading(available), Room { commit_room: 8_137 * MIB + GB, ..room(available) }] {
+                        let verdict = admit(&ask(dxil_len, false), &load, &room);
+                        assert!(!held(dxil_len, &load, available) || verdict == Verdict::Hold, "{dxil_len} B: {load:?}, {room:?}");
+                    }
+                }
+            }
+        }
+        assert!(held(2 << 10, &Load { settled: 0, ..load }, 5_059 * MIB), "giants within their expected time keep their estimates");
+        assert!(held(2 << 10, &Load { starving: 1, ..load }, 5_059 * MIB), "a waited-for compile waits for memory first");
+        assert!(held(2 << 10, &load, GB), "under the floor");
+        assert!(held(GIANT_DXIL, &load, 5_059 * MIB), "a background giant within 30 s of live demand");
+    }
+
+    /// A take asks `fits` once for a DXIL size, however many parked pipelines have it and however
+    /// many of the groups bound lately they are looked through for.
+    #[test]
+    fn a_take_asks_once_for_a_size() {
+        let mut b = Backlog::<&'static str>::default();
+        for id in 1..=40 {
+            b.park(if id % 2 == 0 { 2_000 } else { 3_000 }, 7, id, None, "parked");
+        }
+        let asked = std::cell::Cell::new(0);
+        let fits = |_| {
+            asked.set(asked.get() + 1);
+            false
+        };
+        assert_eq!(b.pop(4, &[7, 8], |_| true, fits, |_| false), None);
+        assert_eq!(asked.get(), 2);
+    }
+
     fn ask(dxil_len: usize, wanted: bool) -> Ask {
         Ask { dxil_len, wanted, most: 20, cap: None, cost: peak(dxil_len), small_lane: false }
     }
@@ -1134,6 +1300,23 @@ mod tests {
         assert_eq!(admit(&Ask { cost: cost(giant, false, 3), ..ask(giant, true) }, &alone, &room(4_200 * MIB)), Verdict::Urgent, "one at a time when it fits");
         let kept = Ask { cost: cost(2_342_300, true, 3), small_lane: true, ..ask(2_342_300, true) };
         assert_eq!(admit(&kept, &load, &available), Verdict::Urgent, "a kept blob loads in the small lane");
+    }
+
+    /// play-91b: one small live compile running (610 MiB reserved), 7,178 MiB available, a live
+    /// cold giant of 2,342,300 B asking. At its corrected 7.9 GB it never fits, and it waited
+    /// 250 s; with no other cold giant running it starts on the curve. Beside a running cold
+    /// giant it waits on the corrected estimate.
+    #[test]
+    fn a_live_giant_alone_falls_back_to_the_curve() {
+        const MIB: u64 = 1 << 20;
+        let giant = 2_342_300;
+        let ask = Ask { cost: cost(giant, false, 3), ..ask(giant, true) };
+        let load = Load { running: 1, urgent: 1, reserved: 610 * MIB, ..Load::default() };
+        let available = room(7_178 * MIB);
+        assert_eq!(admit(&ask, &load, &available), Verdict::Urgent);
+        let beside = Load { running: 2, giants: 1, reserved: 3_000 * MIB, giant_reserved: 2_390 * MIB, ..load };
+        assert_eq!(admit(&ask, &beside, &room(9_000 * MIB)), Verdict::Hold, "one cold giant at a time while its corrected estimate does not fit");
+        assert_eq!(admit(&ask, &load, &room(3_000 * MIB)), Verdict::Hold, "the curve and the floor still have to fit");
     }
 
     #[test]
@@ -1189,12 +1372,13 @@ mod tests {
         assert_eq!(admit(&ask(live, true), &fresh, &available), Verdict::Hold, "a giant within its expected time keeps its estimate");
         let settled = Load { settled: 8_641 * MIB, ..fresh };
         assert_eq!(admit(&ask(live, true), &settled, &available), Verdict::Urgent);
-        assert_eq!(admit(&ask(small, false), &Load { starving: 0, ..settled }, &available), Verdict::Hold, "background work keeps the whole estimate");
+        assert_eq!(admit(&ask(small, false), &Load { starving: 0, ..settled }, &available), Verdict::Background, "small background work too (XCL_SETTLE_BACKGROUND)");
         assert_eq!(admit(&ask(live, true), &settled, &room(976 * MIB)), Verdict::Hold, "the floor stays");
         let commit = Room { commit_room: 2 * GB, ..available };
         assert_eq!(admit(&ask(live, true), &settled, &commit), Verdict::Urgent, "the commit room shows it too");
         let growing = Room { trend_fall: 51 * MIB, ..available };
-        assert_eq!(admit(&ask(live, true), &settled, &growing), Verdict::Hold, "not while the memory still falls (play-89a's giant grew ~51 MB/s)");
+        assert_eq!(admit(&ask(live, true), &settled, &growing), Verdict::Urgent, "while the memory falls too (XCL_SETTLE_OVERDUE)");
+        assert_eq!(admit(&ask(live, true), &settled, &Room { available: 976 * MIB, ..growing }), Verdict::Hold, "the floor stays");
         assert_eq!(admit(&ask(live, true), &settled, &Room { trend_fall: SETTLE_FALL - 1, ..available }), Verdict::Urgent);
     }
 
@@ -1301,58 +1485,6 @@ mod tests {
         assert_eq!(admit(&ask(small, false), &load, &with(2 * cost + GB - 1)), Verdict::Hold);
         assert_eq!(admit(&ask(small, true), &load, &with(2 * cost + GB)), Verdict::Urgent);
         assert_eq!(admit(&ask(small, true), &load, &with(2 * cost + GB - 1)), Verdict::Hold, "a bind waits for commit too");
-    }
-
-    /// `short_of_memory` is exactly the memory part of `admit`: the RAM floor and the commit
-    /// headroom hold a compile back as memory; a waiting bind or the background limit do not.
-    #[test]
-    fn short_of_memory_is_admits_ram_and_commit_test() {
-        let small = 512 << 10;
-        let cost = peak(small);
-        let load = Load { running: 1, reserved: cost, ..Load::default() };
-        for wanted in [false, true] {
-            assert!(!short_of_memory(&ask(small, wanted), &load, &room(2 * cost + GB)));
-            assert!(short_of_memory(&ask(small, wanted), &load, &room(2 * cost + GB - 1)));
-            let commit = Room { commit_room: 2 * cost + GB - 1, ..room(64 * GB) };
-            assert!(short_of_memory(&ask(small, wanted), &load, &commit));
-            assert_eq!(admit(&ask(small, wanted), &load, &commit), Verdict::Hold);
-        }
-        let waiting = Load { starving: 1, ..load };
-        assert_eq!(admit(&ask(small, false), &waiting, &room(64 * GB)), Verdict::Hold);
-        assert!(!short_of_memory(&ask(small, false), &waiting, &room(64 * GB)));
-        let full = Load { running: 2, reserved: cost, ..Load::default() };
-        assert_eq!(admit(&Ask { most: 2, ..ask(small, false) }, &full, &room(64 * GB)), Verdict::Hold);
-        assert!(!short_of_memory(&Ask { most: 2, ..ask(small, false) }, &full, &room(64 * GB)));
-
-        let tight = room(2 * cost + GB);
-        let behind_giant = Load { running: 2, giants: 1, urgent: 1, reserved: 8 * GB + cost, giant_reserved: 8 * GB, ..Load::default() };
-        let live = Ask { small_lane: true, ..ask(small, true) };
-        assert!(!short_of_memory(&live, &behind_giant, &tight), "the live lane leaves the cold giant's reservation out");
-        assert_eq!(admit(&live, &behind_giant, &tight), Verdict::Urgent);
-        assert!(short_of_memory(&live, &behind_giant, &room(2 * cost + GB - 1)));
-        assert_eq!(admit(&live, &behind_giant, &room(2 * cost + GB - 1)), Verdict::Hold);
-        assert!(short_of_memory(&ask(small, true), &behind_giant, &tight), "outside the live lane the giant counts");
-        assert_eq!(admit(&ask(small, true), &behind_giant, &tight), Verdict::Hold);
-
-        let settled = Load { running: 2, urgent: 1, reserved: 8 * GB + cost, settled: 8 * GB, ..Load::default() };
-        assert!(!short_of_memory(&ask(small, true), &settled, &tight));
-        assert_eq!(admit(&ask(small, true), &settled, &tight), Verdict::Urgent);
-        let falling = Room { trend_fall: SETTLE_FALL, ..tight };
-        assert!(short_of_memory(&ask(small, true), &settled, &falling), "a settled compile counts again while memory falls");
-        assert_eq!(admit(&ask(small, true), &settled, &falling), Verdict::Hold);
-
-        let giant = 2 << 20;
-        let quiet = Load::default();
-        let roomy = room(64 * GB);
-        assert_eq!(admit(&ask(giant, false), &quiet, &roomy), Verdict::Background, "no count of giants holds one");
-        assert_eq!(admit(&ask(giant, false), &Load { live_recent: true, ..quiet }, &roomy), Verdict::Hold);
-        assert!(!short_of_memory(&ask(giant, false), &Load { live_recent: true, ..quiet }, &roomy), "live demand is not memory");
-        assert_eq!(admit(&ask(giant, false), &quiet, &Room { fall: FAST_FALL, ..roomy }), Verdict::Hold);
-        assert!(!short_of_memory(&ask(giant, false), &quiet, &Room { fall: FAST_FALL, ..roomy }), "a fast fall is not memory");
-        let gcost = peak(giant);
-        assert!(short_of_memory(&ask(giant, false), &quiet, &room(gcost + GB - 1)));
-        assert_eq!(admit(&ask(giant, false), &quiet, &room(gcost + GB - 1)), Verdict::Hold);
-        assert!(short_of_memory(&ask(giant, false), &quiet, &Room { commit_room: gcost + GB - 1, ..roomy }));
     }
 
     /// A waiting warm-up giant keeps smaller background compiles from taking the memory it needs,

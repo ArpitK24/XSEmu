@@ -12,6 +12,7 @@ pub mod pack;
 pub(crate) mod physical_binding;
 pub(crate) mod pix_capture;
 pub mod rdna2;
+pub(crate) mod rebar;
 pub mod recomp;
 mod rdna2_spec;
 mod rdna2_xbox;
@@ -21,5 +22,7 @@ pub mod tiling;
 mod tiling_tables;
 pub mod uma;
 pub mod xbox;
+#[cfg(test)]
+mod title_corpus_tests;
 
 pub use rdna2_spec::ARCH as RDNA2_ARCH;

@@ -60,7 +60,7 @@ Usage:
       memory. Keys with a measured wait go first, longest first, then --targets keys listed
       without one (a line with the key alone) in file order. Keys made ready in an earlier pass
       of the same translation and driver are skipped; --fresh replays them.
-      The compiles run in child processes of xcl.exe, one governor across them: pool children
+      The compiles run in child processes of XSEmu.exe, one governor across them: pool children
       (--pool-children, default 2 from 8 logical cores) share the cores and are replaced after
       --recycle-keys keys (default 400) or --recycle-mb MB of private commit (default 8192);
       a predicted giant (43,691 B of console shaders or more, or slow before) gets a child of
@@ -352,7 +352,7 @@ fn warm_up_blocking(args: &[String]) -> i32 {
     let (mut pool, mut giants, mut recycle_keys, mut recycle_mb, mut key_timeout) = (None, None, None, None, None);
     let mut args = args.iter();
     let invalid = || {
-        eprintln!("usage: xcl warm-up --blocking [--budget-s N (1–86400)] [--targets FILE] [--max-keys N (1–1000000)] [--fresh] [--in-process] [--pool-children N (1–16)] [--giant-children N (1–96)] [--recycle-keys N (1–1000000)] [--recycle-mb N (512–1048576)] [--key-timeout-s N (10–86400)]");
+        eprintln!("usage: XSEmu warm-up --blocking [--budget-s N (1–86400)] [--targets FILE] [--max-keys N (1–1000000)] [--fresh] [--in-process] [--pool-children N (1–16)] [--giant-children N (1–96)] [--recycle-keys N (1–1000000)] [--recycle-mb N (512–1048576)] [--key-timeout-s N (10–86400)]");
         1
     };
     while let Some(flag) = args.next() {
@@ -429,7 +429,7 @@ fn warm_up_blocking_child(args: &[String]) -> i32 {
         _ => (None, None, false),
     };
     let (Some(threads), Some(budget)) = (threads, budget) else {
-        eprintln!("usage: xcl warm-up --blocking-child --threads N (1–256) --budget-s N (1–86400) [--leave-giants], started by xcl warm-up --blocking");
+        eprintln!("usage: XSEmu warm-up --blocking-child --threads N (1–256) --budget-s N (1–86400) [--leave-giants], started by XSEmu warm-up --blocking");
         return 1;
     };
     if unsafe { SetConsoleCtrlHandler(Some(cancel_blocking_warm_up), 1) } == 0 {

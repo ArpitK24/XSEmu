@@ -123,6 +123,31 @@ impl PhysicalPageRef {
 
 pub(crate) const PHYSICAL_SEGMENT_BYTES: usize = 8 << 20;
 
+/// The title's physical pages for `memdiag`: allocations, pages allocated and not freed, pages
+/// committed (used) and, of those, pages freed while their allocation lives on (a section page
+/// cannot be decommitted alone, so its memory stays until the whole allocation is freed).
+pub(crate) fn physical_page_summary() -> String {
+    let g = PHYS.lock().unwrap();
+    let used = USED.read().unwrap_or_else(|e| e.into_inner());
+    let (mut pages, mut live, mut freed_used) = (0usize, 0usize, 0usize);
+    for b in g.blocks.values() {
+        pages += b.count;
+        live += b.live;
+        if b.live < b.count {
+            freed_used += (0..b.count).filter(|&i| !b.is_live(i) && used.contains(&(b.view + i * PHYS_PAGE))).count();
+        }
+    }
+    let mb = |n: usize| (n * PHYS_PAGE) >> 20;
+    format!(
+        "{} allocations of {} MB, {} MB not freed, {} MB committed, {} MB committed in freed pages of live allocations",
+        g.blocks.len(),
+        mb(pages),
+        mb(live),
+        mb(used.len()),
+        mb(freed_used)
+    )
+}
+
 impl PhysicalPageRef {
     pub(crate) fn pin_committed_segment(&self, offsets: std::ops::Range<usize>) -> Option<(usize, PhysicalSectionView)> {
         let lo = offsets.start;

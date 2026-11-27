@@ -39,8 +39,8 @@ const WAIT_ALL: u32 = 1;
 const TOKEN_ON_TIMEOUT: u32 = 2;
 /// ScheduleFrameEventX flags
 const UNSCHEDULE: u32 = 1;
-const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
-const KNOWN_TOKENS: usize = 64;
+pub(super) const TOKEN_MASK: u64 = 0xFFFF_FFFF_FFFF;
+pub(super) const KNOWN_TOKENS: usize = 64;
 const FLIPPED_KEEP: usize = 64;
 
 /// Frame intervals the console accepts (µs, with the rounding a title may use); the 120 Hz

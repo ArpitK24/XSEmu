@@ -39,6 +39,7 @@ pub mod list_x;
 pub mod null;
 pub mod page_mappings;
 pub mod present;
+pub mod present_order;
 pub mod pso_async;
 mod pso_canon;
 mod pso_library;
@@ -57,12 +58,15 @@ mod external_buffers;
 pub(crate) fn placed_buffers_over(va: usize, len: usize) -> Vec<String> {
     external_buffers::placed_over(va, len)
 }
+pub mod raytracing;
+pub mod title_gta6;
 pub mod title_list;
 pub mod title_textures;
 pub(crate) mod image_writeback;
 pub mod vram;
 mod wait_trace;
 mod live_status;
+pub mod console_status;
 
 use std::ffi::c_void;
 use std::sync::OnceLock;

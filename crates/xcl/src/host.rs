@@ -49,8 +49,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
         crate::log::Level::parse(&boot.config.log_level),
         boot.config.log_to_stderr,
     );
-    crate::xlog_info!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
-    crate::xlog_info!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
+    crate::xlog_console!("XCL {} – host for '{}'", env!("CARGO_PKG_VERSION"), boot.title);
+    crate::xlog_console!("game: {} (read-only folder: {})", boot.exe_path.display(), boot.game_root.display());
     crate::xlog_info!("XCL data: {}", boot.data_dir.display());
     crate::gpu::pix_capture::load_before_d3d12();
 
@@ -61,6 +61,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
     crate::hosting::start();
     crate::control::start();
     fine_timer();
+    crate::hle::d3d12x::console_status::start();
+    crate::memdiag::start();
     // `XCL_ACTIVITY=1`: every 2 s what the title did since (a timeline of where it stops)
     if std::env::var_os("XCL_ACTIVITY").is_some() {
         let _ = std::thread::Builder::new().name("xcl-activity".into()).spawn(|| {
@@ -69,7 +71,7 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let (d, x) = crate::hle::d3d12x::bind::activity();
                 let f = crate::hle::d3d12x::frame::activity();
                 let (r, b, fail) = crate::hle::dstorage::counters();
-                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail]
+                [p, e, d, x, f[0], f[1], f[2], f[3], r, b >> 20, fail, crate::hle::d3d12x::present_order::dropped(), crate::hle::d3d12x::bind::indirect_refusals()]
             };
             let mut last = snap();
             for tick in 1u64.. {
@@ -92,8 +94,8 @@ pub fn host_main(boot_path: &Path) -> i32 {
                 let now = snap();
                 let d: Vec<u64> = now.iter().zip(last).map(|(a, b)| a - b).collect();
                 crate::xlog_info!(
-                    "activity (2 s): {} presents, {} submits, {} draws, {} dispatches, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed, {} entries waiting for Submit",
-                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8], d[9], d[10], crate::hle::dstorage::waiting_for_submit()
+                    "activity (2 s): {} presents ({} dropped as older than the frame shown), {} submits, {} draws, {} dispatches, {} indirect calls refused as reading unwritten arguments, {} frame-event waits ({} timed out), {} frame statistics ({} not flipped); DirectStorage {} requests, {} MB, {} failed, {} entries waiting for Submit",
+                    d[0], d[11], d[1], d[2], d[3], d[12], d[4], d[5], d[6], d[7], d[8], d[9], d[10], crate::hle::dstorage::waiting_for_submit()
                 );
                 // where the memory is: the process's commit, video memory, and XCL's parts of it
                 let private = crate::util::process_commit_bytes();

@@ -287,7 +287,7 @@ fn sample() {
     }
 }
 
-fn observations() -> Vec<Sample> {
+pub(super) fn observations() -> Vec<Sample> {
     let mut spans = live_stall::snapshot();
     spans.extend(super::pso_async::diagnostic_queued());
     spans.extend(super::list_x::diagnostic_gpu_wait());
@@ -341,7 +341,22 @@ fn pinned_core(tid: u32) -> Option<u32> {
     (ok && affinity.Mask.count_ones() == 1).then(|| affinity.Mask.trailing_zeros())
 }
 
+/// The panel: the frame rate, the process's CPU, GPU and video memory, the pipelines and one line
+/// for what is stuck; `log::verbose`: every tracked job and the per-CPU and per-engine detail.
 fn panel_text(fps: f64) -> Vec<String> {
+    if crate::log::verbose() {
+        return verbose_panel_text(fps);
+    }
+    let mut lines = vec![format!("XCL LIVE   |   {fps:.1} host FPS   |   F10 hide/show")];
+    if let Some(m) = METRICS.try_lock().ok().filter(|m| fresh(m)) {
+        lines.push(format_metrics(&m));
+    }
+    lines.push(super::console_status::pipelines(super::pso_async::status_counts().0));
+    lines.extend(super::console_status::stuck(Instant::now()));
+    lines
+}
+
+fn verbose_panel_text(fps: f64) -> Vec<String> {
     let now = Instant::now();
     let mut lines = vec![format!(
         "XCL LIVE   |   {fps:.1} host FPS   |   F10 hide/show"

@@ -1797,3 +1797,41 @@ mod shader_bench {
         println!("pairs: {tried} tried, {missing} not found or not translated, {plain} refused without the GS, {only_gs} refused only with it");
     }
 }
+
+#[cfg(test)]
+mod title_corpus {
+    //! `XCL_RECOMP_TITLE_CORPUS=<folder of dumped console shaders (*_cs.bin, *_ps.bin, *_vs.bin)>`:
+    //! every shader translates as the runtime translates it (4 memory windows, split wave64) and
+    //! DXC compiles the result. The folder holds title data and stays on the machine that has the
+    //! title; without it the test does nothing.
+    use super::*;
+
+    #[test]
+    fn title_shaders_translate_and_compile() {
+        let Some(dir) = std::env::var_os("XCL_RECOMP_TITLE_CORPUS") else {
+            println!("XCL_RECOMP_TITLE_CORPUS not set");
+            return;
+        };
+        let mut files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.path()).collect();
+        files.sort();
+        let (mut n, mut failed) = (0, Vec::new());
+        for path in files {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let stage = match name.rsplit_once('_').map(|(_, s)| s) {
+                Some("cs.bin") => Stage::Compute,
+                Some("ps.bin") => Stage::Pixel,
+                Some("vs.bin") => Stage::Vertex,
+                _ => continue,
+            };
+            n += 1;
+            let blob = std::fs::read(&path).unwrap();
+            let r = console_translation(&blob, stage, 0, 4, true, false).and_then(|(t, profile)| dxc::compile_dxc_only(&t.hlsl, "main", profile).map(drop));
+            if let Err(e) = r {
+                failed.push(format!("{name}: {}", e.lines().next().unwrap_or_default()));
+            }
+        }
+        assert!(n > 0, "no console shaders in {dir:?}");
+        println!("{n} title shaders translated and compiled, {} failed", failed.len());
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+}

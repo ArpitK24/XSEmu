@@ -450,6 +450,10 @@ pub(super) fn register_test_base(pso: usize, dynamic_depth_bias: bool, static_bi
 }
 
 /// A pipeline released for good is no longer a base; its cached depth-bias variants go with it.
+pub(super) fn base_count() -> usize {
+    BASES.lock().unwrap().as_ref().map_or(0, HashMap::len)
+}
+
 pub(super) fn forget_base(pso: usize) {
     if super::depth_lineage::enabled() {
         if let Some(psos) = LINEAGE_DEPTH_WRITE_PSOS.lock().unwrap().as_mut() {

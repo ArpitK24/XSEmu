@@ -51,6 +51,14 @@ static COUNTS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 pub fn activity() -> (u64, u64) {
     (COUNTS[DRAWS].load(Ordering::Relaxed), COUNTS[DISPATCHES].load(Ordering::Relaxed))
 }
+
+/// ExecuteIndirect calls refused as reading what a skipped dispatch should have written
+/// (`indirect::check`), so far (`XCL_ACTIVITY`)
+static INDIRECT_REFUSED: AtomicU64 = AtomicU64::new(0);
+
+pub fn indirect_refusals() -> u64 {
+    INDIRECT_REFUSED.load(Ordering::Relaxed)
+}
 const DRAWS: usize = 0;
 const DRAWS_SKIPPED: usize = 1;
 const DRAWS_PC: usize = 2;
@@ -563,6 +571,9 @@ pub(super) fn draw_gate_calls() -> bool {
 }
 
 pub(super) fn shader_skip(pso: usize) -> bool {
+    if super::raytracing::builder_held(pso) {
+        return true;
+    }
     let skips = shader_skips();
     let live = LIVE_SHADER_ACTIVE.load(Ordering::Acquire);
     if skips.is_empty() && !live {
@@ -787,9 +798,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     // dispatch should have written is skipped too
     let (args_title, count_title) = (resource_title(args, args_off), resource_title(count_buf, count_off));
     if let Err(why) = super::indirect::check(sig, max, args_title, count_title) {
-        if dispatches {
-            note_skipped_writer(this, pso, title_pso);
-        }
+        INDIRECT_REFUSED.fetch_add(1, Ordering::Relaxed);
         count(if dispatches { DISPATCHES_SKIPPED } else { DRAWS_SKIPPED });
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, Ordering::Relaxed) < 16 {
@@ -858,7 +867,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
                 count(DISPATCHES);
                 mark(this, kind);
                 note_dispatch_binding(this, title_pso, None);
-                super::indirect::produced(title_pso);
+                note_built_writes(this, title_pso);
                 return;
             }
             Err(why) => {
@@ -950,7 +959,7 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
             capture_draw_gate_indirect(this, list, timed_capture.filter(|_| !capture), safe, args_title, count_title, pso, raw);
             if compute {
                 note_dispatch_binding(this, title_pso, None);
-                super::indirect::produced(title_pso);
+                note_built_writes(this, title_pso);
             }
             if capture {
                 let (writer, writer_at) = args_title.map_or(("unknown".into(), None), writer_of);
@@ -1841,19 +1850,83 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso: 
 /// of indirect calls after it (`note_indirect`).
 static SKIPPED_WRITERS: Mutex<Vec<(usize, Vec<(u64, u64, usize, String)>)>> = Mutex::new(Vec::new());
 
-/// A dispatch of `pso` (the title's `title_pso`) on `this` was skipped: the memory it may have
-/// written is kept, for the log and as unwritten (`indirect::skipped_producer`).
+/// A dispatch of `pso` (the title's `title_pso`) on `this` was skipped: the memory its UAVs
+/// cover is kept, for the log and as unwritten (`indirect::skipped_producer`).
 fn note_skipped_writer(this: *mut c_void, pso: usize, title_pso: usize) {
-    let writes = with(this, |s| s.layout.as_ref().map_or_else(Vec::new, |l| bound_writes(l, &s.args)));
-    if indirect_world_trace() {
+    let trace = indirect_world_trace();
+    let (bound, writes) = with(this, |s| {
+        s.layout.as_ref().map_or_else(Default::default, |l| (if trace { bound_writes(l, &s.args) } else { Vec::new() }, uav_writes(l, &s.args, console_descriptor)))
+    });
+    if trace {
         let cs = super::dispatch_timing::profile_shader(pso);
-        indirect_world_event(this as usize, format_args!("skipped dispatch pso {pso:#x} cs {cs:016x?} buffer bindings {:x?}", &writes[..writes.len().min(24)]));
+        indirect_world_event(this as usize, format_args!("skipped dispatch pso {pso:#x} cs {cs:016x?} buffer bindings {:x?} UAV writes {:x?}", &bound[..bound.len().min(24)], &writes[..writes.len().min(24)]));
     }
     record_skipped_writes(pso, title_pso, writes);
 }
 
+/// A dispatch of the title's `title_pso` ran on `this` with a translation: what that pipeline
+/// writes is written again, and so is what its UAVs cover, whichever skip kept it.
+fn note_built_writes(this: *mut c_void, title_pso: usize) {
+    super::indirect::produced(title_pso);
+    if super::indirect::nothing_unwritten() {
+        return;
+    }
+    let writes = with(this, |s| s.layout.as_ref().map_or_else(Vec::new, |l| uav_writes(l, &s.args, console_descriptor)));
+    let ranges = write_ranges(&writes);
+    super::indirect::bound(title_pso, &ranges);
+    super::indirect::written(&ranges);
+}
+
+/// The console words of the descriptor at `addr` and the PC resource behind it (0: none known).
+fn console_descriptor(addr: u32) -> Option<([u32; 8], usize)> {
+    let words = super::console_heap::words_at(addr)?;
+    Some((words, crate::gpu::uma::get().and_then(|u| super::console_heap::resource_at(u.base() + addr as usize)).unwrap_or(0)))
+}
+
+/// The buffer views a call bound by `layout` and `args` can write: its root UAVs (16 MB assumed,
+/// as `bound_writes`) and the buffer descriptors in its tables' UAV ranges, the first 64 slots
+/// (console address, bytes, PC resource, where). Texture UAVs hold no indirect arguments.
+fn uav_writes(layout: &Layout, args: &[u8], descriptor: impl Fn(u32) -> Option<([u32; 8], usize)>) -> Vec<(u64, u64, usize, String)> {
+    let word = |at: usize| args.get(at..at + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap())).unwrap_or(0);
+    let mut out = Vec::new();
+    let mut slots = 64u32;
+    for binding in &layout.uavs {
+        match *binding {
+            UavBinding::Root { param, at } => {
+                let va = word(at as usize) as u64 | (word(at as usize + 4) as u64) << 32;
+                if va != 0 {
+                    out.push((va, 16 << 20, 0, format!("p{param} root UAV")));
+                }
+            }
+            UavBinding::Table { param, at, first, count } => {
+                let table = word(at as usize);
+                let n = count.min(slots);
+                slots -= n;
+                if table == 0 {
+                    continue;
+                }
+                for slot in first..first.saturating_add(n) {
+                    let Some((w, resource)) = slot.checked_mul(32).and_then(|off| table.checked_add(off)).and_then(&descriptor) else { break };
+                    let (base, stride, records) = (w[0] as u64 | ((w[1] & 0xffff) as u64) << 32, ((w[1] >> 16) & 0x3fff) as u64, w[2] as u64);
+                    if w[3] >> 30 != 0 || base == 0 || records == 0 {
+                        continue;
+                    }
+                    out.push((base, records * stride.max(1), resource, format!("p{param} UAV table {table:#x} slot {slot}")));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The console ranges (start, bytes) `writes` keep as unwritten or write: a root view's assumed
+/// 16 MB as 64 KB.
+fn write_ranges(writes: &[(u64, u64, usize, String)]) -> Vec<(u64, u64)> {
+    writes.iter().map(|&(base, size, _, _)| (base, if size == 16 << 20 { 64 << 10 } else { size })).collect()
+}
+
 pub(super) fn record_skipped_writes(pso: usize, title_pso: usize, writes: Vec<(u64, u64, usize, String)>) {
-    super::indirect::skipped_producer(title_pso, &writes.iter().map(|&(base, size, _, _)| (base, if size == 16 << 20 { 64 << 10 } else { size })).collect::<Vec<_>>());
+    super::indirect::skipped_producer(title_pso, &write_ranges(&writes));
     let mut w = SKIPPED_WRITERS.lock().unwrap();
     if w.len() < 256 && !w.iter().any(|e| e.0 == pso) {
         w.push((pso, writes));
@@ -1874,7 +1947,7 @@ fn note_pending_compute_skip(this: *mut c_void, title_pso: usize, call: &str, sk
 pub(super) fn note_pending_compute_skip_with_args(title_pso: usize, call: &str, skip: super::pso_async::PendingComputeSkip, layout: Option<&Layout>, args: &[u8]) {
     count(DISPATCHES_SKIPPED);
     let super::pso_async::PendingComputeSkip::Deadline { shader, waited_ms } = skip else { return };
-    let writes = layout.map_or_else(Vec::new, |l| bound_writes(l, args));
+    let writes = layout.map_or_else(Vec::new, |l| uav_writes(l, args, console_descriptor));
     record_skipped_writes(title_pso, title_pso, writes);
     let n = {
         let mut counts = PENDING_COMPUTE_SKIPS.lock().unwrap();
@@ -2928,7 +3001,7 @@ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32,
             count(DISPATCHES);
             mark(this, "dispatch");
             note_dispatch_binding(this, title_pso, Some([x, y, z]));
-            super::indirect::produced(title_pso);
+            note_built_writes(this, title_pso);
         }
         Err(e) => {
             count(DISPATCHES_SKIPPED);
@@ -4075,5 +4148,116 @@ void main(uint t : SV_GroupIndex) {
             assert_eq!(release_fn(raw_list), 0);
             let _ = pso_async::released(standin);
         }
+    }
+
+    /// play-93b's pattern: a skipped culling pass binds the shared argument buffer read-only (a
+    /// root SRV, an SRV range), and among its UAVs the title's view of all of its memory, a root
+    /// UAV and its own output. Only its root UAV and its output are kept as unwritten: indirect
+    /// calls reading the shared buffer or elsewhere in memory run, one reading its output is
+    /// refused until a built pass with a UAV over it runs, and the view of all memory neither
+    /// marks nor clears.
+    #[test]
+    fn a_skipped_dispatch_keeps_only_what_its_uavs_can_write() {
+        const SHARED: u64 = 0x4_20b1_0000;
+        const OUT: u64 = 0x5_1234_0000;
+        const ROOT_OUT: u64 = 0x5_2000_0000;
+        const WHOLE: u64 = 0x3d00_0000;
+        const WHOLE_BYTES: u64 = 0xf665_d000_000 - WHOLE;
+        let words = [
+            2u32, 3, 24, 0, 0, 0,
+            3, 0, 60, 4, 0, 72, 0, 0, 84,
+            0, 0, 0, 1, 0, 0,
+            2, 92,
+            0, 3, 0, 0, 0, 0,
+            1, 2, 0, 0, 0, u32::MAX,
+        ];
+        let blob: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let layout = console_list::layout_from_blob(&blob).unwrap();
+        let args = |root_srv: u64, root_uav: u64, table: u32| -> Vec<u8> { [root_srv.to_le_bytes(), root_uav.to_le_bytes()].concat().into_iter().chain(table.to_le_bytes()).collect() };
+        let buf = |base: u64, bytes: u64, stride: u64| ([base as u32, (base >> 32) as u32 & 0xffff | (stride as u32) << 16, (bytes / stride) as u32, 0, 0, 0, 0, 0], 0usize);
+        let empty = ([0u32; 8], 0usize);
+        let (producer, sig) = (0x7E57_9300usize, 0x7E57_9302usize);
+
+        let writes = uav_writes(&layout, &args(SHARED + 0x200, ROOT_OUT, 0x40), |addr| {
+            assert!(addr >= 0x40 + 3 * 32, "the SRV range is not read: {addr:#x}");
+            match (addr - 0x40) / 32 {
+                3 => Some(buf(WHOLE, WHOLE_BYTES, 0x1000)),
+                4 => Some(buf(OUT, 0x1000, 4)),
+                _ => None,
+            }
+        });
+        assert_eq!(writes.iter().map(|w| (w.0, w.1)).collect::<Vec<_>>(), [(ROOT_OUT, 16 << 20), (WHOLE, WHOLE_BYTES), (OUT, 0x1000)]);
+        record_skipped_writes(producer, producer, writes);
+        super::super::indirect::note_signature(sig, super::super::indirect::DISPATCH, 12, true);
+        let check = |at: u64| super::super::indirect::check(sig, 1, Some(at), None);
+        assert!(check(SHARED + 0x200).is_ok(), "a buffer it only reads");
+        assert!(check(0x6_0000_0000).is_ok(), "elsewhere in the view of all memory");
+        assert!(check(OUT + 0x10).unwrap_err().contains(&format!("{producer:#x}")));
+        assert!(check(ROOT_OUT + 0x10).is_err());
+
+        let all = uav_writes(&layout, &args(0, 0, 0x40), |addr| Some(if (addr - 0x40) / 32 == 3 { buf(WHOLE, WHOLE_BYTES, 0x1000) } else { empty }));
+        super::super::indirect::written(&write_ranges(&all));
+        assert!(check(OUT + 0x10).is_err(), "a write through the view of all memory cannot be placed");
+        let culled = uav_writes(&layout, &args(0, 0, 0x40), |addr| Some(if (addr - 0x40) / 32 == 4 { buf(OUT, 0x1000, 4) } else { empty }));
+        super::super::indirect::written(&write_ranges(&culled));
+        assert!(check(OUT + 0x10).is_ok(), "the built culling pass wrote its output");
+        assert!(check(ROOT_OUT + 0x10).is_err(), "the root UAV it did not cover");
+        super::super::indirect::produced(producer);
+        assert!(check(ROOT_OUT + 0x10).is_ok());
+    }
+
+    /// play-96's pattern: skipped passes each bind their own output as a root UAV and the title's
+    /// 174 MiB pool of indirect arguments through slot 185 of a global table. While fewer than
+    /// SHARED_BINDERS pipelines bind the pool it is kept as unwritten like any buffer; from then
+    /// on it is a shared pool: its marks go, later skips do not mark it and a dispatch that runs
+    /// does not clear through it, while each pass's own output stays kept until it runs.
+    #[test]
+    fn a_pool_many_pipelines_bind_through_a_global_table_is_neither_kept_nor_cleared() {
+        use super::super::indirect::{self as ind, SHARED_BINDERS};
+        const POOL: u64 = 0x6_70b1_0000;
+        const POOL_BYTES: u64 = 0xae0_0000;
+        const OUT: u64 = 0x6_9000_0000;
+        const TABLE: u32 = 0x4000;
+        let words = [
+            2u32, 2, 24, 0, 0, 0,
+            4, 0, 48, 0, 0, 60,
+            1, 0, 0,
+            1, 68,
+            1, 1, 0, 0, 0, 185,
+        ];
+        let blob: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
+        let layout = console_list::layout_from_blob(&blob).unwrap();
+        let args = |out: u64| -> Vec<u8> { out.to_le_bytes().into_iter().chain(TABLE.to_le_bytes()).collect() };
+        let pool = |addr: u32| {
+            assert_eq!(addr, TABLE + 185 * 32, "only slot 185 of the global table is a UAV");
+            Some(([POOL as u32, (POOL >> 32) as u32 & 0xffff | 4 << 16, (POOL_BYTES / 4) as u32, 0, 0, 0, 0, 0], 0usize))
+        };
+        let sig = 0x7E57_9600usize;
+        ind::note_signature(sig, ind::DISPATCH, 12, true);
+        let check = |at: u64| ind::check(sig, 1, Some(at), None);
+        let producer = |k: usize| 0x7E57_9610usize + k;
+        let out = |k: usize| OUT + 0x10_0000 * k as u64;
+
+        for k in 0..SHARED_BINDERS - 1 {
+            let writes = uav_writes(&layout, &args(out(k)), pool);
+            assert_eq!(writes.iter().map(|w| (w.0, w.1)).collect::<Vec<_>>(), [(out(k), 16 << 20), (POOL, POOL_BYTES)]);
+            record_skipped_writes(producer(k), producer(k), writes);
+        }
+        assert!(check(POOL + 0x5000).is_err(), "bound by fewer than SHARED_BINDERS pipelines: kept like any buffer");
+        record_skipped_writes(producer(SHARED_BINDERS - 1), producer(SHARED_BINDERS - 1), uav_writes(&layout, &args(out(SHARED_BINDERS - 1)), pool));
+        assert!(check(POOL + 0x5000).is_ok(), "a shared pool is not kept");
+        assert!(check(POOL).is_ok() && check(POOL + POOL_BYTES - 12).is_ok());
+        for k in 0..SHARED_BINDERS {
+            assert!(check(out(k) + 0x10).unwrap_err().contains(&format!("{:#x}", producer(k))), "pass {k}'s own output is still kept");
+        }
+        record_skipped_writes(producer(0), producer(0), uav_writes(&layout, &args(out(0)), pool));
+        assert!(check(POOL + 0x5000).is_ok(), "a later skip does not mark the pool again");
+
+        ind::written(&write_ranges(&uav_writes(&layout, &args(0x6_f000_0000), pool)));
+        assert!(check(out(1) + 0x10).is_err(), "a write through the pool cannot be placed");
+        for k in 0..SHARED_BINDERS {
+            ind::produced(producer(k));
+        }
+        assert!(check(out(1) + 0x10).is_ok());
     }
 }

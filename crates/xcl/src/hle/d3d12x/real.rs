@@ -559,7 +559,44 @@ pub fn device_raw() -> *mut c_void {
     DEVICE.load(Ordering::Acquire) as *mut c_void
 }
 
+/// (driver compiles running, giants among them, the bytes reserved for them), for `memdiag`.
+pub(crate) fn diag_driver_compiles() -> (usize, usize, u64) {
+    let s = DRIVER_COMPILES.state.lock().unwrap_or_else(|e| e.into_inner());
+    (s.running, s.giants, s.reserved)
+}
+
+/// (console shader copies alive, their bytes), for `memdiag`: the copies the builds kept own
+/// (`OwnedDesc`), each once (`intern_shader_blob`).
+pub(crate) fn diag_shader_copies() -> (usize, u64) {
+    let Some(cache) = SHADER_BLOBS.get() else { return (0, 0) };
+    let cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    cache.blobs.iter().filter(|(_, blob)| blob.strong_count() != 0).fold((0, 0), |(n, bytes), ((_, len), _)| (n + 1, bytes + *len as u64))
+}
+
 /// The process's video memory on the device's adapter: (local, non-local) bytes in use.
+/// Entries in XCL's long-lived maps, for `memdiag`.
+pub(crate) fn diag_map_sizes() -> String {
+    fn n<K, V>(m: &Mutex<Option<HashMap<K, V>>>) -> usize {
+        m.lock().unwrap().as_ref().map_or(0, HashMap::len)
+    }
+    fn s<K>(m: &Mutex<Option<HashSet<K>>>) -> usize {
+        m.lock().unwrap().as_ref().map_or(0, HashSet::len)
+    }
+    format!(
+        "pipeline names {}, input layouts {}, shader pairs {}, root signatures {}, user SGPRs {}, translated compute {}, translated graphics {}, unified-memory buffers {}, heaps with blocks {}, derivable bases {}",
+        n(&PSO_NAMES),
+        n(&PSO_LAYOUTS),
+        n(&PSO_SHADERS),
+        n(&PSO_RS),
+        n(&PSO_USER_SGPRS),
+        s(&TRANSLATED_COMPUTE),
+        s(&TRANSLATED_GRAPHICS),
+        n(&UMA_BUFFERS),
+        n(&HEAP_UMA),
+        super::device_x::base_count()
+    )
+}
+
 pub fn video_memory() -> Option<(u64, u64)> {
     let [local, non_local] = video_memory_info()?;
     Some((local.CurrentUsage, non_local.CurrentUsage))
@@ -666,6 +703,7 @@ pub fn init() -> Result<String, String> {
                 }
             }
         }
+        start_trim();
         let factory: IDXGIFactory6 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).map_err(|e| format!("DXGI: {e}"))?;
         let mut device: Option<ID3D12Device> = None;
         let mut name = String::new();
@@ -705,6 +743,7 @@ pub fn init() -> Result<String, String> {
             }
         }
         open_uma(&device);
+        crate::gpu::rebar::init(&device);
         let directory = if !super::page_mappings::queue::available() {
             "off (XCL_PHYSICAL_DIRECTORY=0)"
         } else if !super::physical_import::init(&device) {
@@ -722,18 +761,26 @@ pub fn init() -> Result<String, String> {
         DEVICE.store(raw as usize, Ordering::Release);
         *ADAPTER.lock().unwrap() = name.clone();
         watch_device_removal();
-        // the driver maps its shader cache (about 9 GB here) at device creation and its pages stay
-        // resident; trimmed so far only when the governor held a compile back, so a game with no
-        // compile waiting went from 7 GB available to 727 MB in 11 s. Trimmed whenever the PC has
-        // less than KEEP_FREE available (trim_mapped_files runs at most every 5 s).
+        Ok(name)
+    }
+}
+
+/// Trims the files mapped into XCL (§trim_mapped_files§) every second while the PC has less than
+/// §TRIM_BELOW§ available, from before the device is made. The driver maps its shader cache while
+/// it makes the device, and the pages it reads stay resident: a game with no compile waiting
+/// went from 7 GB available to 727 MB in 11 s, and play-91 (the first launch after a rekey, 15 GB
+/// of cache views) from 15.5 GB to 21 MB, falling ~1 GB/s through the 9.5 s of device creation,
+/// before this thread used to start. Its commit hardly moved: mapped file pages are not commit.
+fn start_trim() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
         let _ = std::thread::Builder::new().name("xcl-trim".into()).spawn(|| loop {
             std::thread::sleep(std::time::Duration::from_secs(1));
             if available_physical() < TRIM_BELOW {
                 trim_mapped_files();
             }
         });
-        Ok(name)
-    }
+    });
 }
 
 /// A debug layer message: errors and warnings into the log – the first 8 of each message id
@@ -2052,6 +2099,7 @@ unsafe extern "system" fn pso_set_name(this: *mut c_void, name: *const u16) -> H
                 super::pso_async::is_pending(this as usize)
             );
         }
+        super::title_gta6::named(this as usize, &text);
         PSO_NAMES.lock().unwrap().get_or_insert_with(HashMap::new).insert(this as usize, text);
     }
     let f: unsafe extern "system" fn(*mut c_void, *const u16) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "SetName")));
@@ -3086,6 +3134,14 @@ unsafe extern "system" fn dev_create_committed_resource_x(this: *mut c_void, pro
         state = super::depth_uav::pc_state(state as u32) as usize;
     }
     let hr = dev_create_committed_resource(this, props, flags, desc, state, clear, riid, ppv);
+    if hr >= 0 && props != 0 && desc != 0 && crate::gpu::shader::readable(props, std::mem::size_of::<D3D12_HEAP_PROPERTIES>()) {
+        if let Some(dev) = ID3D12Device::from_raw_borrowed(&this) {
+            let hp = std::ptr::read_unaligned(props as *const D3D12_HEAP_PROPERTIES);
+            let rd = std::ptr::read_unaligned(desc as *const D3D12_RESOURCE_DESC);
+            let size = dev.GetResourceAllocationInfo(0, &[rd]).SizeInBytes;
+            crate::memdiag::TITLE_COMMITTED[crate::memdiag::heap_class(&hp)].add(if size == u64::MAX { 0 } else { size });
+        }
+    }
     if hr < 0 {
         let pw = |o: usize| if props == 0 { 0 } else { *((props + o) as *const u32) };
         crate::xlog_warn!(
@@ -3120,9 +3176,13 @@ unsafe extern "system" fn dev_create_compute_pso_x(this: *mut c_void, desc: *con
         crate::xlog_warn!("CreateComputePipelineState (console, slot 62): unknown parameters {a:#x} {b:#x} ignored");
     }
     let hr = dev_create_compute_pso(this, desc, riid, ppv);
+    let made = if hr >= 0 && !ppv.is_null() { *ppv as usize } else { 0 };
     // console code writes into pipeline objects (D3D12.X inline code): give it a console-shaped one
     if hr >= 0 && super::console_list::enabled() && !ppv.is_null() && !(*ppv).is_null() {
         *ppv = super::console_list::wrap_pso(*ppv, LAST_COMPUTE_TRANSLATED.with(|c| c.get()), LAST_COMPUTE_RS.with(|c| c.replace(0)));
+    }
+    if made != 0 {
+        super::raytracing::note_builder_alias(made, *ppv as usize);
     }
     hr
 }
@@ -3156,7 +3216,7 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
             ("CreateCommittedResource1", dev_create_committed_resource1 as usize),
             ("CreateHeap1", dev_create_heap1 as usize),
             ("CreateReservedResource1", dev_create_reserved_resource1 as usize),
-            ("CreateStateObject", dev_create_state_object as usize),
+            ("CreateStateObject", if super::raytracing::off() { super::raytracing::create_state_object as usize } else { dev_create_state_object as usize }),
             ("CreateCommittedResource2", dev_create_committed_resource2 as usize),
             ("CreateCommittedResource3", dev_create_committed_resource3 as usize),
             ("CreatePlacedResource1", dev_create_placed_resource1 as usize),
@@ -3240,6 +3300,9 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
     if kind == Kind::CommandList && (super::bind::draw_gate_trace() || super::bind::ignore_predication() || super::depth_capture::enabled()) {
         v.retain(|(method, _)| *method != "SetPredication");
         v.push(("SetPredication", cl_set_predication as usize));
+    }
+    if kind == Kind::CommandList {
+        super::raytracing::list_overrides(&mut v);
     }
     v
 }
@@ -3840,6 +3903,7 @@ unsafe fn heap_with_residency(
     match made {
         Ok((hr, spilled)) => {
             if !(*ppv).is_null() {
+                crate::memdiag::TITLE_HEAPS[crate::memdiag::heap_class(&d.Properties)].add(d.SizeInBytes);
                 super::residency::track(dev, *ppv as usize, d.Properties, d.SizeInBytes, high, session == 0 && super::residency::may_evict(d.Flags), spilled);
             }
             hr
@@ -3906,6 +3970,8 @@ struct HeapUma {
     /// in it read back on `Map(0, NULL, ...)`.
     cpu_readback: bool,
     block: Option<usize>,
+    /// a heap of buffers only (no textures): its PC heap holds nothing once it has a block
+    buffers_only: bool,
 }
 
 /// heap → its backing block (allocated lazily on the first placed buffer; sparse VRAM for
@@ -3941,6 +4007,7 @@ unsafe fn note_heap_uma(desc: usize, ppv: *mut *mut c_void) {
             prefer_coherent: is_rb && size <= COHERENT_READBACK_MAX,
             cpu_readback: is_rb || is_custom_wb,
             block: None,
+            buffers_only: d.Flags.0 & 0xC0 == 0xC0,
         },
     );
 }
@@ -4000,6 +4067,9 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
         return Some((existing, cr));
     }
     e.block = Some(p);
+    if e.buffers_only {
+        crate::memdiag::BUFFER_HEAPS_IN_UMA.add(e.size as u64);
+    }
     drop(g);
     static N: AtomicU64 = AtomicU64::new(0);
     if N.fetch_add(1, Ordering::Relaxed) < 4 {
@@ -4570,6 +4640,95 @@ impl GovState {
     }
 }
 
+/// The waited-for compiles holding for a driver slot or memory: (thread, DXIL bytes, estimate,
+/// since), for `log_slot_wait`.
+static SLOT_WAITS: Mutex<Vec<(std::thread::ThreadId, usize, u64, std::time::Instant)>> = Mutex::new(Vec::new());
+
+/// A waited-for compile in `SLOT_WAITS` until it starts or gives up.
+struct SlotWait(std::thread::ThreadId);
+
+impl SlotWait {
+    fn new(id: std::thread::ThreadId, dxil_len: usize, cost: u64) -> Self {
+        SLOT_WAITS.lock().unwrap_or_else(|e| e.into_inner()).push((id, dxil_len, cost, std::time::Instant::now()));
+        Self(id)
+    }
+}
+
+impl Drop for SlotWait {
+    fn drop(&mut self) {
+        SLOT_WAITS.lock().unwrap_or_else(|e| e.into_inner()).retain(|w| w.0 != self.0);
+    }
+}
+
+/// Every 10 s while a waited-for compile has waited 10 s or more: each waiter's estimate, its
+/// multiplier over the plain curve (`peak`) and its wait; each running compile's estimate and age
+/// against its expected time (play-95's waits of 250 to 281 s could not be read from the log).
+fn log_slot_wait(s: &GovState, available: u64) {
+    static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+    let ten = std::time::Duration::from_secs(10);
+    let waits = SLOT_WAITS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if waits.iter().all(|w| w.3.elapsed() < ten) {
+        return;
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if last.is_some_and(|t| t.elapsed() < ten) {
+        return;
+    }
+    *last = Some(std::time::Instant::now());
+    let waiting: Vec<String> = waits
+        .iter()
+        .map(|&(_, len, cost, at)| format!("{} KB est {} MiB (x{:.2}) for {} s", len >> 10, cost >> 20, cost as f64 / peak(len).max(1) as f64, at.elapsed().as_secs()))
+        .collect();
+    let running: Vec<String> = s
+        .runs
+        .iter()
+        .map(|&(_, cost, at, expected, giant)| format!("est {} MiB, {} s of ~{} s{}", cost >> 20, at.elapsed().as_secs(), expected.as_secs(), if giant { ", cold giant" } else { "" }))
+        .collect();
+    crate::xlog_info!(
+        "D3D12.X: driver slot wait: {} waited-for compiles held [{}]; {} running [{}]: {} MiB reserved, {} MiB of it past its expected time; {} MiB available",
+        waits.len(),
+        waiting.join("; "),
+        s.running,
+        running.join("; "),
+        s.reserved >> 20,
+        s.settled() >> 20,
+        available >> 20
+    );
+}
+
+thread_local! {
+    /// why this thread's last admission held its compile (`pso_sched::admit_why`)
+    static HOLD_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") };
+}
+
+/// Why a driver compile is held, once per pipeline (`live_stall::job` names it): the first 2,000
+/// held, then every 100th (play-95's starvation of 2 KB loading passes showed only in totals).
+fn log_hold(dxil_len: usize, cost: u64, wanted: bool, available: u64, s: &GovState) {
+    static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let job = crate::live_stall::job();
+    if job != (0, 0) && !SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(job) {
+        return;
+    }
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n > 2_000 && n % 100 != 0 {
+        return;
+    }
+    crate::xlog_info!(
+        "D3D12.X: driver compile held (pipeline {:016x}, shader {:016x}, {} KB of DXIL, est {} MiB, {}): {}; {} MiB available, {} MiB reserved, {} MiB of it past its expected time, {} running (#{n})",
+        job.0,
+        job.1,
+        dxil_len >> 10,
+        cost >> 20,
+        if wanted { "waited for" } else { "background" },
+        HOLD_REASON.with(std::cell::Cell::get),
+        available >> 20,
+        s.reserved >> 20,
+        s.settled() >> 20,
+        s.running
+    );
+}
+
 struct GovGuard {
     cost: u64,
     giant: bool,
@@ -4959,14 +5118,14 @@ pub(super) fn background_memory_paused() -> bool {
 /// compiles the PC had memory for (one at a time with 7 GB "available"; 13 GB after a trim). Clean
 /// pages go to the standby list: available, and read back without a disk read if touched again.
 /// Only file-backed views are trimmed, never the sections that back the title's memory. At most
-/// every 5 s; logged when it frees 1 GB or more (at most once a minute).
+/// every second; logged when it frees 1 GB or more (at most once a minute).
 fn trim_mapped_files() {
     use windows_sys::Win32::System::Memory::{VirtualQuery, VirtualUnlock, MEMORY_BASIC_INFORMATION, MEM_COMMIT, MEM_MAPPED};
     use windows_sys::Win32::System::ProcessStatus::K32GetMappedFileNameW;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
     static LAST: Mutex<Option<(std::time::Instant, Option<std::time::Instant>)>> = Mutex::new(None);
     let mut last = LAST.lock().unwrap();
-    if last.is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_secs(5)) {
+    if last.is_some_and(|(t, _)| t.elapsed() < std::time::Duration::from_secs(1)) {
         return;
     }
     let before = available_physical();
@@ -5067,7 +5226,7 @@ impl Governor {
     /// `verdict` for a load and the memory available as given.
     #[allow(clippy::too_many_arguments)]
     fn verdict_in(&self, load: &super::pso_sched::Load, available: u64, dxil_len: usize, wanted: bool, most: usize, cap: Option<u64>, floor: Option<u64>) -> super::pso_sched::Verdict {
-        use super::pso_sched::{admit, Ask, Room};
+        use super::pso_sched::{Ask, Room};
         #[cfg(test)]
         let commit_room = u64::MAX;
         #[cfg(not(test))]
@@ -5083,9 +5242,9 @@ impl Governor {
         };
         let room = Room { available, floor: floor.unwrap_or_else(keep_free), urgent_floor: URGENT_FLOOR, commit: if cap.is_some() { crate::util::process_commit_bytes() } else { 0 }, commit_room, fall, commit_fall, trend_fall };
         let (cost, cold_giant) = compile_cost(dxil_len);
-        let ask = Ask { dxil_len, wanted, most, cap, cost, small_lane: wanted && live_lanes() && !cold_giant };
-        let verdict = admit(&ask, load, &room);
-        if verdict == super::pso_sched::Verdict::Hold && super::pso_sched::short_of_memory(&ask, load, &room) {
+        let (verdict, why) = super::pso_sched::admit_why(&Ask { dxil_len, wanted, most, cap, cost, small_lane: wanted && live_lanes() && !cold_giant }, load, &room);
+        HOLD_REASON.with(|c| c.set(why));
+        if verdict == super::pso_sched::Verdict::Hold && (why.starts_with("memory") || why.starts_with("commit room")) {
             RAM_HOLDS.fetch_add(1, Ordering::Relaxed);
         }
         if fall != 0 || commit_fall != 0 {
@@ -5147,6 +5306,8 @@ impl Governor {
         let blocking_giant = dxil_len >= GIANT_DXIL && BLOCKING_WARM.with(|state| state.get().is_some());
         let mut waiting_giant = false;
         let mut gave_way: Option<(u64, std::time::Instant)> = None;
+        let mut slot_wait = None;
+        let mut told = false;
         // a warm-up child admits against the other children's compiles under their common lock,
         // and publishes its own before it lets go (`warm_peers`)
         let peers = super::warm_peers::joined();
@@ -5164,17 +5325,20 @@ impl Governor {
             }
             let now_demand = demand();
             let wanted = now_demand != DriverDemand::Background;
+            // (a live cold giant waits in its own lane: it holds no background work back, so
+            // one that cannot fit does not stop everything else – play-91b)
+            let holds_back = wanted && !cold_giant;
             if now_demand == DriverDemand::Live && !WARM_UP_PROCESS.load(Ordering::Relaxed) {
                 s.live_at = Some(std::time::Instant::now());
             }
             // A bind waiting for room takes precedence over speculative builds.
-            if wanted != starving {
-                if wanted {
+            if holds_back != starving {
+                if holds_back {
                     s.starving += 1;
                 } else {
                     s.starving -= 1;
                 }
-                starving = wanted;
+                starving = holds_back;
             }
             held = peers.map(|p| p.lock());
             let others = held.as_ref().map_or_else(Default::default, |h| h.others());
@@ -5186,6 +5350,14 @@ impl Governor {
             }
             if wanted && !WARM_UP_PROCESS.load(Ordering::Relaxed) {
                 s.live_at = Some(std::time::Instant::now());
+            }
+            if !told {
+                told = true;
+                log_hold(dxil_len, cost, wanted, available, &s);
+            }
+            if wanted {
+                slot_wait.get_or_insert_with(|| SlotWait::new(id, dxil_len, cost));
+                log_slot_wait(&s, available);
             }
             if !wait {
                 s.starving -= starving as usize;
@@ -5331,14 +5503,17 @@ pub(super) struct ParkedRoom {
 
 #[cfg(not(test))]
 impl ParkedRoom {
+    /// (`pso_sched::held_on_sample` first: the full verdict reads the system's memory)
     pub(super) fn fits(self, dxil_len: usize) -> bool {
-        DRIVER_COMPILES.verdict_in(&self.load, self.available, dxil_len, false, self.most, None, Some(self.floor))
-            == super::pso_sched::Verdict::Background
+        !super::pso_sched::held_on_sample(dxil_len, compile_cost(dxil_len).0, self.most, &self.load, self.available, self.floor, URGENT_FLOOR)
+            && DRIVER_COMPILES.verdict_in(&self.load, self.available, dxil_len, false, self.most, None, Some(self.floor))
+                == super::pso_sched::Verdict::Background
     }
 
     pub(super) fn peer_fits(self, dxil_len: usize) -> bool {
         super::pso_async::title_held()
             && self.load.urgent > 0
+            && !super::pso_sched::held_on_sample(dxil_len, compile_cost(dxil_len).0, self.most, &self.load, self.available, self.bind_floor, URGENT_FLOOR)
             && DRIVER_COMPILES.verdict_in(&self.load, self.available, dxil_len, false, self.most, None, Some(self.bind_floor))
                 == super::pso_sched::Verdict::Background
     }
@@ -5620,7 +5795,7 @@ fn driver_slot(dxil_len: usize, warm: bool, kept: bool, what: impl FnOnce() -> S
     let live = run && live_priority();
     KEPT_BLOB.with(|k| k.set(kept));
     let mut r = DRIVER_COMPILES.acquire_within(dxil_len, most, cap, warming.is_some() && !blocking_warm, floor, wait, || {
-        if run && (!background || super::pso_async::blocking_waiter()) {
+        if run && (!background || super::pso_async::blocking_waiter() || super::pso_async::first_build()) {
             DriverDemand::Blocking
         } else if !background || super::pso_async::waited_on() {
             DriverDemand::Wanted
@@ -6489,9 +6664,9 @@ const WARM_UP_COMMIT: u64 = 12 << 30;
 
 /// `cancel_warm_up` was called
 static WARM_UP_CANCEL: AtomicBool = AtomicBool::new(false);
-/// times `pso_sched::admit` held a compile back on its memory tests (`pso_sched::short_of_memory`:
-/// RAM available less the running compiles' peaks short of its peak and floor, or the commit
-/// headroom short of its peak and `URGENT_FLOOR`), read as `WarmStatus::short_of_ram`
+/// times `pso_sched::admit_why` held a compile back on its memory tests (a "memory" or "commit room"
+/// reason: RAM available less the reservations short of its estimate and floor, or the commit
+/// headroom short of its estimate and `URGENT_FLOOR`), read as `WarmStatus::short_of_ram`
 static RAM_HOLDS: AtomicUsize = AtomicUsize::new(0);
 
 /// `warm_up` starts no more builds: a compile waiting for its slot gives up, those running
@@ -8590,16 +8765,17 @@ impl OwnedDesc {
     }
 }
 
-fn intern_shader_blob(bytes: &[u8]) -> Arc<Vec<u8>> {
-    #[derive(Default)]
-    struct Cache {
-        blobs: HashMap<(u64, usize), Weak<Vec<u8>>>,
-        inserts: u8,
-    }
+#[derive(Default)]
+struct ShaderBlobs {
+    blobs: HashMap<(u64, usize), Weak<Vec<u8>>>,
+    inserts: u8,
+}
 
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
+static SHADER_BLOBS: OnceLock<Mutex<ShaderBlobs>> = OnceLock::new();
+
+fn intern_shader_blob(bytes: &[u8]) -> Arc<Vec<u8>> {
     let key = (crate::gpu::shader::fnv64(bytes), bytes.len());
-    let mut cache = CACHE.get_or_init(Mutex::default).lock().unwrap();
+    let mut cache = SHADER_BLOBS.get_or_init(Mutex::default).lock().unwrap();
     if let Some(blob) = cache.blobs.get(&key).and_then(Weak::upgrade) {
         if blob.as_slice() == bytes {
             return blob;
@@ -8815,6 +8991,9 @@ unsafe fn go_background(
     let what = kept.shaders.iter().map(|(at, s)| format!("{} {:016x}", super::pso_manifest::stage_at(&kept, *at), crate::gpu::shader::fnv64(s))).collect::<Vec<_>>().join(" ");
     // (console shaders only: a PC shader's driver compile is not the translated program's)
     let shader_bytes = kept.shaders.iter().filter(|(_, s)| crate::gpu::recomp::pso::is_console(s)).map(|(_, s)| s.len()).sum::<usize>();
+    let builder = super::raytracing::building_builder();
+    let left_out = super::raytracing::left_out(compute, builder, kept.shaders.iter().map(|(_, s)| &s[..]));
+    let early = super::title_gta6::early_shader(kept.shaders.iter().map(|(_, s)| &s[..]));
     let record = super::pso_manifest::record(kept);
     let (standin, built_from) = (*ppv as usize, what.clone());
     let job: super::pso_async::Job = Box::new(move || {
@@ -8835,7 +9014,18 @@ unsafe fn go_background(
             0
         }
     });
+    // (left out: a build that makes nothing, given up at once – no worker that takes it builds it)
+    let job: super::pso_async::Job = if left_out.is_some() { Box::new(|| 0) } else { job };
     super::pso_async::submit_recorded(*ppv as usize, compute, job, (key, record), what, shader_bytes, group);
+    if let Some(why) = left_out {
+        note_untranslated(*ppv as usize, why.to_string());
+        super::pso_async::give_up(*ppv as usize);
+    } else if builder {
+        super::pso_async::mark_builder(*ppv as usize);
+        super::pso_async::build_first(*ppv as usize);
+    } else if let Some(shader) = early {
+        super::title_gta6::build_early(*ppv as usize, shader);
+    }
     if image_only {
         super::pso_async::allow_image_skip(standin);
     }
@@ -8923,7 +9113,18 @@ unsafe fn note_translated_compute(hr: HRESULT, ppv: *mut *mut c_void) {
     }
 }
 
+/// CreateComputePipelineState, console (slot 62) and PC alike: a pipeline whose CS lies in
+/// XboxBvhBuilder.dll's image is a stage of the acceleration-structure builder (`raytracing`).
 unsafe extern "system" fn dev_create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
+    let builder = super::raytracing::builder_desc(desc);
+    let hr = super::raytracing::creating_builder(builder, || create_compute_pso(this, desc, riid, ppv));
+    if builder && hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+        super::raytracing::note_builder_stage(*ppv as usize, *ppv as usize);
+    }
+    hr
+}
+
+unsafe fn create_compute_pso(this: *mut c_void, desc: *const c_void, riid: *const GUID, ppv: *mut *mut c_void) -> HRESULT {
     super::null::capture_compute_desc(desc as *const u8);
     let f: PsoFn = std::mem::transmute(orig_fn(this, slot_of(this, "CreateComputePipelineState")));
     take_last_note();
@@ -13071,13 +13272,13 @@ mod governor_tests {
                 })
             });
             loop {
-                if waiter.is_finished() || g.state.lock().unwrap().starving == 1 {
+                if waiter.is_finished() || g.state.lock().unwrap().live_at.is_some() {
                     break;
                 }
                 std::thread::yield_now();
             }
             std::thread::sleep(std::time::Duration::from_millis(2150));
-            let remained_queued = !waiter.is_finished() && g.state.lock().unwrap().starving == 1;
+            let remained_queued = !waiter.is_finished();
             g.test_ram.as_ref().unwrap().0.store(compile_cost(giant).0 + (2 << 30), Ordering::Relaxed);
             g.cv.notify_all();
             assert!(remained_queued, "temporary pressure must not fail an idle governor's compile");
@@ -13213,6 +13414,37 @@ mod governor_tests {
         assert_eq!(g.in_flight(), (0, 0, 0));
     }
 
+    /// play-91b: a live cold giant that does not fit waited 250 s counted as an urgent compile
+    /// queued, and the background held back for it (`live_compile_waiting` paused the build queue
+    /// and preload); 1,830 pipelines waited with 7.5 GB available. It waits in its own lane now.
+    #[test]
+    fn a_waiting_live_giant_holds_no_background_work_back() {
+        let gib = 1u64 << 30;
+        let g = Governor { test_ram: Some((AtomicU64::new(7 * gib), 32 * gib)), ..governor() };
+        let giant = 3_900_000;
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| {
+                let slot = g.acquire_within(giant, 20, None, false, |_| None, true, || DriverDemand::Live).ok().unwrap();
+                g.release(&slot);
+                std::mem::forget(slot);
+            });
+            let t0 = std::time::Instant::now();
+            while g.state.lock().unwrap().live_at.is_none() {
+                assert!(t0.elapsed() < std::time::Duration::from_secs(10), "the giant asked");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(!waiter.is_finished(), "it does not fit 7 GB, not even on the curve");
+            assert_eq!(g.state.lock().unwrap().starving, 0, "a waiting cold giant is not an urgent compile queued");
+            let small = g.acquire_within(64 << 10, 20, None, false, |_| None, false, || DriverDemand::Background).ok().expect("background work goes on beside it");
+            g.release(&small);
+            std::mem::forget(small);
+            g.test_ram.as_ref().unwrap().0.store(32 * gib, Ordering::Relaxed);
+            g.cv.notify_all();
+            waiter.join().unwrap();
+        });
+        assert_eq!(g.in_flight(), (0, 0, 0));
+    }
+
     #[test]
     fn a_waited_for_compile_that_fits_starts_at_once_outside_the_limits() {
         if available_physical() < peak(0) + URGENT_FLOOR + (1 << 30) {
@@ -13247,7 +13479,9 @@ mod governor_tests {
         assert!(matches!(g.acquire_within(live_giant, 20, None, false, |_| None, false, || DriverDemand::Live), Err(Refused::NoRoom)), "a fresh giant keeps its estimate from a live giant");
         let Some(long_ago) = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(600)) else { return };
         g.state.lock().unwrap().runs[0].2 = long_ago;
-        assert!(matches!(g.acquire_within(900 << 10, 20, None, false, |_| None, false, || DriverDemand::Background), Err(Refused::NoRoom)), "background work keeps the whole estimate");
+        let small_background = g.acquire_within(900 << 10, 20, None, false, |_| None, false, || DriverDemand::Background).ok().expect("small background work counts a settled giant as measured too (XCL_SETTLE_BACKGROUND)");
+        g.release(&small_background);
+        std::mem::forget(small_background);
         let live = g.acquire_within(live_giant, 1, None, false, |_| None, false, || DriverDemand::Live).ok().expect("a live giant beside a settled giant");
         assert!(live.urgent, "a live build asks as a waited-for one");
         g.test_ram.as_ref().unwrap().0.store(32 * gib, Ordering::Relaxed);

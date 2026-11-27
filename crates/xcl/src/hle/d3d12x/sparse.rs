@@ -238,8 +238,9 @@ struct State {
     released_pins: ReleasedPins,
     /// tile ranges to check for pending clears on the current mapping
     to_zero: Vec<(usize, usize)>,
-    /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped)
-    staging: Option<(ID3D12Resource, *mut u8)>,
+    /// ring-buffered upload staging heap (`STAGING` bytes, persistently mapped, written only:
+    /// in video memory when `rebar` places it)
+    staging: Option<(ID3D12Resource, *mut u8, crate::gpu::rebar::Placed)>,
     /// monotonic ring-buffer write/submitted/retired byte cursors
     ring_write: u64,
     ring_submitted: u64,
@@ -247,7 +248,7 @@ struct State {
     /// submitted ring chunks awaiting GPU completion: `(fence_val, ring_end_pos)`
     inflight: VecDeque<(u64, u64)>,
     /// dedicated 1 MiB pre-zeroed buffer for tile/hole clears (zero staging bandwidth)
-    zero_buf: Option<ID3D12Resource>,
+    zero_buf: Option<(ID3D12Resource, crate::gpu::rebar::Placed)>,
     /// ring of async upload command allocators + lists
     slots: Vec<UploadSlot>,
     next_slot: usize,
@@ -947,54 +948,28 @@ impl State {
 
     unsafe fn staging_ptr(&mut self) -> Option<*mut u8> {
         if self.staging.is_none() {
-            let mut r: Option<ID3D12Resource> = None;
             let mut d = buffer_desc(STAGING as u64);
             d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            self.dev
-                .CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
-                    D3D12_HEAP_FLAG_NONE,
-                    &d,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut r,
-                )
-                .ok()?;
-            let r = r?;
+            let (r, placed) = crate::gpu::rebar::upload_buffer(&self.dev, &d, crate::gpu::rebar::Class::Sparse).ok()?;
             let mut p = std::ptr::null_mut();
             r.Map(0, None, Some(&mut p)).ok()?;
-            self.staging = Some((r, p as *mut u8));
+            self.staging = Some((r, p as *mut u8, placed));
         }
-        self.staging.as_ref().map(|&(_, p)| p)
+        self.staging.as_ref().map(|s| s.1)
     }
 
     unsafe fn ensure_zero_buf(&mut self) -> bool {
         if self.zero_buf.is_none() {
-            let mut r: Option<ID3D12Resource> = None;
             let mut d = buffer_desc(ZERO_BUF as u64);
             d.Flags = D3D12_RESOURCE_FLAG_NONE;
-            if self
-                .dev
-                .CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
-                    D3D12_HEAP_FLAG_NONE,
-                    &d,
-                    D3D12_RESOURCE_STATE_GENERIC_READ,
-                    None,
-                    &mut r,
-                )
-                .is_err()
-            {
-                return false;
-            }
-            let Some(r) = r else { return false };
+            let Ok((r, placed)) = crate::gpu::rebar::upload_buffer(&self.dev, &d, crate::gpu::rebar::Class::Sparse) else { return false };
             let mut p = std::ptr::null_mut();
             if r.Map(0, None, Some(&mut p)).is_err() {
                 return false;
             }
             std::ptr::write_bytes(p as *mut u8, 0, ZERO_BUF);
             r.Unmap(0, None);
-            self.zero_buf = Some(r);
+            self.zero_buf = Some((r, placed));
         }
         true
     }
@@ -1205,7 +1180,7 @@ impl State {
         }
         let slot_idx = self.begin_slot();
         let mut last_wi: Option<usize> = None;
-        let zero_buf = self.zero_buf.as_ref().unwrap();
+        let zero_buf = &self.zero_buf.as_ref().unwrap().0;
         let list = &self.slots[slot_idx].list;
         for &(a, n) in runs {
             let mut done = 0usize;

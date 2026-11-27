@@ -10,6 +10,10 @@ pub mod log;
 pub mod alias;
 pub mod manifest;
 pub mod memmap;
+pub mod memdiag;
+
+#[global_allocator]
+static ALLOCATOR: memdiag::Counting = memdiag::Counting;
 pub mod config;
 pub mod control;
 pub mod disasm;
